@@ -1,0 +1,50 @@
+{
+  "name": "darb-alshifa-pharmacy",
+  "version": "1.0.0",
+  "description": "نظام مبيعات صيدلية درب الشفاء — نظام متكامل لإدارة الصيدلية",
+  "main": "main.js",
+  "author": "Darb Al-Shifa Pharmacy",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --publish never",
+    "release": "electron-builder --win --publish always"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  },
+  "build": {
+    "appId": "com.darbalshifa.pharmacy",
+    "productName": "نظام صيدلية درب الشفاء",
+    "directories": { "output": "dist" },
+    "files": [
+      "**/*",
+      "!dist/**",
+      "!.git/**",
+      "!.github/**",
+      "!*.md",
+      "!*.log"
+    ],
+    "win": {
+      "target": ["nsis"],
+      "artifactName": "DarbAlShifa-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "alirazzak-22",
+        "repo": "darb-alshifa-releases",
+        "releaseType": "release"
+      }
+    ]
+  }
+}
