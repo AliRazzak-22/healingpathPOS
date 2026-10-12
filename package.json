@@ -1,6 +1,6 @@
 {
   "name": "darb-alshifa-pharmacy",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "نظام مبيعات صيدلية درب الشفاء — نظام متكامل لإدارة الصيدلية",
   "main": "main.js",
   "author": "Darb Al-Shifa Pharmacy",
@@ -20,7 +20,9 @@
   "build": {
     "appId": "com.darbalshifa.pharmacy",
     "productName": "نظام صيدلية درب الشفاء",
-    "directories": { "output": "dist" },
+    "directories": {
+      "output": "dist"
+    },
     "files": [
       "**/*",
       "!dist/**",
@@ -30,7 +32,9 @@
       "!*.log"
     ],
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
       "artifactName": "DarbAlShifa-Setup-${version}.${ext}"
     },
     "nsis": {
