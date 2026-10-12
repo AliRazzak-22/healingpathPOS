@@ -221,6 +221,7 @@ const DEFAULT_SETTINGS = {
   id: 'app', pharmacyName: 'صيدلية درب الشفاء', profitPct: 30, lowStock: 10,
     currency: 'د.ع', geminiKey: '', unitNames: ['قطعة','باكيت','شريط','كرتون','علبة','قنينة','أمبول','فيال','كيس','لفافة'],
   generatedBarcode: 0,
+  printer: { name: '', w: 38, h: 25 }, // ★ طابعة الملصقات: الاسم + الأبعاد بالمم (افتراضي Xprinter 38×25)
 };
 const findAcc  = id => state.accounts.find(a => a.id === id);
 const findProd = id => state.products.find(p => p.id === id && !p.deleted);
@@ -618,86 +619,11 @@ function renderTopbar() {
   emp.innerHTML = '';
     emp.append(accountAvatar(acc, 28), h('b', {}, acc.name),
     acc.role === 'admin' ? h('span', { class: 'badge b' }, 'مدير') : null);
-  renderCustomerSelect();
     const lo = $('#btn-logout');
   lo.innerHTML = icon('logout'); lo.onclick = logout;
   $$('.tb-info .win-ctl').forEach(n => n.remove());
   const wc = winControls(); if (wc) lo.after(wc);
   tickTopClock();
-}
-/* ═══ زبون مستقل لكل تبويب نقطة بيع + منتقي زبائن فاخر ═══ */
-const activePosTab = () => { const t = tabs.find(x => x.id === activeTabId); return t && t.type === 'pos' ? t : null; };
-
-function setCustomerForActiveTab(id) {
-  let t = activePosTab();
-  if (!t) { t = tabs.find(x => x.type === 'pos') || openTab('pos'); activateTab(t.id); }
-  t.state.customerId = id || null;
-  state.customerId = t.state.customerId;
-  if (id === DR_NADIA_ID) t.state.sideTab = 'dr';
-  renderTabStrip();
-  renderCustomerSelect();
-  renderTabContent(t); // السلة محفوظة في t.state.cart فلا تضيع
-}
-
-function renderCustomerSelect() {
-  const box = $('#tb-customer');
-  if (!box) return;
-  box.innerHTML = '';
-  const t = activePosTab();
-  const cid = t ? (t.state.customerId || null) : state.customerId;
-  const cust = cid ? findCust(cid) : null;
-  const nadia = cid === DR_NADIA_ID;
-  const btn = h('button', { class: 'cust-pill' + (nadia ? ' pink' : cust ? ' named' : ''), title: 'اختيار زبون هذا التبويب',
-    onclick: e => { e.stopPropagation(); openCustomerPicker(btn); } },
-    h('span', { class: 'cust-ic', html: nadia ? '<img src="nadia-logo.svg" alt="">' : icon('users') }),
-    h('span', { class: 'cust-meta' }, h('small', {}, t ? t.title : 'نقطة البيع'), h('b', {}, cust ? cust.name : 'زبون نقدي')),
-    h('span', { class: 'cust-caret' }, '▾'));
-  box.append(btn);
-}
-
-function openCustomerPicker(anchor) {
-  document.querySelectorAll('.cust-pop').forEach(n => n.remove());
-  const base = activePosTab() || tabs.find(x => x.type === 'pos');
-  const curId = base ? (base.state.customerId || null) : null;
-  const pop = h('div', { class: 'cust-pop', onclick: e => e.stopPropagation() });
-  const q = h('input', { class: 'cust-search', placeholder: 'ابحث عن زبون…', autocomplete: 'off' });
-  const list = h('div', { class: 'cust-list' });
-  const onKey = e => { if (e.key === 'Escape') close(); };
-  function close() { pop.remove(); document.removeEventListener('click', close); document.removeEventListener('keydown', onKey); }
-  const pick = id => { close(); setCustomerForActiveTab(id); };
-
-  const row = (id, name, sub) => h('div', { class: 'cust-row' + (id === curId ? ' on' : '') + (id === DR_NADIA_ID ? ' pink' : ''), onclick: () => pick(id) },
-    h('span', { class: 'cust-av', html: id === DR_NADIA_ID ? '<img src="nadia-logo.svg" alt="">' : id === null ? icon('store') : esc(String(name).trim().charAt(0) || '؟') }),
-    h('div', { class: 'cust-nm' }, h('b', {}, name), sub ? h('small', {}, sub) : null),
-    id === curId ? h('span', { class: 'cust-ck', html: icon('check') }) : null);
-
-  function draw() {
-    list.innerHTML = '';
-    const s = q.value.trim().toLowerCase();
-    if (!s || 'زبون نقدي'.includes(s)) list.append(row(null, 'زبون نقدي', 'بيع مباشر بدون حساب'));
-    const custs = state.customers.filter(c => !c.deleted && (!s || String(c.name).toLowerCase().includes(s)))
-      .sort((a, b) => (b.id === DR_NADIA_ID) - (a.id === DR_NADIA_ID) || String(a.name).localeCompare(String(b.name), 'ar'));
-    custs.forEach(c => list.append(row(c.id, c.name, c.id === DR_NADIA_ID ? 'سلة وردية + تبويب أصناف ذكي' : '')));
-    if (!list.children.length) list.append(h('div', { class: 'cust-empty' }, 'لا يوجد زبون بهذا الاسم'));
-  }
-  q.addEventListener('input', draw);
-
-  const addRow = h('div', { class: 'cust-add', onclick: async () => {
-    const name = ((await promptBox('إضافة زبون جديد', { placeholder: 'اسم الزبون', value: q.value.trim() })) || '').trim();
-    if (!name) return;
-    const c = { id: uid(), name, createdAt: Date.now() };
-    await save('customers', c);
-    toast(`تمت إضافة الزبون «${name}»`);
-    pick(c.id);
-  } }, h('span', { html: icon('plus') }), 'زبون جديد');
-
-  pop.append(h('div', { class: 'cust-head' }, base ? `زبون «${base.title}»` : 'اختيار الزبون'), q, list, addRow);
-  document.body.append(pop);
-  const r = anchor.getBoundingClientRect();
-  pop.style.top = (r.bottom + 8) + 'px';
-  pop.style.left = Math.max(8, Math.min(window.innerWidth - 336, r.left)) + 'px';
-  draw();
-  setTimeout(() => { q.focus(); document.addEventListener('click', close); document.addEventListener('keydown', onKey); }, 0);
 }
 function tickTopClock() {
   if (!state.session) return;
@@ -780,9 +706,7 @@ function activateTab(id) {
   renderTabStrip();
   markActiveNav();
   const t = tabs.find(x => x.id === id);
-  if (t && t.type === 'pos') state.customerId = t.state.customerId || null; // ★ زبون كل تبويب مستقل
-  renderCustomerSelect();
-  if (t && LIVE_TABS.includes(t.type)) renderTabContent(t); // بيانات طازجة عند كل فتح للتبويب
+  if (t && LIVE_TABS.includes(t.type)) renderTabContent(t);
 }
 function renderTabStrip() {
   const box = $('#tabs');
@@ -790,8 +714,7 @@ function renderTabStrip() {
   tabs.forEach(t => {
     box.append(h('div', { class: 'tab' + (t.id === activeTabId ? ' active' : ''), onclick: () => activateTab(t.id) },
       h('span', { html: icon(t.icon) }),
-            h('span', { class: 'tab-title' }, t.title,
-        t.type === 'pos' && t.state.customerId ? h('small', { class: 'tab-cust' + (t.state.customerId === DR_NADIA_ID ? ' pink' : '') }, (findCust(t.state.customerId) || {}).name || '') : null),
+      h('span', { class: 'tab-title' }, t.title),
       h('span', { class: 'tab-close', html: icon('close'), onclick: e => { e.stopPropagation(); closeTab(t.id); } })));
   });
   markActiveNav();
@@ -919,7 +842,7 @@ function renderPOS(tab) {
   st.discount = st.discount || 0;
   st.sideTab = st.sideTab || 'featured';
 
-    const wrap = h('div', { class: 'pos-layout' + (isDrNadia(tab) ? ' dr-mode' : '') }); // سلة وردية لزبونة دكتورة نادية
+ const wrap = h('div', { class: 'pos-layout' }); // ★ سلة واحدة بشعار الصيدلية — الزبون يُختار لحظة الحفظ
   const center = h('div', { class: 'pos-center' });
 
   /* محرك البحث */
@@ -1019,11 +942,11 @@ function renderPOS(tab) {
   st.renderCart = () => {
     cartWrap.innerHTML = '';
     if (!st.cart.length) {
-                  cartWrap.append(h('div', { class: 'cart-empty', inert: true, 'aria-hidden': 'true' },
-        h('span', { class: 'cart-watermark' + (isDrNadia(tab) ? ' pink' : ''), inert: true,
+      cartWrap.append(h('div', { class: 'cart-empty', inert: true, 'aria-hidden': 'true' },
+        h('span', { class: 'cart-watermark', inert: true,
           onmousedown: e => e.preventDefault(), ondragstart: e => e.preventDefault(),
           onselectstart: e => e.preventDefault(), oncontextmenu: e => e.preventDefault(),
-          html: `<img src="${isDrNadia(tab) ? 'nadia-logo.svg' : 'logo.svg'}" alt="" draggable="false">` })));
+          html: `<img src="logo.svg" alt="" draggable="false">` }))); // ★ شعار الصيدلية دائماً
       return;
     }
     const tbody = h('tbody');
@@ -1117,11 +1040,55 @@ function addToCart(tab, p) {
 }
 
 /* تنفيذ البيع */
+/* تنفيذ البيع — الخطوة 1: نافذة سرعة لاختيار الزبون */
 async function checkout(tab, pay) {
   const st = tab.state;
+  if (st.processing) return;
   if (!st.cart.length) return toast('السلة فارغة', 'r');
-    if (pay === 'credit' && !st.customerId) return toast('البيع الآجل يتطلب اختيار زبون لهذا التبويب من الشريط العلوي', 'r');
-  st.processing = true; // قفل مؤقت لمنع الضغط المزدوج على أزرار البيع
+  openCheckoutCustomer(tab, pay);
+}
+
+/* ★ نافذة اختيار الزبون لحظة الحفظ (زر البيع أو Ctrl+S):
+   زبون نقدي / دكتورة نادية بضغطة واحدة — أو ابحث عن أي زبون آخر. Enter = زبون نقدي */
+function openCheckoutCustomer(tab, pay) {
+  const q = h('input', { class: 'cust-search', placeholder: 'ابحث عن زبون آخر… (Enter = زبون نقدي)', autocomplete: 'off' });
+  const list = h('div', { class: 'cust-list' });
+  let m;
+  const done = cid => { m.close(); finalizeCheckout(tab, pay, cid); };
+  const bigRow = (id, name, logoHtml, sub, cls) => h('button', { class: 'cust-row co-big ' + (cls || ''), onclick: () => {
+    if (pay === 'credit' && !id) return toast('البيع الآجل يتطلب زبوناً مسجلاً — اختر دكتورة نادية أو زبوناً آخر', 'r');
+    done(id);
+  } },
+    h('span', { class: 'cust-av', html: logoHtml }),
+    h('div', { class: 'cust-nm' }, h('b', {}, name), h('small', {}, sub)));
+  const nadia = findCust(DR_NADIA_ID);
+  list.append(
+    bigRow(null, 'زبون نقدي', icon('store'), 'بيع مباشر بدون حساب'),
+    nadia ? bigRow(DR_NADIA_ID, 'دكتورة نادية', '<img src="nadia-logo.svg" alt="">', 'تُحفظ القائمة في حسابها', 'pink') : null);
+  const draw = () => {
+    list.querySelectorAll('.cust-x').forEach(n => n.remove());
+    const s = q.value.trim().toLowerCase();
+    if (!s) return;
+    state.customers.filter(c => !c.deleted && c.id !== DR_NADIA_ID && String(c.name).toLowerCase().includes(s))
+      .forEach(c => list.append(h('button', { class: 'cust-row cust-x', onclick: () => done(c.id) },
+        h('span', { class: 'cust-av' }, esc(String(c.name).trim().charAt(0) || '؟')),
+        h('div', { class: 'cust-nm' }, h('b', {}, c.name)))));
+  };
+  q.addEventListener('input', draw);
+  q.addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    if (pay === 'credit') { const first = list.querySelector('.cust-x'); if (first) first.click(); else toast('البيع الآجل يتطلب زبوناً مسجلاً', 'r'); }
+    else done(null);
+  });
+  m = openModal({ title: 'حفظ القائمة باسم…', icon: 'users', body: h('div', {}, list, q) });
+  setTimeout(() => q.focus(), 60);
+}
+
+/* تنفيذ البيع — الخطوة 2: الحفظ الفعلي في حساب الزبون المختار */
+async function finalizeCheckout(tab, pay, customerId) {
+  const st = tab.state;
+  if (st.processing || !st.cart.length) return;
+  st.processing = true; // قفل مؤقت لمنع الضغط المزدوج
   const acc = me();
   const items = st.cart.map(it => {
     const p = findProd(it.productId);
@@ -1134,7 +1101,7 @@ async function checkout(tab, pay) {
   const sale = {
     id: uid(), type: 'sale', version: 1, versions: [],
     items, subtotal, discount: st.discount, net, cost, profit: net - cost,
-    pay, customerId: st.customerId || null, customerName: st.customerId ? (findCust(st.customerId) || {}).name : 'زبون نقدي',
+    pay, customerId: customerId || null, customerName: customerId ? (findCust(customerId) || {}).name : 'زبون نقدي',
     employeeId: acc.id, employeeName: acc.name,
     ts, date: dateStr(ts), time: timeStr(ts), deviceId: DEVICE_ID,
   };
@@ -1143,16 +1110,15 @@ async function checkout(tab, pay) {
     const p = findProd(it.productId);
     if (p) { p.stockBase = (p.stockBase || 0) - it.qtyBase; await save('products', p); }
   }
-    st.cart = []; st.discount = 0; st.processing = false;
-  renderTabContent(tab); // إعادة بناء كاملة للتبويب — تمنع تكرار الواجهة نهائياً
+  st.cart = []; st.discount = 0; st.processing = false;
+  renderTabContent(tab);
   renderSideNav();
-  toast(`تمت عملية البيع بنجاح — ${fmt(net)} ${cur()}`);
+  toast(`تمت عملية البيع بنجاح — ${fmt(net)} ${cur()}${customerId ? ` — ${sale.customerName}` : ''}`);
 }
 
 /* اللوح الجانبي لنقطة البيع */
 /* ═══ زبون دكتورة نادية: زبون ثابت له تبويب مبيعات ذكي في نقطة البيع ═══ */
 const DR_NADIA_ID = 'cust_dr_nadia';
-const isDrNadia = tab => (tab && tab.state ? tab.state.customerId : state.customerId) === DR_NADIA_ID;
 
 function renderPOSSide(tab) {
   const st = tab.state;
@@ -1160,17 +1126,13 @@ function renderPOSSide(tab) {
   const body = h('div', { class: 'side-body' });
   const tabsBar = h('div', { class: 'side-tabs' });
 
-  /* عند اختيار دكتورة نادية يُفتح تبويبها تلقائياً — وهو أول تبويب */
-  if (isDrNadia(tab)) st.sideTab = 'dr';
-  else if (st.sideTab === 'dr') st.sideTab = 'featured';
-
-  const TABS = () => isDrNadia(tab)
-    ? [['dr', 'دكتورة نادية'], ['featured', 'المميز'], ['invoices', 'الفواتير السابقة'], ['shortage', 'النواقص'], ['shift', 'تقرير الشفت']]
-    : [['featured', 'المميز'], ['invoices', 'الفواتير السابقة'], ['shortage', 'النواقص'], ['shift', 'تقرير الشفت']];
+  /* ★ تبويب دكتورة نادية دائم الظهور للإضافة السريعة — الزبون نفسه يُختار لحظة الحفظ */
+  const TABS = [['dr', 'دكتورة نادية'], ['featured', 'المميز'], ['invoices', 'الفواتير السابقة'], ['shortage', 'النواقص'], ['shift', 'تقرير الشفت']];
+  if (!TABS.some(([k]) => k === st.sideTab)) st.sideTab = 'featured';
 
   function draw() {
     tabsBar.innerHTML = '';
-    TABS().forEach(([k, l]) => tabsBar.append(
+    TABS.forEach(([k, l]) => tabsBar.append(
       h('div', { class: 'side-tab' + (st.sideTab === k ? ' active' : ''), onclick: () => { st.sideTab = k; draw(); } }, l)));
     body.innerHTML = '';
     if (st.sideTab === 'dr') drawDrNadia(tab, body);
@@ -1184,7 +1146,8 @@ function renderPOSSide(tab) {
   return side;
 }
 
-/* ★ تبويب دكتورة نادية — الأصناف مرتّبة تنازلياً بحسب عدد مرات البيع (الأكثر أولاً)، وكل صنف له زر إخفاء نهائي */
+/* ★ تبويب دكتورة نادية — جدول مدمج: كل صنف صف صغير (الاسم + مرات البيع)،
+   القائمة كاملة بلا اقتطاع ولا «+3»، مرتبة تنازلياً: الأكثر بيعاً في الأعلى */
 function drawDrNadia(tab, body) {
   const hidden = new Set(state.settings.drHidden || []);
   const tally = new Map();
@@ -1199,25 +1162,23 @@ function drawDrNadia(tab, body) {
   const rows = [...tally.entries()]
     .filter(([pid]) => !hidden.has(pid) && findProd(pid))
     .map(([pid, e]) => ({ p: findProd(pid), count: e.count, qty: e.qty }))
-    .sort((a, b) => (b.count - a.count) || (b.qty - a.qty));   /* الأكثر بيعاً في الأعلى */
+    .sort((a, b) => (b.count - a.count) || (b.qty - a.qty));   /* تنازلي صارم */
 
   body.append(h('div', { class: 'side-actions' },
     h('button', { class: 'mini-btn red', onclick: () => openDrHiddenModal(tab) }, h('span', { html: icon('trash') }), 'الأصناف المخفية')));
 
   if (!rows.length) {
     body.append(h('div', { class: 'empty-note' }, 'لا مبيعات مسجّلة للدكتورة نادية بعد',
-      h('br'), 'اختر «دكتورة نادية» من الشريط العلوي وبِع لها أصنافاً ليظهر ترتيبها هنا'));
+      h('br'), 'عند حفظ أي قائمة بيع اختر «دكتورة نادية» ليظهر ترتيب أصنافها هنا'));
     return;
   }
-  const grid = h('div', { class: 'feat-grid dr-grid' });
-  rows.forEach((r, i) => grid.append(h('div', { class: 'feat-cell dr-cell', title: 'اضغط للإضافة للسلة', onclick: () => addToCart(tab, r.p) },
-    h('span', { class: 'dr-rank' }, i + 1),
-    h('span', { html: icon('pill') }),
-    h('div', { style: { flex: 1, minWidth: 0 } }, r.p.brandName,
-      h('small', { style: { display: 'block', color: 'var(--muted)', fontWeight: 700, fontSize: '10.5px' } },
-        `بِيعت ${r.count} مرة • ${fmt(r.qty)} ${smallUnitName(r.p)}`)),
-    h('span', { class: 'feat-price' }, `${fmt(salePerUnit(r.p, r.p.units.length - 1))} ${cur()}`),
-    h('button', { class: 'dr-del', title: 'إخفاء هذا الصنف من التبويب نهائياً', html: icon('close'),
+  const tbody = h('tbody');
+  rows.forEach((r, i) => tbody.append(h('tr', { class: 'dr-row', title: 'اضغط للإضافة للسلة', onclick: () => addToCart(tab, r.p) },
+    h('td', { class: 'td-seq' }, i + 1),
+    h('td', { class: 'td-name' }, r.p.brandName, coTag(r.p)),
+    h('td', {}, h('span', { class: 'badge b' }, `${r.count}×`)),
+    h('td', { class: 'td-num', style: { fontSize: '12px' } }, fmt(salePerUnit(r.p, r.p.units.length - 1))),
+    h('td', {}, h('button', { class: 'dr-del2', title: 'إخفاء هذا الصنف من التبويب نهائياً', html: icon('close'),
       onclick: async e => {
         e.stopPropagation();
         const yes = await confirmBox(`إخفاء «${r.p.brandName}» من تبويب دكتورة نادية؟ لن يظهر هنا بعد الآن.`, { danger: true, okLabel: 'إخفاء' });
@@ -1226,8 +1187,11 @@ function drawDrNadia(tab, body) {
         await save('settings', state.settings);
         renderTabContent(tab);
         toast(`أُخفي «${r.p.brandName}» من تبويب دكتورة نادية`, 'b');
-      } }))));
-  body.append(grid);
+      } })))));
+  body.append(h('div', { class: 'tbl-scroll dr-table' },
+    h('table', { class: 'tbl' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'ت'), h('th', {}, 'الصنف'), h('th', {}, 'مرات البيع'), h('th', {}, 'السعر'), h('th', {}, ''))),
+      tbody)));
 }
 
 function openDrHiddenModal(tab) {
@@ -1448,7 +1412,8 @@ function openBarcodePrint(p, code) {
       h('div', { class: 'f-field full' }, h('label', {}, 'اسم الملصق (قابل للتعديل بالكامل)'), lblInp),
       h('div', { class: 'f-field' }, h('label', {}, 'عدد الملصقات المطبوعة'), qtyInp),
       h('div', { class: 'f-field' }, h('label', {}, 'رقم الباركود'), h('div', { style: { direction: 'ltr', fontWeight: 900, fontSize: '16px' } }, String(code))),
-      h('div', { class: 'f-field full' }, h('div', { class: 'f-hint' }, 'الملصق يُطبع بمقاس 38 مم عرض × 25 مم ارتفاع — مناسب لطابعات الملصقات الحرارية.'))),
+            h('div', { class: 'f-field full' }, h('div', { class: 'f-hint' },
+        `طباعة صامتة مباشرة على «${(state.settings.printer || {}).name || 'الطابعة الافتراضية'}» بمقاس ${(state.settings.printer || {}).w || 38}×${(state.settings.printer || {}).h || 25} مم — الطابعة والأبعاد من: الإعدادات ← الطابعة والملصقات`))),
     actions: [
       { label: 'إلغاء', cls: 'n', onClick: c => c() },
       { label: 'طباعة', cls: 'g', icon: 'print', big: true,
@@ -1458,19 +1423,44 @@ function openBarcodePrint(p, code) {
   setTimeout(() => { lblInp.focus(); lblInp.select(); }, 80);
 }
 
-/* ينشئ عدد النسخ داخل طبقة الطباعة ثم يستدعي طابعة النظام (تعمل داخل Electron) */
-function printBarcodeLabels(name, code, qty) {
+/* ★ يضبط مقاس صفحة الطباعة ديناميكياً حسب إعدادات الطابعة (يتغلب على قاعدة 38×25 الثابتة) */
+function setLabelPage(wMm, hMm) {
+  let st = document.getElementById('label-page-style');
+  if (!st) { st = h('style', { id: 'label-page-style' }); document.head.append(st); }
+  st.textContent = `@page{size:${wMm}mm ${hMm}mm;margin:0}
+@media print{.print-area .print-label{width:${wMm}mm!important;height:${hMm}mm!important;border:0;page-break-after:always}
+.print-area .print-label:last-child{page-break-after:auto}}`;
+}
+
+/* ★ طباعة صامتة مباشرة عبر Electron: الطابعة والأبعاد من الإعدادات — بلا نافذة إعدادات وبلا هدر ملصقات.
+   في المتصفح (أو عند فشل الطباعة الصامتة) يسقط تلقائياً على نافذة النظام. */
+async function printBarcodeLabels(name, code, qty) {
   const old = document.getElementById('print-root'); if (old) old.remove();
+  const pr = state.settings.printer || {};
+  const wMm = pr.w || 38, hMm = pr.h || 25;
+  setLabelPage(wMm, hMm);
   const root = h('div', { id: 'print-root', class: 'print-area' });
   const svg = barcodeSVG(code);
-  for (let i = 0; i < qty; i++) root.append(
-    h('div', { class: 'print-label' },
+  for (let i = 0; i < qty; i++) {
+    const lb = h('div', { class: 'print-label' },
       h('div', { class: 'pl-name' }, name),
       h('div', { class: 'pl-code', html: svg }),
-      h('div', { class: 'pl-num' }, String(code))));
+      h('div', { class: 'pl-num' }, String(code)));
+    lb.style.width = wMm + 'mm'; lb.style.height = hMm + 'mm';
+    root.append(lb);
+  }
   document.body.append(root);
+  const cleanup = () => setTimeout(() => root.remove(), 600);
+  if (window.desktop && window.desktop.print) {
+    try {
+      const r = await window.desktop.print.silent({ deviceName: pr.name || '', widthMm: wMm, heightMm: hMm });
+      if (r && r.ok) { toast(`طُبعت ${qty} ملصقاً على «${pr.name || 'الطابعة الافتراضية'}»`); cleanup(); return; }
+      if (r && /cancel/i.test(r.reason || '')) { cleanup(); return; }
+      toast('فشلت الطباعة الصامتة — راجع الإعدادات ← الطابعة. فُتحت نافذة النظام بدلاً منها', 'r');
+    } catch (e) { toast('تعذّر الوصول إلى الطابعة', 'r'); }
+  }
   window.print();
-  setTimeout(() => root.remove(), 800);
+  cleanup();
 }
 
 const FORMS = ['Tab','Cap','Amp','Vial','Gum','Syrup','Susp','Supp'];
@@ -1802,10 +1792,18 @@ function renderProductForm(tab) {
     }
     await save('products', f);
     toast(existing ? 'تم حفظ التعديلات' : `تمت إضافة «${f.brandName}»`);
-    if (P.returnTab) {
+        if (P.returnTab) {
       const rt = tabs.find(t => t.id === P.returnTab);
       if (rt && rt.type === 'purchase') {
-        addPurchaseItem(rt, f, 1);
+        if (P.editOnly) {
+          /* ★ تعديل من داخل قائمة الشراء: تحديث اسم/تعبئة السطر فقط — بلا إعادة إضافة وبلا مساس بسعر القائمة */
+          const it = (rt.state.items || []).find(x => x.productId === f.id);
+          if (it) {
+            it.name = f.brandName;
+            if (it.unitIdx > f.units.length - 1) it.unitIdx = f.units.length - 1;
+            if (rt.state.renderItems) rt.state.renderItems();
+          }
+        } else addPurchaseItem(rt, f, 1);
         closeTab(tab.id); activateTab(rt.id); renderSideNav(); return;
       }
     }
@@ -1912,12 +1910,24 @@ function renderPurchase(tab) {
           return ex;
         })()),
         h('td', { class: 'td-num td-total' }, fmt(it.buyPrice * it.qty)),
-        h('td', {}, h('button', { class: 'icon-btn del', html: icon('trash'), onclick: () => { st.items.splice(i, 1); st.renderItems(); drawTotals(); } })),
+        h('td', {}, h('div', { class: 'row-act' },
+          p ? h('button', { class: 'icon-btn edit', title: 'تعديل الصنف (التعبئة / سعر البيع) قبل الحفظ', html: icon('edit'),
+            onclick: () => openTab('product', { productId: p.id, returnTab: tab.id, editOnly: true }) }) : null,
+          h('button', { class: 'icon-btn del', title: 'حذف من القائمة', html: icon('trash'), onclick: () => { st.items.splice(i, 1); st.renderItems(); drawTotals(); } }))),
       ));
     });
     cartWrap.append(h('div', { class: 'tbl-scroll' },
       h('table', { class: 'tbl' },
-        h('thead', {}, h('tr', {}, h('th', {}, 'ت'), h('th', {}, 'المنتج'), h('th', {}, 'الوحدة'), h('th', {}, 'العدد'), h('th', {}, 'سعر الشراء'), h('th', {}, 'الإكسباير'), h('th', {}, 'المجموع'), h('th', {}, 'حذف'))),
+        h('thead', {},
+          h('tr', {},
+            h('th', {}, 'ت'),
+            h('th', {}, 'المنتج'),
+            h('th', {}, 'الوحدة'),
+            h('th', {}, 'العدد'),
+            h('th', {}, 'سعر الشراء'),
+            h('th', {}, 'الإكسباير'),
+            h('th', {}, 'المجموع'),
+            h('th', {}, 'إجراء'))),
         tbody)));
   };
 
@@ -1953,12 +1963,14 @@ function renderPurchase(tab) {
   st.renderItems(); drawTotals();
   setTimeout(() => sInput.focus(), 60);
 }
-function addPurchaseItem(tab, p, qty = 1) {
+function addPurchaseItem(tab, p, qty = 1, opts = {}) {
   const st = tab.state;
   st.items = st.items || [];
   const ex = st.items.find(it => it.productId === p.id && it.unitIdx === 0);
   if (ex) ex.qty += qty;
-  else st.items.push({ productId: p.id, name: p.brandName, unitIdx: 0, qty, buyPrice: costPerUnit(p, 0), expiry: p.expiry || '' });
+  else st.items.push({ productId: p.id, name: p.brandName, unitIdx: 0, qty,
+    buyPrice: opts.price || costPerUnit(p, 0),          /* سعر ورقة المذخر إن وُجد */
+    expiry: opts.expiry || p.expiry || '' });            /* الإكسباير من ورقة المذخر */
   if (st.renderItems) { st.renderItems(); }
   toast(`أُضيف «${p.brandName}» للقائمة`, 'b');
 }
@@ -2789,7 +2801,7 @@ function renderSettings(tab) {
   const acc = me();
   const page = h('div', { class: 'page', style: { overflowY: 'auto' } });
   page.append(h('div', { class: 'page-head' }, h('div', { class: 'page-title' }, h('span', { html: icon('settings') }), 'الإعدادات')));
-    const SECTIONS = [['profile','حسابي'],['pharmacy','الصيدلية والنظام'],['accounts','إدارة الحسابات'],['companies','الشركات'],['scanner','الماسح الذكي'],['backup','النسخ الاحتياطي']];
+    const SECTIONS = [['profile','حسابي'],['pharmacy','الصيدلية والنظام'],['printer','الطابعة والملصقات'],['accounts','إدارة الحسابات'],['companies','الشركات'],['scanner','الماسح الذكي'],['backup','النسخ الاحتياطي']];
     const nav = h('div', { class: 'settings-nav' }, SECTIONS // الصلاحيات مفتوحة: كل الحسابات ترى كل الأقسام حالياً (بطلبك)
     .map(([k, l]) => h('div', { class: 'set-chip' + (st.section === k ? ' active' : ''), onclick: () => { st.section = k; renderTabContent(tab); } }, l)));
   page.append(nav);
@@ -2839,6 +2851,37 @@ function renderSettings(tab) {
           await save('settings', state.settings);
           renderTopbar(); renderSideNav(); toast('تم حفظ إعدادات النظام');
         } }, h('span', { html: icon('check') }), 'حفظ الإعدادات'))));
+  }
+    else if (st.section === 'printer') {
+    /* ★ إعدادات طابعة الملصقات: كل شيء من داخل التطبيق — الطباعة بعدها صامتة بضغطة واحدة */
+    state.settings.printer = state.settings.printer || { name: '', w: 38, h: 25 };
+    const pr = state.settings.printer;
+    const prSel = h('select', {}, h('option', { value: '' }, '— الطابعة الافتراضية للنظام —'));
+    const statusEl = h('div', { class: 'f-hint' }, 'جارٍ قراءة طابعات النظام…');
+    (async () => {
+      if (!(window.desktop && window.desktop.print)) { statusEl.textContent = 'قائمة الطابعات متاحة داخل تطبيق سطح المكتب فقط'; return; }
+      const list = await window.desktop.print.list();
+      statusEl.textContent = list.length ? `تم العثور على ${list.length} طابعة في النظام` : 'لم يُعثر على أي طابعة مثبتة';
+      list.forEach(x => prSel.append(h('option', { value: x.name, selected: pr.name === x.name },
+        x.name + (x.isDefault ? ' (افتراضية)' : ''))));
+    })();
+    const wInp = h('input', { type: 'number', min: 20, max: 120, value: pr.w || 38 });
+    const hInp = h('input', { type: 'number', min: 10, max: 120, value: pr.h || 25 });
+    const savePr = async () => {
+      pr.name = prSel.value; pr.w = num(wInp.value) || 38; pr.h = num(hInp.value) || 25;
+      await save('settings', state.settings);
+    };
+    box.append(h('div', { class: 'form-grid', style: { maxWidth: '620px' } },
+      h('div', { class: 'f-field full' }, h('label', {}, 'طابعة الملصقات (Xprinter)'), prSel, statusEl),
+      h('div', { class: 'f-field' }, h('label', {}, 'عرض الملصق (مم)'), wInp),
+      h('div', { class: 'f-field' }, h('label', {}, 'ارتفاع الملصق (مم)'), hInp),
+      h('div', { class: 'f-field full' }, h('div', { class: 'f-hint' },
+        'لملصقاتك الحالية: العرض 38 والارتفاع 25. الاتجاه يُفرض عمودياً تلقائياً لكل ملصق — لن تُطبع صفحة عرضية ولن يُهدر أي ملصق. تأكد أيضاً أن مقاس الورق في تعريف الطابعة بويندوز هو 38×25مم.')),
+      h('div', { class: 'f-field full', style: { display: 'flex', gap: '10px', flexWrap: 'wrap' } },
+        h('button', { class: 'btn g', onclick: async () => { await savePr(); toast('حُفظت إعدادات الطابعة — الطباعة الآن صامتة دائماً'); } },
+          h('span', { html: icon('check') }), 'حفظ إعدادات الطابعة'),
+        h('button', { class: 'btn b', onclick: async () => { await savePr(); printBarcodeLabels('اختبار طباعة — ' + (state.settings.pharmacyName || ''), '000001', 1); } },
+          h('span', { html: icon('print') }), 'طباعة ملصق تجريبي'))));
   }
   else if (st.section === 'accounts') {
     const list = h('div', {});
@@ -2988,7 +3031,10 @@ function renderScannerTab(tab) {
       items.forEach(it => {
         const p = (it.productId && findProd(it.productId)) ||
           state.products.find(x => !x.deleted && x.brandName.trim().toLowerCase() === String(it.name || '').trim().toLowerCase());
-        if (p) addPurchaseItem(target, p, +it.qty || 1);
+        if (p) addPurchaseItem(target, p, +it.qty || 1, {
+          price: +it.price || 0,
+          expiry: (InvoiceScanner.normExpiry && InvoiceScanner.normExpiry(it.expiry)) || '', // الإكسباير من ورقة المذخر
+        });
       });
       activateTab(target.id);
       toast(`استُوردت ${items.length} مادة إلى قائمة الشراء`);

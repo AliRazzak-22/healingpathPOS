@@ -800,3 +800,22 @@ table.tbl tbody td{border-bottom:1px solid #d5dde8}
 table.tbl tbody tr:nth-child(even){background:#f4f7fb}
 table.tbl tbody tr:hover{background:var(--green-ghost)}
 
+/* ═══ نافذة اختيار الزبون لحظة الحفظ ═══ */
+.cust-row{width:100%;text-align:start;font-family:inherit;background:var(--white)}
+.cust-row.co-big{padding:13px 12px;border:1.5px solid var(--line);margin-bottom:8px}
+.cust-row.co-big:hover{background:var(--green-ghost);border-color:var(--green-soft)}
+.cust-row.co-big .cust-av{width:46px;height:46px;border-radius:14px}
+.cust-row.co-big .cust-av img{width:34px;height:34px}
+.cust-row.co-big .cust-nm b{font-size:16px}
+.cust-row.co-big.pink{background:#fff6fa;border-color:#f9c6dc}
+.cust-row.co-big.pink:hover{border-color:#ec7bb0}
+
+/* ═══ تبويب دكتورة نادية — جدول مدمج بصفوف صغيرة ═══ */
+.dr-table{border:1px solid var(--line);border-radius:13px;overflow:hidden;background:var(--white)}
+.side-body .tbl{font-size:12.5px}
+.side-body .tbl th,.side-body .tbl td{padding:7px 8px}
+.dr-row{cursor:pointer}
+.dr-row .td-name{font-size:12.5px;min-width:0}
+.dr-del2{width:24px;height:24px;border-radius:8px;background:var(--red-ghost);color:var(--red);display:flex;align-items:center;justify-content:center;flex:none}
+.dr-del2:hover{background:var(--red);color:#fff}
+.dr-del2 svg{width:12px;height:12px}

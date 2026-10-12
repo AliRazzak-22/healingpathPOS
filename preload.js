@@ -11,5 +11,9 @@ contextBridge.exposeInMainWorld('desktop', Object.freeze({
     onProgress:  cb => on('update:progress', cb),
     onReady:     cb => on('update:ready', cb),
     onError:     cb => on('update:error', cb),
+    print: {
+  list:   ()     => ipcRenderer.invoke('print:list'),
+  silent: (opts) => ipcRenderer.invoke('print:silent', opts),
+},
   }),
 }));

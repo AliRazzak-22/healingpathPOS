@@ -33,6 +33,26 @@ ipcMain.handle('update:download', e => {
   autoUpdater.downloadUpdate().catch(err => { downloading = false; send('update:error', String((err && err.message) || err).slice(0, 200)); });
 });
 ipcMain.handle('update:ignore', e => {
+  /* ═══ الطباعة الصامتة للملصقات — بلا نافذة إعدادات، بالأبعاد الدقيقة ═══ */
+ipcMain.handle('print:list', async e => {
+  if (!trusted(e) || !win) return [];
+  try { return await win.webContents.getPrintersAsync(); } catch { return []; }
+});
+ipcMain.handle('print:silent', (e, opts) => new Promise(res => {
+  if (!trusted(e) || !win) return res({ ok: false, reason: 'untrusted' });
+  const o = opts || {};
+  /* ★ إصلاح الطباعة العرضية: pageSize بالميكرون (38مم×25مم = 38000×25000)
+     مع portrait إجباري + حواف صفر — ملصق واحد = صفحة واحدة بالضبط، صفر هدر */
+  const w = Math.max(10000, Math.round((+o.widthMm || 38) * 1000));
+  const hh = Math.max(10000, Math.round((+o.heightMm || 25) * 1000));
+  win.webContents.print({
+    silent: true, printBackground: true,
+    deviceName: o.deviceName || undefined,
+    pageSize: { width: w, height: hh },
+    margins: { marginType: 'none' },
+    landscape: false, scaleFactor: 100, copies: 1,
+  }, (ok, reason) => res({ ok, reason: String(reason || '') }));
+}));
   if (!trusted(e)) return;
   ignoredUntil = Date.now() + IGNORE_MS;
   clearTimeout(ignoreTimer);

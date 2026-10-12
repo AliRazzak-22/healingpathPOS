@@ -8,14 +8,18 @@
 window.InvoiceScanner = (() => {
 
   
-  const PROMPT = `You are an expert pharmaceutical invoice OCR system for an Iraqi pharmacy.
-Analyze this invoice image and extract EVERY line item.
+    const PROMPT = `You are an expert pharmaceutical invoice OCR system for an Iraqi pharmacy.
+Analyze this invoice image and extract EVERY product line item.
 Return ONLY a JSON object (no markdown, no explanation) in this exact shape:
-{"supplier":"<distributor/supplier company name if printed, else \"\">","items":[{"name":"<drug brand name exactly as printed>","company":"<manufacturer company if printed, else \"\">","quantity":<number>,"unit_price":<number>,"total":<number>}]}
-Rules:
-- Keep drug names exactly as printed (Arabic or English), do not translate or invent.
-- quantity, unit_price, total must be plain numbers (no currency symbols).
-- If a value is unreadable use 0, and use "" for unknown text.
+{"supplier":"<supplier name if printed, else \"\">","items":[{"name":"","sci":"","dose":"","form":"","expiry":"","company":"","quantity":0,"unit_price":0,"total":0}]}
+Strict rules for each item:
+- name: the trade/brand name ONLY, in English (Latin) letters exactly as printed, Left-to-Right. Ignore every other text on the line. Never include Arabic text, company name, price or quantity inside name.
+- dose: the strength ONLY if explicitly printed (e.g. "500mg", "250mg/5ml", "10%"). If not clearly printed use "".
+- form: dosage form if printed — one of: Tab, Cap, Amp, Vial, Syrup, Susp, Drops, Cream, Oint, Gel, Supp, Sachet, Spray, Inhaler, Patch, Infusion. Otherwise "".
+- sci: the scientific (generic) name if the supplier printed it, else "".
+- expiry: the expiry date printed for this line, normalized to "YYYY-MM". If missing or unreadable use "".
+- company: manufacturer/brand company if printed, else "".
+- quantity, unit_price, total: plain numbers only (no currency symbols). If unreadable use 0.
 - Ignore headers, invoice totals, taxes, discounts and any non-product line.
 - Output must start with { and end with } and nothing else.`;
 
@@ -37,7 +41,51 @@ Rules:
     return (2 * inter) / (A.size + B.size);
   }
 
-  /* ★ البحث في المخزن أولاً — يمنع إنشاء أي نسخة مكررة */
+    /* ★ استخراج النص اللاتيني داخل الأقواس: «بايونير (Pioneer)» ← pioneer */
+  const latinOf = s => { const m = String(s || '').match(/[(\[]([A-Za-z][A-Za-z0-9&.\- ]{1,40})[)\]]/); return m ? norm(m[1]) : ''; };
+
+  /* ★ حل مشكلة الشركات: المقروء إنكليزي والمسجّل «عربي (إنكليزي)» —
+     المطابقة على النص الكامل + على اللاتيني داخل الأقواس معاً */
+  function resolveCompany(scanned) {
+    const raw = String(scanned || '').trim();
+    if (!raw) return '';
+    const cn = norm(raw);
+    const cs = state.settings.companies || [];
+    let hit = cs.find(c => norm(c.name) === cn);
+    if (!hit) hit = cs.find(c => { const l = latinOf(c.name); return l && (l === cn || l.includes(cn) || cn.includes(l)); });
+    if (!hit) hit = cs.find(c => { const n2 = norm(c.name); return n2 && (n2.includes(cn) || cn.includes(n2)); });
+    return hit ? hit.name : raw;
+  }
+
+  /* نقاط إضافية عند تطابق الشركة (تكسر التعادل بين أسماء متشابهة) */
+  function companyBonus(p, company) {
+    const cn = norm(company); if (!cn) return 0;
+    const full = norm(p.company), lat = latinOf(p.company);
+    if (full && full === cn) return 20;
+    if (lat && (lat === cn || lat.includes(cn) || cn.includes(lat))) return 20;
+    if (full && (full.includes(cn) || cn.includes(full))) return 10;
+    return 0;
+  }
+
+  /* ★ توحيد الإكسباير إلى YYYY-MM من أي صيغة مكتوبة في ورقة المذخر (05/2027، 2027-05، 05-27…) */
+  function normExpiry(v) {
+    const s = String(v || '').trim();
+    if (!s) return '';
+    let y, mo;
+    const m = s.match(/(\d{4})[\s\/\-.](\d{1,2})/) || s.match(/(\d{1,2})[\s\/\-.](\d{2,4})/);
+    if (m) {
+      if (m[1].length === 4) { y = +m[1]; mo = +m[2]; }
+      else { mo = +m[1]; y = +m[2]; if (y < 100) y += 2000; }
+    } else {
+      const y4 = s.match(/(20\d{2})/);
+      if (y4) { y = +y4[1]; mo = 12; } else return '';
+    }
+    if (!(y >= 2020 && y <= 2060) || !(mo >= 1 && mo <= 12)) return '';
+    return `${y}-${String(mo).padStart(2, '0')}`;
+  }
+
+    /* ★ البحث في المخزن أولاً — بمحرك بحث التطبيق نفسه (arTokens + _scoreProduct)
+     فالتطابق أصبح مطابقاً تماماً لما يعطيه البحث اليدوي: لا «موجود» زائف ولا «غير موجود» زائف */
   function bestMatch(name, company) {
     const n = norm(name);
     if (!n) return null;
@@ -48,17 +96,13 @@ Rules:
     if (m) return m;
     m = live.find(p => norm(p.scientificName) && norm(p.scientificName) === n);
     if (m) return m;
-    m = live.find(p => { const b = norm(p.brandName); return b && (b.includes(n) || n.includes(b)); });
-    if (m) return m;
-    /* مطابقة ضبابية عالية + تفضيل نفس الشركة */
+    const qt = arTokens(name);
     let best = null, bestScore = 0;
-    const cn = norm(company);
     live.forEach(p => {
-      let s = sim(n, norm(p.brandName));
-      if (cn && norm(p.company) && (norm(p.company).includes(cn) || cn.includes(norm(p.company)))) s += 0.08;
+      const s = (qt.length ? _scoreProduct(p, qt, true) : 0) + companyBonus(p, company);
       if (s > bestScore) { bestScore = s; best = p; }
     });
-    return bestScore >= 0.72 ? best : null;
+    return bestScore >= 35 ? best : null; /* عتبة محسوبة: تقبل الخطأ الإملائي الواحد وترفض التخمين */
   }
 
   /* شركة جديدة تُسجَّل في قائمة الشركات (نفس مصدر صفحة الصنف) */
@@ -71,17 +115,21 @@ Rules:
     await save('settings', state.settings);
   }
 
-  /* إنشاء صنف جديد بنفس أسلوب أصناف المخزن */
+    /* إنشاء صنف جديد — الاسم بصيغة ملزمة: التجاري - الجرعة - الشكل (إنكليزي LTR فقط)،
+     وداخلياً يحفظ: الاسم العلمي + الشكل + الجرعة + الإكسباير المقروء من ورقة المذخر */
   async function createProduct(it) {
     const price = +it.price || 0;
     const profit = +(state.settings.profitPct ?? 30);
+    const dose = String(it.dose || '').trim();
+    let form = String(it.form || '').trim();
+    if (form && !FORMS.includes(form)) FORMS.push(form); // شكل جديد يُضاف لقائمة الأشكال تلقائياً
     const p = {
       id: uid(),
-      brandName: String(it.name || '').trim(),
-      scientificName: '',
+      brandName: [String(it.name || '').trim(), dose, form].filter(Boolean).join(' '),
+      scientificName: String(it.sci || '').trim(),
       barcodes: [genBarcode()],
-      form: 'Tab', dose: '', expiry: '', featured: false,
-      company: String(it.company || '').trim(), country: '',
+      form: form || 'Tab', dose, expiry: normExpiry(it.expiry), featured: false,
+      company: resolveCompany(it.company), country: '',
       units: [{ name: 'قطعة', perNext: 1 }],
       purchasePriceTop: price,
       salePriceBase: price ? Math.round(price * (1 + profit / 100)) : 0,
@@ -200,8 +248,12 @@ Rules:
       if (as >= 0 && ae >= 0) obj = { supplier: '', items: JSON.parse(text.slice(as, ae + 1)) };
       else throw new Error('تعذّر استخراج بيانات من الصورة');
     }
-    const items = (obj.items || []).map(x => ({
+        const items = (obj.items || []).map(x => ({
       name: String(x.name || '').trim(),
+      sci: String(x.sci || x.scientific || '').trim(),
+      dose: String(x.dose || '').trim(),
+      form: String(x.form || '').trim(),
+      expiry: String(x.expiry || '').trim(),
       company: String(x.company || '').trim(),
       qty: +x.quantity || +x.qty || 0,
       price: +x.unit_price || +x.price || 0,
@@ -255,7 +307,12 @@ Rules:
         const parsed = parseItems(data);
         supplier = parsed.supplier; items = parsed.items;
         if (!items.length) throw new Error('لم يُعثر على مواد في الفاتورة');
-        items.forEach(it => { const m = bestMatch(it.name, it.company); it.productId = m ? m.id : null; });
+                /* الشركة تُترجم أولاً لاسمها المسجّل (عربي/إنكليزي) ثم تُطابَخ الأصناف */
+        items.forEach(it => {
+          it.company = resolveCompany(it.company);
+          const m = bestMatch(it.name, it.company);
+          it.productId = m ? m.id : null;
+        });
         drawTable(dataUrl);
       } catch (e) {
         stage.innerHTML = `<div class="readonly-banner" style="border-color:var(--red-soft);background:var(--red-ghost);color:var(--red)">
@@ -263,50 +320,81 @@ Rules:
       }
     }
 
-    function drawTable(imgUrl) {
+        function drawTable(imgUrl) {
       stage.innerHTML = '';
       const wrap = document.createElement('div');
       wrap.style.display = 'flex'; wrap.style.flexDirection = 'column'; wrap.style.gap = '14px';
 
-      const matched = items.filter(it => it.productId).length;
+      const matched = items.filter(it => it.productId && !it.forceNew).length;
       const fresh = items.length - matched;
       const head = document.createElement('div');
       head.style.cssText = 'display:flex;align-items:center;gap:12px;flex-wrap:wrap';
       head.innerHTML = `<span class="badge g">${items.length} مادة</span>
         <span class="badge b">مطابقة للمخزن: ${matched}</span>
         ${fresh ? `<span class="badge amber">جديدة: ${fresh}</span>` : ''}
-        ${supplier ? `<span class="badge n">المذخر: ${supplier}</span>` : ''}
-        <span style="font-weight:700;color:var(--muted);font-size:12.5px">راجع الأسماء والكميات وعدّل أي خطأ قبل الاستيراد</span>`;
+        ${supplier ? `<span class="badge n">المذخر: ${esc(supplier)}</span>` : ''}
+        <span style="font-weight:700;color:var(--muted);font-size:12.5px">راجع وعدّل — زرّا «موجود / ليس هو» يصححان أي مطابقة خاطئة فوراً</span>`;
 
       const tbl = document.createElement('table');
       tbl.className = 'tbl editable-table';
-      tbl.innerHTML = `<thead><tr><th>ت</th><th>اسم العلاج</th><th>الشركة</th><th>الكمية</th><th>السعر المفرد</th><th>المجموع</th><th>الحالة</th><th></th></tr></thead>`;
+      tbl.innerHTML = `<thead><tr><th>ت</th><th>اسم العلاج (إنكليزي LTR)</th><th>الجرعة</th><th>الشكل</th><th>الإكسباير</th><th>الشركة</th><th>الكمية</th><th>السعر المفرد</th><th>المجموع</th><th>الحالة</th><th></th></tr></thead>`;
       const tbody = document.createElement('tbody');
 
       items.forEach((it, i) => {
         const tr = document.createElement('tr');
-        const m = it.productId ? findProd(it.productId) : null;
         tr.innerHTML = `
           <td class="td-seq">${i + 1}</td>
-          <td><input data-f="name" value="${String(it.name).replace(/"/g, '&quot;')}"></td>
-          <td style="width:170px"><input data-f="company" value="${String(it.company || '').replace(/"/g, '&quot;')}"></td>
-          <td style="width:90px"><input data-f="qty" type="number" value="${it.qty}"></td>
-          <td style="width:110px"><input data-f="price" type="number" value="${it.price}"></td>
+          <td style="min-width:190px"><input data-f="name" dir="ltr" value="${esc(it.name)}">
+            <input data-f="sci" dir="ltr" placeholder="الاسم العلمي (إن كتبه المذخر)" style="margin-top:4px;font-size:11.5px;color:var(--muted)" value="${esc(it.sci || '')}"></td>
+          <td style="width:74px"><input data-f="dose" dir="ltr" value="${esc(it.dose || '')}"></td>
+          <td style="width:74px"><input data-f="form" dir="ltr" value="${esc(it.form || '')}"></td>
+          <td style="width:88px"><input data-f="expiry" dir="ltr" placeholder="YYYY-MM" value="${esc(normExpiry(it.expiry) || it.expiry || '')}"></td>
+          <td style="width:150px"><input data-f="company" value="${esc(it.company || '')}"></td>
+          <td style="width:80px"><input data-f="qty" type="number" value="${it.qty}"></td>
+          <td style="width:100px"><input data-f="price" type="number" value="${it.price}"></td>
           <td class="td-num td-total">${(it.qty * it.price || it.total).toLocaleString('en-US')}</td>
-          <td class="td-match">${m
-            ? `<span class="badge g">موجود: ${m.brandName}</span>`
-            : `<span class="badge amber">جديد — سيُضاف للمخزن</span>`}</td>
+          <td class="td-match"></td>
           <td><button class="icon-btn del" title="حذف السطر"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg></button></td>`;
+
+        const matchTd = tr.querySelector('.td-match');
+        matchTd.style.cssText = 'min-width:170px';
+        /* خلية الحالة + زرا التصحيح: «موجود بالمخزن — اختره» و«ليس هو — أنشئ جديد» */
+        const paintMatch = () => {
+          const m = (!it.forceNew && it.productId) ? findProd(it.productId) : null;
+          matchTd.innerHTML = '';
+          const box = document.createElement('div');
+          box.style.cssText = 'display:flex;gap:6px;align-items:center;flex-wrap:wrap';
+          if (m) {
+            const b = document.createElement('span'); b.className = 'badge g'; b.textContent = 'موجود: ' + m.brandName;
+            const bn = document.createElement('button');
+            bn.className = 'mini-btn red'; bn.style.cssText = 'flex:none;padding:5px 9px;font-size:11px';
+            bn.textContent = 'ليس هو — أنشئ جديد';
+            bn.onclick = () => { it.forceNew = true; it.productId = null; drawTable(imgUrl); };
+            box.append(b, bn);
+          } else {
+            const b = document.createElement('span'); b.className = 'badge amber';
+            b.textContent = it.forceNew ? 'جديد (بقرارك) — سيُضاف للمخزن' : 'جديد — سيُضاف للمخزن';
+            const bp = document.createElement('button');
+            bp.className = 'mini-btn blue'; bp.style.cssText = 'flex:none;padding:5px 9px;font-size:11px';
+            bp.textContent = 'موجود بالمخزن — اختره';
+            bp.onclick = () => openPickProduct(it, () => drawTable(imgUrl));
+            box.append(b, bp);
+          }
+          matchTd.append(box);
+        };
+        paintMatch();
+
         tr.querySelectorAll('input').forEach(inp => inp.addEventListener('input', () => {
           const f = inp.dataset.f;
-          it[f] = (f === 'qty' || f === 'price') ? (+inp.value || 0) : inp.value;
-          tr.children[5].textContent = (it.qty * it.price || it.total).toLocaleString('en-US');
-          /* إعادة المطابقة الحيّة عند تغيير الاسم أو الشركة */
-          const mm = bestMatch(it.name, it.company);
-          it.productId = mm ? mm.id : null;
-          tr.querySelector('.td-match').innerHTML = mm
-            ? `<span class="badge g">موجود: ${esc(mm.brandName)}</span>`
-            : `<span class="badge amber">جديد — سيُضاف للمخزن</span>`;
+          if (f === 'qty' || f === 'price') it[f] = (+inp.value || 0);
+          else it[f] = inp.value;
+          tr.children[8].textContent = (it.qty * it.price || it.total).toLocaleString('en-US');
+          /* إعادة المطابقة الحيّة عند تغيير الاسم/الشركة — إلا إذا قرر المستخدم «ليس هو» */
+          if ((f === 'name' || f === 'company') && !it.forceNew) {
+            const mm = bestMatch(it.name, resolveCompany(it.company));
+            it.productId = mm ? mm.id : null;
+            paintMatch();
+          }
         }));
         tr.querySelector('.icon-btn').onclick = () => { items.splice(i, 1); drawTable(imgUrl); };
         tbody.append(tr);
@@ -323,10 +411,15 @@ Rules:
       importBtn.onclick = async () => {
         importBtn.disabled = true; importBtn.innerHTML = 'جارٍ الإنشاء والاستيراد…';
         for (const it of items) {
-          /* ★ لا إنشاء إلا عند غياب أي مطابقة — بحث مخزني أولاً دائماً */
-          let p = it.productId ? findProd(it.productId) : null;
-          if (!p) p = bestMatch(it.name, it.company);
+          /* ★ لا إنشاء إلا عند غياب المطابقة أو عند قرار المستخدم «ليس هو» */
+          let p = (!it.forceNew && it.productId) ? findProd(it.productId) : null;
+          if (!p && !it.forceNew) p = bestMatch(it.name, it.company);
           if (!p) p = await createProduct(it);
+          else {
+            /* الإكسباير المقروء من ورقة المذخر يُعتمد للصنف الموجود إن كان بلا تاريخ */
+            const ex = normExpiry(it.expiry);
+            if (ex && !p.expiry) { p.expiry = ex; await save('products', p); }
+          }
           it.productId = p.id;
         }
         onImport(items);
@@ -341,7 +434,30 @@ Rules:
       wrap.append(head, tbl, foot);
       stage.append(wrap);
     }
+
+    /* ★ منتقي «موجود بالمخزن»: بحث حي بمحرك التطبيق نفسه واختيار بنقرة واحدة */
+    function openPickProduct(it, onDone) {
+      const inp = h('input', { placeholder: 'ابحث عن الصنف الموجود فعلاً…', value: it.name || '',
+        style: { width: '100%', border: '1.5px solid var(--line)', borderRadius: '12px', padding: '11px 14px', fontWeight: 800, outline: 'none' } });
+      const list = h('div', { style: { marginTop: '12px', maxHeight: '320px', overflowY: 'auto' } });
+      const draw = () => {
+        list.innerHTML = '';
+        const res = searchProducts(inp.value);
+        if (!res.length) { list.append(h('div', { class: 'empty-note' }, 'لا نتائج — جرّب كتابة جزء من الاسم')); return; }
+        res.forEach(p => list.append(h('div', { class: 'inv-mini', onclick: () => {
+          it.productId = p.id; it.forceNew = false;
+          m.close(); onDone();
+          toast(`رُبط بـ «${p.brandName}»`);
+        } },
+          h('div', { class: 'im-top' }, h('span', {}, p.brandName), h('b', {}, fmt(salePerUnit(p, p.units.length - 1)))),
+          h('div', { class: 'im-sub' }, h('span', {}, p.company || ''), h('span', {}, `المخزون: ${fmt(p.stockBase || 0)}`))
+        )));
+      };
+      inp.addEventListener('input', draw);
+      const m = openModal({ title: 'اختيار الصنف الموجود من المخزن', icon: 'search', body: h('div', {}, inp, list) });
+      draw(); inp.focus(); inp.select();
+    }
   }
 
-    return { mount, usableModels: async k => orderModels(await listModels(k)) };
+    return { mount, usableModels: async k => orderModels(await listModels(k)), normExpiry, resolveCompany };
 })();
