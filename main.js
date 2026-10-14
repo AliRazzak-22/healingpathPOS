@@ -33,30 +33,68 @@ ipcMain.handle('update:download', e => {
   autoUpdater.downloadUpdate().catch(err => { downloading = false; send('update:error', String((err && err.message) || err).slice(0, 200)); });
 });
 ipcMain.handle('update:ignore', e => {
-  /* ═══ الطباعة الصامتة للملصقات — بلا نافذة إعدادات، بالأبعاد الدقيقة ═══ */
-ipcMain.handle('print:list', async e => {
-  if (!trusted(e) || !win) return [];
-  try { return await win.webContents.getPrintersAsync(); } catch { return []; }
-});
-ipcMain.handle('print:silent', (e, opts) => new Promise(res => {
-  if (!trusted(e) || !win) return res({ ok: false, reason: 'untrusted' });
-  const o = opts || {};
-  /* ★ إصلاح الطباعة العرضية: pageSize بالميكرون (38مم×25مم = 38000×25000)
-     مع portrait إجباري + حواف صفر — ملصق واحد = صفحة واحدة بالضبط، صفر هدر */
-  const w = Math.max(10000, Math.round((+o.widthMm || 38) * 1000));
-  const hh = Math.max(10000, Math.round((+o.heightMm || 25) * 1000));
-  win.webContents.print({
-    silent: true, printBackground: true,
-    deviceName: o.deviceName || undefined,
-    pageSize: { width: w, height: hh },
-    margins: { marginType: 'none' },
-    landscape: false, scaleFactor: 100, copies: 1,
-  }, (ok, reason) => res({ ok, reason: String(reason || '') }));
-}));
   if (!trusted(e)) return;
   ignoredUntil = Date.now() + IGNORE_MS;
   clearTimeout(ignoreTimer);
   ignoreTimer = setTimeout(announce, IGNORE_MS + 500);
+});
+
+/* ═══ الطباعة الصامتة للملصقات ═══ */
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const clampN = (v, lo, hi, d) => { v = +v; return isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
+function cleanSvg(s) {
+  s = String(s || '');
+  if (s.length > 200000 || !/^\s*<svg[\s>]/i.test(s)) return '';
+  return s.replace(/<script[\s\S]*?<\/script>/gi, '')
+          .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+          .replace(/javascript:/gi, '');
+}
+function labelsHtml(name, code, svg, qty, w, hh) {
+  const one = `<div class="l"><div class="n">${esc(name)}</div><div class="c">${svg}</div><div class="d">${esc(code)}</div></div>`;
+  return `<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<style>
+@page{size:${w}mm ${hh}mm;margin:0}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:${w}mm;background:#fff}
+.l{width:${w}mm;height:${(hh - 0.3).toFixed(2)}mm;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:.6mm 1mm;page-break-after:always;break-after:page;font-family:Tahoma,Arial,sans-serif;color:#000;direction:rtl}
+.l:last-child{page-break-after:auto;break-after:auto}
+.n{font-size:7pt;font-weight:700;line-height:1.1;max-height:7mm;overflow:hidden;width:100%}
+.c{width:100%}
+.c svg{width:100%!important;height:${(hh * 0.36).toFixed(1)}mm!important;display:block}
+.d{font-size:6pt;line-height:1.1;direction:ltr;letter-spacing:.5px}
+</style></head><body>${one.repeat(qty)}</body></html>`;
+}
+ipcMain.handle('print:list', async e => {
+  if (!trusted(e) || !win) return [];
+  try { return await win.webContents.getPrintersAsync(); } catch { return []; }
+});
+ipcMain.handle('print:silent', async (e, opts) => {
+  if (!trusted(e) || !win) return { ok: false, reason: 'untrusted' };
+  const o = opts || {};
+  const wMm = clampN(o.widthMm, 10, 200, 38), hMm = clampN(o.heightMm, 10, 200, 25);
+  const qty = Math.floor(clampN(o.qty, 1, 500, 1));
+  const svg = cleanSvg(o.svg);
+  if (!svg) return { ok: false, reason: 'bad-barcode' };
+  let deviceName = '';
+  if (o.deviceName) {
+    let list = []; try { list = await win.webContents.getPrintersAsync(); } catch {}
+    if (!list.some(p => p.name === o.deviceName)) return { ok: false, reason: 'printer-not-found' };
+    deviceName = o.deviceName;
+  }
+  const pw = new BrowserWindow({ show: false, width: 420, height: 320,
+    webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, javascript: false } });
+  try {
+    const html = labelsHtml(String(o.name || '').slice(0, 120), String(o.code || '').slice(0, 64), svg, qty, wMm, hMm);
+    await pw.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+    return await new Promise(res => pw.webContents.print({
+      silent: true, printBackground: true, deviceName: deviceName || undefined,
+      pageSize: { width: Math.round(wMm * 1000), height: Math.round(hMm * 1000) },
+      margins: { marginType: 'none' }, landscape: false, scaleFactor: 100, copies: 1,
+    }, (ok, reason) => res({ ok, reason: String(reason || '') })));
+  } catch (err) {
+    return { ok: false, reason: String((err && err.message) || err).slice(0, 120) };
+  } finally { if (!pw.isDestroyed()) pw.destroy(); }
 });
 
 function createWindow() {

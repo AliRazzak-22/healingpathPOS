@@ -225,6 +225,55 @@ const DEFAULT_SETTINGS = {
 };
 const findAcc  = id => state.accounts.find(a => a.id === id);
 const findProd = id => state.products.find(p => p.id === id && !p.deleted);
+
+/* ★ إجراءات المنتج الموحّدة: عرض / تعديل / حذف */
+function productActions(p, tab, extra = []) {
+  const inCart = tab && (tab.type === 'pos' || tab.type === 'purchase');
+  const canDelete = tab && tab.type === 'inventory';
+  return h('div', { class: 'row-act' },
+    h('button', { class: 'icon-btn view', title: 'تفاصيل وحركة المادة', html: icon('eye'),
+      onclick: () => openTab('details', { productId: p.id }) }),
+    h('button', { class: 'icon-btn edit', title: 'تعديل المنتج', html: icon('edit'),
+      onclick: () => openTab('product', inCart ? { productId: p.id, returnTab: tab.id, editOnly: true } : { productId: p.id }) }),
+    canDelete ? h('button', { class: 'icon-btn del', title: 'حذف المنتج من النظام', html: icon('trash'),
+      onclick: () => deleteProductEverywhere(p) }) : null,
+    extra);
+}
+function syncProductEverywhere(f) {
+  for (const t of tabs) {
+    const s = t.state || {};
+    if (t.type === 'pos' && Array.isArray(s.cart)) {
+      let hit = false;
+      s.cart.forEach(it => { if (it.productId !== f.id) return; hit = true;
+        it.name = f.brandName; it.unitIdx = Math.min(it.unitIdx, f.units.length - 1);
+        it.sale = salePerUnit(f, it.unitIdx); it.cost = costPerUnit(f, it.unitIdx); });
+      if (hit) { s.renderCart && s.renderCart(); s.renderTotals && s.renderTotals(); }
+    } else if (t.type === 'purchase' && Array.isArray(s.items)) {
+      let hit = false;
+      s.items.forEach(it => { if (it.productId !== f.id) return; hit = true;
+        it.name = f.brandName; it.unitIdx = Math.min(it.unitIdx, f.units.length - 1); });
+      if (hit) { s.renderItems && s.renderItems(); s.drawTotals && s.drawTotals(); }
+    }
+  }
+}
+async function deleteProductEverywhere(p) {
+  const yes = await confirmBox(`حذف «${p.brandName}» من المخزن؟ (تبقى حركاته السابقة محفوظة)`, { danger: true, okLabel: 'حذف' });
+  if (!yes) return false;
+  p.deleted = true;
+  await save('products', p);
+  for (const t of tabs) {
+    const s = t.state || {};
+    if (t.type === 'pos' && Array.isArray(s.cart) && s.cart.some(it => it.productId === p.id)) {
+      s.cart = s.cart.filter(it => it.productId !== p.id);
+      s.renderCart && s.renderCart(); s.renderTotals && s.renderTotals();
+    } else if (t.type === 'purchase' && Array.isArray(s.items) && s.items.some(it => it.productId === p.id)) {
+      s.items = s.items.filter(it => it.productId !== p.id);
+      s.renderItems && s.renderItems(); s.drawTotals && s.drawTotals();
+    }
+  }
+  renderSideNav(); toast('تم الحذف', 'b');
+  return true;
+}
 const findSup  = id => state.suppliers.find(s => s.id === id);
 const findCust = id => state.customers.find(c => c.id === id);
 const me = () => findAcc(state.session);
@@ -840,7 +889,7 @@ function renderPOS(tab) {
   const st = tab.state;
   st.cart = st.cart || [];           // [{productId,name,unitIdx,qty,cost,sale}]
   st.discount = st.discount || 0;
-  st.sideTab = st.sideTab || 'featured';
+  st.sideTab = st.sideTab || 'dr';
 
  const wrap = h('div', { class: 'pos-layout' }); // ★ سلة واحدة بشعار الصيدلية — الزبون يُختار لحظة الحفظ
   const center = h('div', { class: 'pos-center' });
@@ -976,9 +1025,11 @@ function renderPOS(tab) {
         h('td', { class: 'td-num td-cost' }, fmt(it.cost)),
         h('td', { class: 'td-num td-sale' }, fmt(it.sale)),
         h('td', { class: 'td-num td-total' }, fmt(it.sale * it.qty)),
-        h('td', {}, h('div', { class: 'row-act' },
-          h('button', { class: 'icon-btn view', title: 'تفاصيل المنتج', html: icon('eye'), onclick: () => openTab('details', { productId: it.productId }) }),
-          h('button', { class: 'icon-btn del', title: 'حذف من السلة', html: icon('trash'), onclick: () => { st.cart.splice(i, 1); st.renderCart(); st.renderTotals(); } }))),
+        h('td', {}, (() => {
+          const rm = h('button', { class: 'icon-btn del', title: 'إزالة من السلة', html: icon('close'),
+            onclick: () => { st.cart.splice(i, 1); st.renderCart(); st.renderTotals(); } });
+          return p ? productActions(p, tab, rm) : h('div', { class: 'row-act' }, rm);
+        })()),
       ));
     });
     cartWrap.append(h('div', { class: 'tbl-scroll' },
@@ -1051,28 +1102,36 @@ async function checkout(tab, pay) {
 /* ★ نافذة اختيار الزبون لحظة الحفظ (زر البيع أو Ctrl+S):
    زبون نقدي / دكتورة نادية بضغطة واحدة — أو ابحث عن أي زبون آخر. Enter = زبون نقدي */
 function openCheckoutCustomer(tab, pay) {
-  const q = h('input', { class: 'cust-search', placeholder: 'ابحث عن زبون آخر… (Enter = زبون نقدي)', autocomplete: 'off' });
+  const q = h('input', { class: 'cust-search', placeholder: 'ابحث عن زبون آخر… (Enter = زبون نقدي) — أو اضغط رقماً: 1 نقدي، 2 د. نادية', autocomplete: 'off' });
   const list = h('div', { class: 'cust-list' });
   let m;
   const done = cid => { m.close(); finalizeCheckout(tab, pay, cid); };
-  const bigRow = (id, name, logoHtml, sub, cls) => h('button', { class: 'cust-row co-big ' + (cls || ''), onclick: () => {
+  const choose = id => {
     if (pay === 'credit' && !id) return toast('البيع الآجل يتطلب زبوناً مسجلاً — اختر دكتورة نادية أو زبوناً آخر', 'r');
     done(id);
-  } },
+  };
+  const keyBadge = n => h('span', { class: 'cust-key' }, String(n));
+  const bigRow = (id, name, logoHtml, sub, cls, n) => h('button', { class: 'cust-row co-big ' + (cls || ''), onclick: () => choose(id) },
     h('span', { class: 'cust-av', html: logoHtml }),
-    h('div', { class: 'cust-nm' }, h('b', {}, name), h('small', {}, sub)));
+    h('div', { class: 'cust-nm' }, h('b', {}, name), h('small', {}, sub)),
+    keyBadge(n));
   const nadia = findCust(DR_NADIA_ID);
+  /* الزبائن المضافون: الأقدم أولاً — رقمهم 3 ثم 4 ثم 5 … */
+  const others = () => state.customers.filter(c => !c.deleted && c.id !== DR_NADIA_ID).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   list.append(
-    bigRow(null, 'زبون نقدي', icon('store'), 'بيع مباشر بدون حساب'),
-    nadia ? bigRow(DR_NADIA_ID, 'دكتورة نادية', '<img src="nadia-logo.svg" alt="">', 'تُحفظ القائمة في حسابها', 'pink') : null);
+    bigRow(null, 'زبون نقدي', icon('store'), 'بيع مباشر بدون حساب', '', 1),
+    nadia ? bigRow(DR_NADIA_ID, 'دكتورة نادية', '<img src="nadia-logo.svg" alt="">', 'تُحفظ القائمة في حسابها', 'pink', 2) : null);
   const draw = () => {
     list.querySelectorAll('.cust-x').forEach(n => n.remove());
     const s = q.value.trim().toLowerCase();
     if (!s) return;
-    state.customers.filter(c => !c.deleted && c.id !== DR_NADIA_ID && String(c.name).toLowerCase().includes(s))
-      .forEach(c => list.append(h('button', { class: 'cust-row cust-x', onclick: () => done(c.id) },
+    others().forEach((c, i) => {
+      if (!String(c.name).toLowerCase().includes(s)) return;
+      list.append(h('button', { class: 'cust-row cust-x', onclick: () => done(c.id) },
         h('span', { class: 'cust-av' }, esc(String(c.name).trim().charAt(0) || '؟')),
-        h('div', { class: 'cust-nm' }, h('b', {}, c.name)))));
+        h('div', { class: 'cust-nm' }, h('b', {}, c.name)),
+        i + 3 <= 9 ? keyBadge(i + 3) : null));
+    });
   };
   q.addEventListener('input', draw);
   q.addEventListener('keydown', e => {
@@ -1081,6 +1140,18 @@ function openCheckoutCustomer(tab, pay) {
     else done(null);
   });
   m = openModal({ title: 'حفظ القائمة باسم…', icon: 'users', body: h('div', {}, list, q) });
+  /* ★ اختصارات الأرقام: تعمل فقط حين يكون حقل البحث فارغاً (وإلا تُكتب الأرقام في البحث) */
+  m.box.addEventListener('keydown', e => {
+    if (q.value || e.ctrlKey || e.altKey || e.metaKey) return;
+    const mt = /^(?:Digit|Numpad)([1-9])$/.exec(e.code || '');
+    if (!mt) return;
+    e.preventDefault();
+    const n = +mt[1];
+    if (n === 1) return choose(null);
+    if (n === 2) { if (nadia) choose(DR_NADIA_ID); return; }
+    const c = others()[n - 3];
+    if (c) choose(c.id); else toast('لا يوجد زبون بهذا الرقم', 'r');
+  });
   setTimeout(() => q.focus(), 60);
 }
 
@@ -1128,7 +1199,7 @@ function renderPOSSide(tab) {
 
   /* ★ تبويب دكتورة نادية دائم الظهور للإضافة السريعة — الزبون نفسه يُختار لحظة الحفظ */
   const TABS = [['dr', 'دكتورة نادية'], ['featured', 'المميز'], ['invoices', 'الفواتير السابقة'], ['shortage', 'النواقص'], ['shift', 'تقرير الشفت']];
-  if (!TABS.some(([k]) => k === st.sideTab)) st.sideTab = 'featured';
+  if (!TABS.some(([k]) => k === st.sideTab)) st.sideTab = 'dr';
 
   function draw() {
     tabsBar.innerHTML = '';
@@ -1435,32 +1506,34 @@ function setLabelPage(wMm, hMm) {
 /* ★ طباعة صامتة مباشرة عبر Electron: الطابعة والأبعاد من الإعدادات — بلا نافذة إعدادات وبلا هدر ملصقات.
    في المتصفح (أو عند فشل الطباعة الصامتة) يسقط تلقائياً على نافذة النظام. */
 async function printBarcodeLabels(name, code, qty) {
-  const old = document.getElementById('print-root'); if (old) old.remove();
   const pr = state.settings.printer || {};
   const wMm = pr.w || 38, hMm = pr.h || 25;
+  qty = Math.max(1, Math.min(500, Math.round(+qty) || 1));
+  if (window.desktop && window.desktop.print) {
+    try {
+      const r = await window.desktop.print.silent({
+        deviceName: pr.name || '', widthMm: wMm, heightMm: hMm, qty,
+        name: String(name || ''), code: String(code), svg: barcodeSVG(code) });
+      if (r && r.ok) toast(`طُبعت ${qty} ملصقاً على «${pr.name || 'الطابعة الافتراضية'}»`);
+      else if (!(r && /cancel/i.test(r.reason || '')))
+        toast(`فشلت الطباعة (${(r && r.reason) || 'غير معروف'}) — راجع الإعدادات ← الطابعة`, 'r');
+    } catch (e) { toast('تعذّر الوصول إلى الطابعة', 'r'); }
+    return;
+  }
+  /* المتصفح فقط */
+  const old = document.getElementById('print-root'); if (old) old.remove();
   setLabelPage(wMm, hMm);
   const root = h('div', { id: 'print-root', class: 'print-area' });
   const svg = barcodeSVG(code);
   for (let i = 0; i < qty; i++) {
     const lb = h('div', { class: 'print-label' },
-      h('div', { class: 'pl-name' }, name),
-      h('div', { class: 'pl-code', html: svg }),
-      h('div', { class: 'pl-num' }, String(code)));
+      h('div', { class: 'pl-name' }, name), h('div', { class: 'pl-code', html: svg }), h('div', { class: 'pl-num' }, String(code)));
     lb.style.width = wMm + 'mm'; lb.style.height = hMm + 'mm';
     root.append(lb);
   }
   document.body.append(root);
-  const cleanup = () => setTimeout(() => root.remove(), 600);
-  if (window.desktop && window.desktop.print) {
-    try {
-      const r = await window.desktop.print.silent({ deviceName: pr.name || '', widthMm: wMm, heightMm: hMm });
-      if (r && r.ok) { toast(`طُبعت ${qty} ملصقاً على «${pr.name || 'الطابعة الافتراضية'}»`); cleanup(); return; }
-      if (r && /cancel/i.test(r.reason || '')) { cleanup(); return; }
-      toast('فشلت الطباعة الصامتة — راجع الإعدادات ← الطابعة. فُتحت نافذة النظام بدلاً منها', 'r');
-    } catch (e) { toast('تعذّر الوصول إلى الطابعة', 'r'); }
-  }
   window.print();
-  cleanup();
+  setTimeout(() => root.remove(), 600);
 }
 
 const FORMS = ['Tab','Cap','Amp','Vial','Gum','Syrup','Susp','Supp'];
@@ -1791,19 +1864,12 @@ function renderProductForm(tab) {
         : [];
     }
     await save('products', f);
+    syncProductEverywhere(f);
     toast(existing ? 'تم حفظ التعديلات' : `تمت إضافة «${f.brandName}»`);
-        if (P.returnTab) {
+    if (P.returnTab) {
       const rt = tabs.find(t => t.id === P.returnTab);
-      if (rt && rt.type === 'purchase') {
-        if (P.editOnly) {
-          /* ★ تعديل من داخل قائمة الشراء: تحديث اسم/تعبئة السطر فقط — بلا إعادة إضافة وبلا مساس بسعر القائمة */
-          const it = (rt.state.items || []).find(x => x.productId === f.id);
-          if (it) {
-            it.name = f.brandName;
-            if (it.unitIdx > f.units.length - 1) it.unitIdx = f.units.length - 1;
-            if (rt.state.renderItems) rt.state.renderItems();
-          }
-        } else addPurchaseItem(rt, f, 1);
+      if (rt && (rt.type === 'purchase' || rt.type === 'pos')) {
+        if (!P.editOnly && rt.type === 'purchase') addPurchaseItem(rt, f, 1);
         closeTab(tab.id); activateTab(rt.id); renderSideNav(); return;
       }
     }
@@ -1886,6 +1952,11 @@ function renderPurchase(tab) {
     const tbody = h('tbody');
     st.items.forEach((it, i) => {
       const p = findProd(it.productId);
+      const totalTd = h('td', { class: 'td-num td-total' }, fmt(it.buyPrice * it.qty));
+      const live = () => { totalTd.textContent = fmt(it.buyPrice * it.qty); drawTotals(); };
+      const boxCss = { border: '1px solid var(--line)', borderRadius: '8px', padding: '5px', textAlign: 'center', fontWeight: 900 };
+      const rm = h('button', { class: 'icon-btn del', title: 'إزالة من القائمة', html: icon('close'),
+        onclick: () => { st.items.splice(i, 1); st.renderItems(); drawTotals(); } });
       tbody.append(h('tr', {},
         h('td', { class: 'td-seq' }, i + 1),
         h('td', { class: 'td-name' }, it.name, h('small', {}, p ? `${p.form || ''} ${p.dose || ''}` : '')),
@@ -1895,13 +1966,15 @@ function renderPurchase(tab) {
           return sel;
         })() : it.unitName || ''),
         h('td', {}, (() => {
-          const q = h('input', { type: 'number', value: it.qty, min: 1, style: { width: '70px', border: '1px solid var(--line)', borderRadius: '8px', padding: '5px', textAlign: 'center', fontWeight: 900 } });
-          q.addEventListener('change', () => { it.qty = Math.max(1, num(q.value) || 1); drawTotals(); });
+          const q = h('input', { type: 'number', value: it.qty, min: 1, style: { ...boxCss, width: '70px' } });
+          const apply = () => { it.qty = Math.max(1, num(q.value) || 1); live(); };
+          q.addEventListener('input', apply); q.addEventListener('change', apply);
           return q;
         })()),
         h('td', {}, (() => {
-          const pr = h('input', { type: 'number', value: it.buyPrice, min: 0, style: { width: '90px', border: '1px solid var(--line)', borderRadius: '8px', padding: '5px', textAlign: 'center', fontWeight: 900 } });
-          pr.addEventListener('change', () => { it.buyPrice = num(pr.value); drawTotals(); });
+          const pr = h('input', { type: 'number', value: it.buyPrice, min: 0, step: 'any', style: { ...boxCss, width: '90px' } });
+          const apply = () => { it.buyPrice = num(pr.value); live(); };
+          pr.addEventListener('input', apply); pr.addEventListener('change', apply);
           return pr;
         })()),
         h('td', {}, (() => {
@@ -1909,11 +1982,8 @@ function renderPurchase(tab) {
           ex.addEventListener('change', () => it.expiry = ex.value);
           return ex;
         })()),
-        h('td', { class: 'td-num td-total' }, fmt(it.buyPrice * it.qty)),
-        h('td', {}, h('div', { class: 'row-act' },
-          p ? h('button', { class: 'icon-btn edit', title: 'تعديل الصنف (التعبئة / سعر البيع) قبل الحفظ', html: icon('edit'),
-            onclick: () => openTab('product', { productId: p.id, returnTab: tab.id, editOnly: true }) }) : null,
-          h('button', { class: 'icon-btn del', title: 'حذف من القائمة', html: icon('trash'), onclick: () => { st.items.splice(i, 1); st.renderItems(); drawTotals(); } }))),
+        totalTd,
+        h('td', {}, p ? productActions(p, tab, rm) : h('div', { class: 'row-act' }, rm)),
       ));
     });
     cartWrap.append(h('div', { class: 'tbl-scroll' },
@@ -1935,6 +2005,7 @@ function renderPurchase(tab) {
   const totalEl = h('div', { class: 'tval' }, h('span', {}, '0'), ' ', h('small', {}, cur()));
   const discInp = h('input', { type: 'number', min: 0, placeholder: '0', value: st.discount || '' });
   discInp.addEventListener('input', () => { st.discount = num(discInp.value); drawTotals(); });
+  st.drawTotals = drawTotals;
   function drawTotals() {
     const t = st.items.reduce((s, it) => s + it.buyPrice * it.qty, 0);
     totalEl.firstChild.textContent = fmt(Math.max(0, t - st.discount));
@@ -1963,16 +2034,24 @@ function renderPurchase(tab) {
   st.renderItems(); drawTotals();
   setTimeout(() => sInput.focus(), 60);
 }
+const parsePrice = v => {
+  const n = parseFloat(String(v == null ? '' : v)
+    .replace(/[\u0660-\u0669]/g, d => d.charCodeAt(0) - 0x0660).replace(/\u066B/g, '.').replace(/[\u066C,\s]/g, ''));
+  return isFinite(n) && n > 0 ? n : 0;
+};
 function addPurchaseItem(tab, p, qty = 1, opts = {}) {
   const st = tab.state;
   st.items = st.items || [];
+  qty = num(qty) > 0 ? num(qty) : 1;
+  const price = parsePrice(opts.price);
   const ex = st.items.find(it => it.productId === p.id && it.unitIdx === 0);
-  if (ex) ex.qty += qty;
+  if (ex) { ex.qty += qty; if (price) ex.buyPrice = price; if (opts.expiry) ex.expiry = opts.expiry; }
   else st.items.push({ productId: p.id, name: p.brandName, unitIdx: 0, qty,
-    buyPrice: opts.price || costPerUnit(p, 0),          /* سعر ورقة المذخر إن وُجد */
-    expiry: opts.expiry || p.expiry || '' });            /* الإكسباير من ورقة المذخر */
-  if (st.renderItems) { st.renderItems(); }
-  toast(`أُضيف «${p.brandName}» للقائمة`, 'b');
+    buyPrice: price || costPerUnit(p, 0) || 0,
+    expiry: opts.expiry || p.expiry || '' });
+  if (st.renderItems) st.renderItems();
+  if (st.drawTotals) st.drawTotals();
+  if (!opts.silent) toast(`أُضيف «${p.brandName}» للقائمة`, 'b');
 }
 async function savePurchaseModal(tab) {
   const st = tab.state;
@@ -2552,13 +2631,7 @@ function renderInventory(tab) {
         h('td', {}, h('span', { class: 'badge ' + ((p.stockBase || 0) <= 0 ? 'r' : (p.stockBase || 0) <= (state.settings.lowStock ?? 10) ? 'amber' : 'g') },
           `${fmt(p.stockBase || 0)} ${smallUnitName(p)}`)),
         h('td', {}, p.expiry ? h('span', { class: 'badge ' + (expired ? 'r' : nearExp ? 'amber' : 'n') }, p.expiry) : '—'),
-        h('td', {}, h('div', { class: 'row-act' },
-          h('button', { class: 'icon-btn view', title: 'تفاصيل وحركة المادة', html: icon('eye'), onclick: () => openTab('details', { productId: p.id }) }),
-          h('button', { class: 'icon-btn edit', title: 'تعديل', html: icon('edit'), onclick: () => openTab('product', { productId: p.id }) }),
-          h('button', { class: 'icon-btn del', title: 'حذف', html: icon('trash'), onclick: async () => {
-            const yes = await confirmBox(`حذف «${p.brandName}» من المخزن؟ (تبقى حركاته السابقة محفوظة)`, { danger: true, okLabel: 'حذف' });
-            if (yes) { p.deleted = true; await save('products', p); draw(); renderSideNav(); toast('تم الحذف', 'b'); }
-          } }))),
+        h('td', {}, productActions(p, tab)),
       ));
     });
     bodyBox.append(h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl' },
@@ -3025,19 +3098,23 @@ function renderScannerTab(tab) {
   tab.el.append(page);
   InvoiceScanner.mount(mount, {
     getKey: () => state.settings.geminiKey,
-        onImport: items => {
+    onImport: items => {
       const rt = tab.props.returnTab && tabs.find(t => t.id === tab.props.returnTab);
       const target = (rt && rt.type === 'purchase') ? rt : openTab('purchase');
+      let added = 0, missed = 0;
       items.forEach(it => {
         const p = (it.productId && findProd(it.productId)) ||
           state.products.find(x => !x.deleted && x.brandName.trim().toLowerCase() === String(it.name || '').trim().toLowerCase());
-        if (p) addPurchaseItem(target, p, +it.qty || 1, {
-          price: +it.price || 0,
-          expiry: (InvoiceScanner.normExpiry && InvoiceScanner.normExpiry(it.expiry)) || '', // الإكسباير من ورقة المذخر
+        if (!p) { missed++; return; }
+        addPurchaseItem(target, p, +it.qty || 1, {
+          price: it.price ?? it.unitPrice ?? it.buyPrice ?? it.cost,
+          expiry: (InvoiceScanner.normExpiry && InvoiceScanner.normExpiry(it.expiry)) || '',
+          silent: true,
         });
+        added++;
       });
       activateTab(target.id);
-      toast(`استُوردت ${items.length} مادة إلى قائمة الشراء`);
+      toast(`استُوردت ${added} مادة إلى قائمة الشراء` + (missed ? ` — ${missed} غير موجودة في المخزن` : ''), missed ? 'r' : 'g');
     },
   });
 }
@@ -3544,6 +3621,230 @@ async function init() {
   window.addEventListener('online', () => Sync.init());
 }
 document.addEventListener('DOMContentLoaded', init);
+
+/* ═══════════════ الحاسبة العلمية العائمة — اضغط F1 للفتح والإغلاق ═══════════════ */
+const CalcEngine = (() => {
+  const S = { deg: true, ans: 0 };
+  const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+  const rad = x => (S.deg ? x * Math.PI / 180 : x);
+  const deg = r => (S.deg ? r * 180 / Math.PI : r);
+  const FN = {
+    sqrt: Math.sqrt, cbrt: Math.cbrt, abs: Math.abs, exp: Math.exp, ln: Math.log, log: Math.log10,
+    sin: x => Math.sin(rad(x)), cos: x => Math.cos(rad(x)), tan: x => Math.tan(rad(x)),
+    asin: x => deg(Math.asin(x)), acos: x => deg(Math.acos(x)), atan: x => deg(Math.atan(x)),
+  };
+  const CONST = { pi: Math.PI, e: Math.E };
+  const fact = n => {
+    if (!Number.isInteger(n) || n < 0 || n > 170) throw new Error('المضروب للأعداد الصحيحة 0–170 فقط');
+    let r = 1; for (let i = 2; i <= n; i++) r *= i; return r;
+  };
+  function tokenize(src) {
+    const s = String(src)
+      .replace(/[\u0660-\u0669]/g, d => d.charCodeAt(0) - 0x0660)
+      .replace(/[\u06F0-\u06F9]/g, d => d.charCodeAt(0) - 0x06F0)
+      .replace(/\u066B/g, '.').replace(/[\u066C,]/g, '')
+      .replace(/×/g, '*').replace(/÷/g, '/').replace(/[−–]/g, '-')
+      .replace(/π/g, 'pi').replace(/√/g, 'sqrt');
+    const out = []; let i = 0, m;
+    while (i < s.length) {
+      const c = s[i], rest = s.slice(i);
+      if (/\s/.test(c)) { i++; continue; }
+      if ((m = /^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/.exec(rest))) { out.push({ t: 'n', v: parseFloat(m[0]) }); i += m[0].length; continue; }
+      if ((m = /^[a-zA-Z]+/.exec(rest))) { out.push({ t: 'i', v: m[0].toLowerCase() }); i += m[0].length; continue; }
+      if ('+-*/^%!()'.includes(c)) { out.push({ t: 'o', v: c }); i++; continue; }
+      throw new Error('رمز غير مفهوم: ' + c);
+    }
+    return out;
+  }
+  function parse(tk) {
+    let p = 0;
+    const peek = () => tk[p], next = () => tk[p++];
+    const isOp = v => peek() && peek().t === 'o' && peek().v === v;
+    const startsPrimary = () => { const t = peek(); return t && (t.t === 'n' || t.t === 'i' || (t.t === 'o' && t.v === '(')); };
+    const close = () => { if (isOp(')')) next(); else if (peek()) throw new Error('قوس ناقص'); };
+    function expr() { let v = term(); while (isOp('+') || isOp('-')) { const o = next().v; const r = term(); v = o === '+' ? v + r : v - r; } return v; }
+    function term() {
+      let v = unary();
+      for (;;) {
+        if (isOp('*')) { next(); v *= unary(); }
+        else if (isOp('/')) { next(); v /= unary(); }
+        else if (startsPrimary()) v *= unary();
+        else return v;
+      }
+    }
+    function unary() { if (isOp('-')) { next(); return -unary(); } if (isOp('+')) { next(); return unary(); } return power(); }
+    function power() { const b = postfix(); if (isOp('^')) { next(); return Math.pow(b, unary()); } return b; }
+    function postfix() {
+      let v = primary();
+      for (;;) {
+        if (isOp('!')) { next(); v = fact(v); }
+        else if (isOp('%')) { next(); v = v / 100; }
+        else return v;
+      }
+    }
+    function primary() {
+      const t = next();
+      if (!t) throw new Error('العملية ناقصة');
+      if (t.t === 'n') return t.v;
+      if (t.t === 'o' && t.v === '(') { const v = expr(); close(); return v; }
+      if (t.t === 'i') {
+        if (t.v === 'ans') return S.ans;
+        if (own(CONST, t.v)) return CONST[t.v];
+        if (own(FN, t.v)) {
+          let a;
+          if (isOp('(')) { next(); a = expr(); close(); } else a = postfix();
+          return FN[t.v](a);
+        }
+        throw new Error('دالة غير معروفة: ' + t.v);
+      }
+      throw new Error('رمز في غير مكانه');
+    }
+    const v = expr();
+    if (p < tk.length) throw new Error('رمز زائد في العملية');
+    return v;
+  }
+  function run(src) {
+    try {
+      let v = parse(tokenize(src));
+      if (typeof v !== 'number' || !isFinite(v)) throw new Error('نتيجة غير معرّفة');
+      if (Math.abs(v) < 1e-12) v = 0;
+      return { ok: true, value: v };
+    } catch (e) { return { ok: false, msg: String((e && e.message) || e) }; }
+  }
+  const raw = n => String(+n.toPrecision(12));
+  const fmtN = n => n.toLocaleString('en-US', { maximumFractionDigits: 10 });
+  return { S, run, raw, fmt: fmtN };
+})();
+
+let _calcGeo = null, _calcExpr = '';
+function closeCalc() {
+  const w = document.getElementById('calc-win'); if (!w) return;
+  _calcGeo = { x: w._x, y: w._y, w: w.offsetWidth, h: w.offsetHeight };
+  _calcExpr = w._inp ? w._inp.value : '';
+  w.remove();
+}
+function openCalc() {
+  const g = _calcGeo || { x: 60, y: 90, w: 330, h: 470 };
+  const win = h('div', { id: 'calc-win', class: 'calc-win', role: 'dialog', 'aria-label': 'الحاسبة' });
+  win.style.width = g.w + 'px'; win.style.height = g.h + 'px';
+  let x = g.x, y = g.y, just = false;
+  const place = () => {
+    x = Math.min(Math.max(0, x), Math.max(0, window.innerWidth - 90));
+    y = Math.min(Math.max(0, y), Math.max(0, window.innerHeight - 44));
+    win._x = x; win._y = y;
+    win.style.transform = `translate(${x}px, ${y}px)`;
+  };
+  win._place = place;
+  const inp = h('input', { class: 'calc-in', type: 'text', dir: 'ltr', spellcheck: 'false', autocomplete: 'off', placeholder: '0' });
+  win._inp = inp;
+  const res = h('div', { class: 'calc-res' }, '');
+  const refresh = () => {
+    res.classList.remove('err');
+    const src = inp.value.trim();
+    if (!src) { res.textContent = ''; return; }
+    const r = CalcEngine.run(src);
+    res.textContent = r.ok ? '= ' + CalcEngine.fmt(r.value) : '';
+  };
+  const equals = () => {
+    const src = inp.value.trim(); if (!src) return;
+    const r = CalcEngine.run(src);
+    if (!r.ok) { res.textContent = r.msg; res.classList.add('err'); return; }
+    CalcEngine.S.ans = r.value;
+    inp.value = CalcEngine.raw(r.value);
+    res.textContent = '= ' + CalcEngine.fmt(r.value);
+    res.classList.remove('err');
+    just = true;
+  };
+  const ins = t => {
+    if (just) { if (!/^[+\-*\/^!%×÷−]/.test(t)) inp.value = ''; just = false; }
+    const a = inp.selectionStart == null ? inp.value.length : inp.selectionStart;
+    const b = inp.selectionEnd == null ? a : inp.selectionEnd;
+    inp.value = inp.value.slice(0, a) + t + inp.value.slice(b);
+    const c = a + t.length; inp.setSelectionRange(c, c);
+    refresh(); inp.focus();
+  };
+  const back = () => {
+    just = false;
+    const a = inp.selectionStart == null ? inp.value.length : inp.selectionStart;
+    const b = inp.selectionEnd == null ? a : inp.selectionEnd;
+    if (a !== b) { inp.value = inp.value.slice(0, a) + inp.value.slice(b); inp.setSelectionRange(a, a); }
+    else if (a > 0) { inp.value = inp.value.slice(0, a - 1) + inp.value.slice(a); inp.setSelectionRange(a - 1, a - 1); }
+    refresh(); inp.focus();
+  };
+  inp.addEventListener('input', () => { just = false; refresh(); });
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); equals(); return; }
+    if (just && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !/[+\-*\/^!%]/.test(e.key)) inp.value = '';
+    if (e.key.length === 1 || e.key === 'Backspace' || e.key === 'Delete') just = false;
+  });
+
+  const D = d => [d, d, 'n'];
+  const KEYS = [
+    ['DEG', 'deg', 'fn'], ['(', '(', 'fn'], [')', ')', 'fn'], ['⌫', 'bs', 'op'], ['C', 'clr', 'clr'],
+    ['sin', 'sin(', 'fn'], ['cos', 'cos(', 'fn'], ['tan', 'tan(', 'fn'], ['π', 'π', 'fn'], ['e', 'e', 'fn'],
+    ['√', '√(', 'fn'], ['x²', '^2', 'fn'], ['xʸ', '^', 'fn'], ['ln', 'ln(', 'fn'], ['log', 'log(', 'fn'],
+    D('7'), D('8'), D('9'), ['÷', '÷', 'op'], ['n!', '!', 'fn'],
+    D('4'), D('5'), D('6'), ['×', '×', 'op'], ['%', '%', 'fn'],
+    D('1'), D('2'), D('3'), ['−', '−', 'op'], ['Ans', 'Ans', 'fn'],
+    D('0'), ['.', '.', 'n'], ['00', '00', 'n'], ['+', '+', 'op'], ['=', '=', 'eq'],
+  ];
+  const keys = h('div', { class: 'calc-keys' });
+  KEYS.forEach(([label, act, cls]) => {
+    const b = h('button', { type: 'button', tabindex: '-1', class: 'calc-k ' + cls }, label);
+    if (act === 'deg') b.textContent = CalcEngine.S.deg ? 'DEG' : 'RAD';
+    b.addEventListener('click', () => {
+      if (act === 'bs') back();
+      else if (act === 'clr') { inp.value = ''; just = false; refresh(); inp.focus(); }
+      else if (act === '=') { equals(); inp.focus(); }
+      else if (act === 'deg') { CalcEngine.S.deg = !CalcEngine.S.deg; b.textContent = CalcEngine.S.deg ? 'DEG' : 'RAD'; refresh(); inp.focus(); }
+      else ins(act);
+    });
+    keys.append(b);
+  });
+
+  const head = h('div', { class: 'calc-head' },
+    h('span', { class: 'calc-title' }, 'الحاسبة'),
+    h('small', {}, 'F1 للإغلاق'),
+    h('button', { type: 'button', tabindex: '-1', class: 'calc-x', title: 'إغلاق', html: icon('close'), onclick: closeCalc }));
+  head.addEventListener('pointerdown', e => {
+    if (e.target.closest('.calc-x')) return;
+    e.preventDefault();
+    head.setPointerCapture(e.pointerId);
+    const sx = e.clientX - x, sy = e.clientY - y;
+    const mv = ev => { x = ev.clientX - sx; y = ev.clientY - sy; place(); };
+    const up = () => {
+      head.removeEventListener('pointermove', mv);
+      head.removeEventListener('pointerup', up);
+      head.removeEventListener('pointercancel', up);
+      inp.focus();
+    };
+    head.addEventListener('pointermove', mv);
+    head.addEventListener('pointerup', up);
+    head.addEventListener('pointercancel', up);
+  });
+  win.addEventListener('keydown', e => {
+    if (e.key === 'F1') return;            /* يمر للمستمع العام ليغلق الحاسبة */
+    e.stopPropagation();                   /* لا يتسرّب أي ضغط إلى نقطة البيع */
+    if (e.key === 'Escape') { e.preventDefault(); closeCalc(); }
+  });
+  win.addEventListener('mousedown', e => { if (e.target.closest('.calc-k')) e.preventDefault(); });
+  win.addEventListener('mouseup', () => { if (document.activeElement !== inp) inp.focus(); });
+
+  win.append(head, h('div', { class: 'calc-disp' }, inp, res), keys);
+  document.body.append(win);
+  place();
+  inp.value = _calcExpr || '';
+  refresh();
+  setTimeout(() => inp.focus(), 0);
+}
+function toggleCalc() { if (document.getElementById('calc-win')) closeCalc(); else openCalc(); }
+document.addEventListener('keydown', e => {
+  if (e.key !== 'F1' || e.ctrlKey || e.altKey || e.metaKey) return;
+  e.preventDefault();
+  if (!state.session && !document.getElementById('calc-win')) return;   /* لا تفتح قبل تسجيل الدخول */
+  toggleCalc();
+});
+window.addEventListener('resize', () => { const w = document.getElementById('calc-win'); if (w && w._place) w._place(); });
 /* ═══ أزرار النافذة (تصغير / إغلاق) ═══ */
 const WIN_MIN_IC = '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M5 18h14"/></svg>';
 function winControls() {
