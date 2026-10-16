@@ -285,6 +285,47 @@ Strict rules for each item:
     stage.style.marginTop = '16px';
     rootEl.append(drop, fileInp, stage);
 
+    /* ★ صندوق وارد الجوال: الصور المرفوعة من تطبيق الجوال تصل هنا وتُقرأ تلقائياً */
+    if (window._scanInboxOff) { try { window._scanInboxOff(); } catch (_) {} window._scanInboxOff = null; }
+    (() => {
+      let ref = null, stopped = false, seen = false, chain = Promise.resolve();
+      const gone = () => { if (rootEl.isConnected) seen = true; return seen && !rootEl.isConnected; };
+      const wait = ms => new Promise(r => setTimeout(r, ms));
+      const stop = () => { stopped = true; if (ref) { try { ref.off(); } catch (_) {} ref = null; } };
+      window._scanInboxOff = stop;
+      const toFile = dataUrl => {
+        const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl || '');
+        if (!m) return null;
+        const bin = atob(m[2]), arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        return new File([arr], 'phone-scan.jpg', { type: m[1] });
+      };
+      const onPhoto = snap => { chain = chain.then(async () => {
+        if (stopped) return;
+        const r = snap.ref, v = snap.val() || {};
+        if (v.status !== 'new') {
+          if (Date.now() - (v.createdAt || 0) > 86400000) await r.remove();
+          return;
+        }
+        const claim = await r.child('status').transaction(cur => cur === 'new' ? 'processing' : undefined);
+        if (!claim.committed) return;
+        const file = toFile(v.image);
+        if (!file) { await r.update({ status: 'failed', image: null }); return; }
+        while (!stopped && !gone() && stage.querySelector('.editable-table')) await wait(1500);
+        if (stopped || gone()) { await r.child('status').set('new'); return; }
+        toast('وصلت صورة من الجوال — جارٍ القراءة…');
+        await handle(file);
+        if (stage.querySelector('.editable-table')) await r.update({ status: 'done', image: null });
+        else await r.update({ status: 'failed', image: null });
+      }).catch(e => console.warn('scanInbox:', e)); };
+      (async () => {
+        while (!stopped && !gone() && !(typeof Sync !== 'undefined' && Sync.ready && Sync.db)) await wait(1500);
+        if (stopped || gone()) return;
+        ref = Sync.db.ref('pos/scanInbox');
+        ref.on('child_added', onPhoto, e => { console.warn('scanInbox:', e); toast('تعذّر استقبال صور الجوال: ' + ((e && (e.code || e.message)) || 'خطأ'), 'r'); });
+      })();
+    })();
+
     async function handle(file) {
       const key = getKey();
       if (!key) {

@@ -34,14 +34,36 @@ const pad2 = n => String(n).padStart(2, '0');
 function dateStr(ts = Date.now()) { const d = new Date(ts); return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`; }
 /* أول يوم وآخر يوم في الشهر الحالي (يُحسب لحظة الضغط) */
 function monthRange(d = new Date()) { return [dateStr(new Date(d.getFullYear(), d.getMonth(), 1).getTime()), dateStr(new Date(d.getFullYear(), d.getMonth() + 1, 0).getTime())]; }
-function timeStr(ts = Date.now()) { const d = new Date(ts); return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`; }
+function timeStr(ts = Date.now()) { const d = new Date(ts); const h24 = d.getHours(); const h12 = h24 % 12 || 12; return `${pad2(h12)}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())} ${h24 < 12 ? 'صباحاً' : 'مساءً'}`; }
 function fmtDate(ts) { if (!ts) return '—'; const d = new Date(ts); return `${pad2(d.getDate())}/${pad2(d.getMonth()+1)}/${d.getFullYear()}`; }
-function fmtTime(ts) { return ts ? timeStr(ts).slice(0,5) : '—'; }
+function fmtTime(ts) { return ts ? timeStr(ts).replace(/^(\d{2}:\d{2}):\d{2}( .*)$/, '$1$2') : '—'; }
 function dayName(ts = Date.now()) { return DAYS[new Date(ts).getDay()]; }
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const cur = () => state.settings.currency || 'د.ع';
 /* شارة الشركة المصنعة — تلاصق اسم البراند كنص واحد أينما عُرض */
 const coTag = p => p && p.company ? h('small', { class: 'co-tag' }, p.company) : null;
+
+/* ★ عداد تصاعدي/تنازلي ناعم لأرقام المجاميع — يتحرك تدريجياً (خصوصاً عند الخصم) بدل القفز المباشر */
+const _animState = new WeakMap();
+function animNum(node, val, suffix = '') {
+  if (!node) return;
+  val = Math.round((+val || 0) * 100) / 100;
+  let st = _animState.get(node);
+  if (!st) { st = { cur: 0, raf: 0 }; _animState.set(node, st); }
+  cancelAnimationFrame(st.raf);
+  if (st.cur === val) { node.textContent = fmt(val) + suffix; return; }
+  const from = st.cur, diff = val - from, t0 = performance.now(), dur = 750;
+  const step = now => {
+    const k = Math.min(1, (now - t0) / dur);
+    if (k >= 1) { st.cur = val; node.textContent = fmt(val) + suffix; return; }
+    const e = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2; /* easeInOutCubic */
+    st.cur = from + diff * e;
+    node.textContent = ((Math.round(st.cur) || 0).toLocaleString('en-US')) + suffix;
+    st.raf = requestAnimationFrame(step);
+  };
+  st.raf = requestAnimationFrame(step);
+}
+const animSpan = (val, suffix = '') => { const s = h('span', {}, fmt(0) + suffix); animNum(s, val, suffix); return s; };
 
 /* ───────────────────────── 1-ب) الأمن: PBKDF2 + حارس التخمين + صور آمنة ───────────────────────── */
 const PBKDF2_ITER = 150000; // قوة التجزئة — ارفعها إلى 250000 إن كانت أجهزتك حديثة
@@ -222,6 +244,9 @@ const DEFAULT_SETTINGS = {
     currency: 'د.ع', geminiKey: '', unitNames: ['قطعة','باكيت','شريط','كرتون','علبة','قنينة','أمبول','فيال','كيس','لفافة'],
   generatedBarcode: 0,
   printer: { name: '', w: 38, h: 25 }, // ★ طابعة الملصقات: الاسم + الأبعاد بالمم (افتراضي Xprinter 38×25)
+  invoicePrinter: { name: '' },        // ★ طابعة فواتير 80مم (فارغ = الطابعة الافتراضية للنظام)
+  printInvoice: true,                  // ★ طباعة الفاتورة تلقائياً بعد كل بيع (تُبدَّل من مفتاح نقطة البيع)
+  invoiceDesign: null,                 // ★ تصميم الفاتورة من «استوديو التصميم» (فارغ = التصميم الافتراضي)
 };
 const findAcc  = id => state.accounts.find(a => a.id === id);
 const findProd = id => state.products.find(p => p.id === id && !p.deleted);
@@ -447,9 +472,12 @@ function syncErrorText(e) {
 /* ───────────────────────── 6) التنبيهات والمودالات ───────────────────────── */
 function toast(msg, type = 'g') {
   const icons = { g: 'check', r: 'warn', b: 'refresh' };
-  const t = h('div', { class: `toast ${type}` }, h('span', { html: icon(icons[type] || 'check') }), msg);
+  const t = h('div', { class: `toast ${type}` },
+    h('span', { class: 'toast-ic', html: icon(icons[type] || 'check') }),
+    h('span', { class: 'toast-msg' }, msg),
+    h('i', { class: 'toast-bar' }));
   $('#toast-root').append(t);
-  setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 320); }, 2800);
+  setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 450); }, 3400);
 }
 function openModal({ title, icon: ic = 'box', body, actions = [], wide = false, xwide = false, onClose = null, noPad = false }) {
   const root = $('#modal-root');
@@ -658,6 +686,7 @@ const NAV = [
   { type: 'returnpurch', label: 'إرجاع شراء',       icon: 'refresh' },
   { type: 'preport',     label: 'تقرير المشتريات',  icon: 'history' },
   { type: 'suppliers',   label: 'حسابات مجهزين',    icon: 'suppliers' },
+  { type: 'debts',       label: 'الديون',            icon: 'dollar' },
   { type: 'statement',   label: 'كشف حساب',         icon: 'receipt' },
   { type: 'settings',    label: 'الإعدادات',        icon: 'settings' },
 ];
@@ -670,7 +699,8 @@ function renderTopbar() {
     acc.role === 'admin' ? h('span', { class: 'badge b' }, 'مدير') : null);
     const lo = $('#btn-logout');
   lo.innerHTML = icon('logout'); lo.onclick = logout;
-  $$('.tb-info .win-ctl').forEach(n => n.remove());
+  $$('.tb-info .win-ctl, .tb-info .theme-sw').forEach(n => n.remove());
+  lo.after(themeToggle());
   const wc = winControls(); if (wc) lo.after(wc);
   tickTopClock();
 }
@@ -685,13 +715,14 @@ function renderSideNav() {
   const nav = $('#side-nav');
   nav.innerHTML = '';
   const lowCount = state.products.filter(p => !p.deleted && (p.stockBase || 0) <= (state.settings.lowStock ?? 10)).length;
+  const debtCount = state.customers.filter(c => !c.deleted && (c.debt || 0) > 0).length;
   NAV.forEach(n => {
         const item = h('div', { class: 'nav-item', dataset: { nav: n.type }, onclick: () => {
       if (n.type === 'pos') { const first = tabs.find(t => t.type === 'pos'); if (first) { activateTab(first.id); return; } } // تنقّل لأول نقطة بيع مفتوحة — التبويب الجديد حصرياً من زر +
       openTab(n.type);
     } },
       h('span', { html: icon(n.icon) }), n.label,
-      n.type === 'inventory' && lowCount ? h('span', { class: 'nav-count' }, lowCount) : null);
+      n.type === 'debts' && debtCount ? h('span', { class: 'nav-count' }, debtCount) : null);
     nav.append(item);
   });
   markActiveNav();
@@ -699,12 +730,12 @@ function renderSideNav() {
 function markActiveNav() {
   const act = tabs.find(t => t.id === activeTabId);
   $$('#side-nav .nav-item').forEach(el =>
-        el.classList.toggle('active', !!act && el.dataset.nav === act.type && ['pos','returnsale','sales','inventory','purchase','returnpurch','preport','suppliers','statement','settings'].includes(act.type)));
+        el.classList.toggle('active', !!act && el.dataset.nav === act.type && ['pos','returnsale','sales','inventory','purchase','returnpurch','preport','suppliers','statement','settings','debts'].includes(act.type)));
 }
 
 /* ───────────────────────── 10) مدير التبويبات (نمط المتصفح) ───────────────────────── */
 let tabs = [], activeTabId = null, posCounter = 1;
-const LIVE_TABS = ['sales','inventory','preport','suppliers','statement']; // تبويبات تقريرية تُحدَّث تلقائياً عند فتحها
+const LIVE_TABS = ['sales','inventory','preport','suppliers','statement','debts']; // تبويبات تقريرية تُحدَّث تلقائياً عند فتحها
 const TAB_META = {
   pos:       { title: () => `نقطة بيع ${'' + ''}`.trim() || 'نقطة بيع', icon: 'pos' },
   sales:     { title: () => 'تقرير المبيعات',  icon: 'report' },
@@ -716,6 +747,7 @@ const TAB_META = {
   returnsale:  { title: () => 'إرجاع بيع',     icon: 'refresh' },
   returnpurch: { title: () => 'إرجاع شراء',    icon: 'refresh' },
   statement:   { title: () => 'كشف حساب',      icon: 'receipt' },
+  debts:       { title: () => 'الديون',          icon: 'dollar' },
   product:   { title: () => 'إضافة صنف',       icon: 'pill' },
   editsale:  { title: () => 'تعديل قائمة بيع', icon: 'edit' },
   editpurch: { title: () => 'تعديل قائمة شراء',icon: 'edit' },
@@ -724,7 +756,7 @@ const TAB_META = {
 };
 function openTab(type, props = {}) {
   // التبويبات الفريدة: واحد من كل نوع (عدا نقطة البيع والتعديلات والتفاصيل)
-    const singleton = ['sales','inventory','preport','suppliers','settings','purchase','scanner','returnsale','returnpurch','statement'];
+    const singleton = ['sales','inventory','preport','suppliers','settings','purchase','scanner','returnsale','returnpurch','statement','debts'];
   if (singleton.includes(type)) {
     const ex = tabs.find(t => t.type === type);
     if (ex) { activateTab(ex.id); return ex; }
@@ -774,7 +806,7 @@ function renderTabContent(tab) {
     purchase: renderPurchase, preport: renderPurchaseReport, suppliers: renderSuppliers,
     settings: renderSettings, product: renderProductForm, editsale: renderEditSale,
         editpurch: renderEditPurchase, details: renderProductDetails, scanner: renderScannerTab,
-    returnsale: renderReturnSale, returnpurch: renderReturnPurchase, statement: renderStatement,
+    returnsale: renderReturnSale, returnpurch: renderReturnPurchase, statement: renderStatement, debts: renderDebts,
   };
   tab.el.innerHTML = '';
   (R[tab.type] || renderPOS)(tab);
@@ -1050,17 +1082,26 @@ function renderPOS(tab) {
   st.renderTotals = () => {
     const sub = st.cart.reduce((s, it) => s + it.sale * it.qty, 0);
     const profit = st.cart.reduce((s, it) => s + (it.sale - it.cost) * it.qty, 0) - st.discount;
-    subEl.textContent = fmt(sub);
-    grandEl.firstChild.textContent = fmt(Math.max(0, sub - st.discount));
+    animNum(subEl, sub);
+    animNum(grandEl.firstChild, Math.max(0, sub - st.discount));
     peekTip.innerHTML = `<small>الربح الصافي من هذه القائمة</small>${fmt(profit)} ${cur()}`;
   };
 
+  /* ★ مفتاح طباعة الفاتورة — بجانب الخصم وعلامة الربح، يُحفظ فوراً ويُزامَن بين الأجهزة */
+  const printSw = h('div', { class: 'pos-print-sw' + (state.settings.printInvoice !== false ? ' on' : ''), title: 'طباعة فاتورة 80مم تلقائياً بعد كل بيع', html: icon('print') });
+  printSw.append(h('span', { class: 'sw' }));
+  printSw.addEventListener('click', async () => {
+    state.settings.printInvoice = !(state.settings.printInvoice !== false);
+    printSw.classList.toggle('on', state.settings.printInvoice);
+    await save('settings', state.settings);
+    toast(state.settings.printInvoice ? 'طباعة الفاتورة: مفعّلة' : 'طباعة الفاتورة: متوقفة', 'b');
+  });
   const footer = h('div', { class: 'pos-footer' },
     h('div', { class: 'totals-row' },
       h('div', { class: 'total-card' }, h('label', {}, 'مجموع القائمة'), subEl),
       h('div', { class: 'total-card' }, h('label', {}, 'الخصم'),
         h('div', { class: 'discount-wrap' }, discInp,
-          h('div', { class: 'profit-peek', html: icon('dollar') }, peekTip))),
+          h('div', { class: 'profit-peek', html: icon('dollar') }, peekTip), printSw)),
       h('div', { class: 'total-card grand' }, h('label', {}, 'المبلغ المطلوب'), grandEl)),
     h('div', { class: 'pay-row' },
       h('button', { class: 'pay-btn cash', onclick: () => checkout(tab, 'cash') },
@@ -1096,6 +1137,7 @@ async function checkout(tab, pay) {
   const st = tab.state;
   if (st.processing) return;
   if (!st.cart.length) return toast('السلة فارغة', 'r');
+  if (pay === 'credit') return openCreditSaleModal(tab);
   openCheckoutCustomer(tab, pay);
 }
 
@@ -1155,8 +1197,67 @@ function openCheckoutCustomer(tab, pay) {
   setTimeout(() => q.focus(), 60);
 }
 
+/* ★ بيع آجل: نافذة تطلب اسم الزبون ورقم هاتفه والمبلغ المدفوع — المتبقي يُحسب تلقائياً ويُسجَّل ديناً.
+   اختيار اسم موجود يعرض دينه الحالي؛ أي اسم جديد يُحفظ تلقائياً كحساب زبون دائم في تبويب الديون */
+function openCreditSaleModal(tab) {
+  const st = tab.state;
+  const net = Math.max(0, st.cart.reduce((s, it) => s + it.sale * it.qty, 0) - (st.discount || 0));
+  const nameInp = h('input', { placeholder: 'اسم الزبون', autocomplete: 'off', list: 'credit-cust-list' });
+  const dlist = h('datalist', { id: 'credit-cust-list' },
+    state.customers.filter(c => !c.deleted).map(c => h('option', { value: c.name })));
+  const phoneInp = h('input', { placeholder: 'رقم الهاتف', type: 'tel', dir: 'ltr', style: { textAlign: 'right' } });
+  const paidInp = h('input', { type: 'number', min: 0, step: 'any', placeholder: '0' });
+  const debtNote = h('div', { class: 'f-hint', style: { display: 'none', color: 'var(--red)', fontWeight: 900 } });
+  const remEl = h('b', {}, fmt(net));
+  const matchCust = () => {
+    const n = nameInp.value.trim().toLowerCase();
+    return n ? state.customers.find(c => !c.deleted && String(c.name).trim().toLowerCase() === n) : null;
+  };
+  const recalc = () => {
+    const c = matchCust();
+    if (c) {
+      if (c.phone && !phoneInp.value) phoneInp.value = c.phone;
+      debtNote.style.display = '';
+      debtNote.textContent = `زبون مسجّل — دينه الحالي قبل هذه القائمة: ${fmt(c.debt || 0)} ${cur()}`;
+    } else debtNote.style.display = 'none';
+    animNum(remEl, Math.max(0, net - num(paidInp.value)));
+  };
+  nameInp.addEventListener('input', recalc);
+  paidInp.addEventListener('input', recalc);
+  openModal({
+    title: 'بيع آجل — حساب زبون', icon: 'clock',
+    body: h('div', { class: 'form-grid' },
+      h('div', { class: 'f-field full' }, h('div', { class: 'sum-card big', style: { textAlign: 'center' } }, h('label', {}, 'إجمالي القائمة المطلوب'), h('b', {}, `${fmt(net)} ${cur()}`))),
+      h('div', { class: 'f-field' }, h('label', {}, 'اسم الزبون ', h('span', { class: 'req' }, '*')), nameInp, dlist, debtNote),
+      h('div', { class: 'f-field' }, h('label', {}, 'رقم الهاتف'), phoneInp),
+      h('div', { class: 'f-field' }, h('label', {}, 'المبلغ المدفوع الآن'), paidInp),
+      h('div', { class: 'f-field' }, h('div', { class: 'sum-card r', style: { textAlign: 'center' } }, h('label', {}, 'المتبقي (يُسجَّل ديناً)'), remEl))),
+    actions: [
+      { label: 'إلغاء', cls: 'n', onClick: c => c() },
+      { label: 'حفظ البيع الآجل', cls: 'g', icon: 'check', big: true, onClick: async c => {
+        const name = nameInp.value.trim();
+        if (!name) return toast('أدخل اسم الزبون أولاً', 'r');
+        const paid = num(paidInp.value);
+        if (paid < 0 || paid > net) return toast('المبلغ المدفوع يجب أن يكون بين 0 وإجمالي القائمة', 'r');
+        let cust = matchCust();
+        if (cust) {
+          const ph = phoneInp.value.trim();
+          if (ph && ph !== cust.phone) { cust.phone = ph; await save('customers', cust); }
+        } else {
+          cust = { id: uid(), name, phone: phoneInp.value.trim(), debt: 0, createdAt: Date.now() };
+          await save('customers', cust);
+          toast(`حُفظ «${name}» كحساب زبون جديد`, 'b');
+        }
+        c();
+        finalizeCheckout(tab, 'credit', cust.id, paid);
+      } },
+    ],
+  });
+  setTimeout(() => nameInp.focus(), 60);
+}
+
 /* تنفيذ البيع — الخطوة 2: الحفظ الفعلي في حساب الزبون المختار */
-async function finalizeCheckout(tab, pay, customerId) {
+async function finalizeCheckout(tab, pay, customerId, paidAmount) {
   const st = tab.state;
   if (st.processing || !st.cart.length) return;
   st.processing = true; // قفل مؤقت لمنع الضغط المزدوج
@@ -1176,7 +1277,15 @@ async function finalizeCheckout(tab, pay, customerId) {
     employeeId: acc.id, employeeName: acc.name,
     ts, date: dateStr(ts), time: timeStr(ts), deviceId: DEVICE_ID,
   };
+  if (pay === 'credit') { // الآجل: المدفوع الآن + المتبقي ديناً على حساب الزبون
+    sale.paid = Math.min(Math.max(0, num(paidAmount)), net);
+    sale.remaining = net - sale.paid;
+  } else { sale.paid = net; sale.remaining = 0; }
   await save('sales', sale);
+  if (pay === 'credit' && sale.remaining > 0 && customerId) {
+    const cust = findCust(customerId);
+    if (cust) { cust.debt = (cust.debt || 0) + sale.remaining; await save('customers', cust); }
+  }
   for (const it of items) {  // خصم المخزون فوراً
     const p = findProd(it.productId);
     if (p) { p.stockBase = (p.stockBase || 0) - it.qtyBase; await save('products', p); }
@@ -1184,7 +1293,8 @@ async function finalizeCheckout(tab, pay, customerId) {
   st.cart = []; st.discount = 0; st.processing = false;
   renderTabContent(tab);
   renderSideNav();
-  toast(`تمت عملية البيع بنجاح — ${fmt(net)} ${cur()}${customerId ? ` — ${sale.customerName}` : ''}`);
+  toast(`تمت عملية البيع بنجاح — ${fmt(net)} ${cur()}${customerId ? ` — ${sale.customerName}` : ''}${pay === 'credit' && sale.remaining > 0 ? ` (المتبقي دين: ${fmt(sale.remaining)} ${cur()})` : ''}`);
+  if (state.settings.printInvoice !== false) printSaleInvoice(sale);
 }
 
 /* اللوح الجانبي لنقطة البيع */
@@ -1332,6 +1442,9 @@ function viewSaleModal(s) {
     h('td', { class: 'td-seq' }, i + 1), h('td', { class: 'td-name' }, it.name),
     h('td', {}, it.unitName), h('td', { class: 'td-num' }, fmt(it.qty)),
     h('td', { class: 'td-num' }, fmt(it.sale)), h('td', { class: 'td-num td-total' }, fmt(it.total))));
+  const isCredit = s.pay === 'credit';
+  const paid = s.paid != null ? s.paid : (isCredit ? 0 : s.net);
+  const remaining = s.remaining != null ? s.remaining : (isCredit ? s.net : 0);
   openModal({
     title: `فاتورة — ${fmtDate(s.ts)} ${fmtTime(s.ts)}`, icon: 'receipt', wide: true,
     body: h('div', {},
@@ -1339,9 +1452,15 @@ function viewSaleModal(s) {
         h('th', {}, 'ت'), h('th', {}, 'المنتج'), h('th', {}, 'الوحدة'), h('th', {}, 'العدد'), h('th', {}, 'السعر'), h('th', {}, 'المجموع'))),
         h('tbody', {}, rows)),
       h('div', { style: { display: 'flex', gap: '10px', marginTop: '14px' } },
-        h('div', { class: 'sum-card n' }, h('label', {}, 'المجموع'), h('b', {}, fmt(s.subtotal))),
-        h('div', { class: 'sum-card r' }, h('label', {}, 'الخصم'), h('b', {}, fmt(s.discount))),
-        h('div', { class: 'sum-card big' }, h('label', {}, 'الصافي'), h('b', {}, `${fmt(s.net)} ${cur()}`)))),
+        h('div', { class: 'sum-card n' }, h('label', {}, 'المجموع'), h('b', {}, animSpan(s.subtotal))),
+        h('div', { class: 'sum-card r' }, h('label', {}, 'الخصم'), h('b', {}, animSpan(s.discount))),
+        h('div', { class: 'sum-card big' }, h('label', {}, 'الصافي'), h('b', {}, animSpan(s.net, ' ' + cur()))),
+        isCredit ? h('div', { class: 'sum-card g' }, h('label', {}, 'المدفوع'), h('b', {}, animSpan(paid, ' ' + cur()))) : null,
+        isCredit ? h('div', { class: 'sum-card r' }, h('label', {}, 'المتبقي (دين)'), h('b', {}, animSpan(remaining, ' ' + cur()))) : null)),
+    actions: [
+      { label: 'إغلاق', cls: 'n', onClick: c => c() },
+      { label: 'طباعة الفاتورة', cls: 'g', icon: 'print', big: true, onClick: () => printSaleInvoice(s) },
+    ],
   });
 }
 function drawShortage(body) {
@@ -1364,13 +1483,13 @@ function drawShift(body) {
   const ret = returns.reduce((x, s) => x + s.net, 0);
   const profit = mine.reduce((x, s) => x + s.profit, 0);
   body.append(h('div', { class: 'shift-cards' },
-    h('div', { class: 'shift-card n' }, h('label', {}, `عدد قوائم اليوم (${acc.name})`), h('b', {}, sales.length)),
-    h('div', { class: 'shift-card g' }, h('label', {}, 'مبيعات كاش'), h('b', {}, `${fmt(cash)} ${cur()}`)),
-    h('div', { class: 'shift-card b' }, h('label', {}, 'مبيعات إلكترونية'), h('b', {}, `${fmt(elec)} ${cur()}`)),
-    h('div', { class: 'shift-card r' }, h('label', {}, 'مبيعات آجلة'), h('b', {}, `${fmt(cred)} ${cur()}`)),
-    h('div', { class: 'shift-card r' }, h('label', {}, 'المرتجعات'), h('b', {}, `${fmt(ret)} ${cur()}`)),
-    h('div', { class: 'shift-card g' }, h('label', {}, 'صافي الدخل (كاش + إلكتروني)'), h('b', {}, `${fmt(cash + elec - ret)} ${cur()}`)),
-    h('div', { class: 'shift-card b' }, h('label', {}, 'ربح الشفت'), h('b', {}, `${fmt(profit)} ${cur()}`)),
+    h('div', { class: 'shift-card n' }, h('label', {}, `عدد قوائم اليوم (${acc.name})`), h('b', {}, animSpan(sales.length))),
+    h('div', { class: 'shift-card g' }, h('label', {}, 'مبيعات كاش'), h('b', {}, animSpan(cash, ' ' + cur()))),
+    h('div', { class: 'shift-card b' }, h('label', {}, 'مبيعات إلكترونية'), h('b', {}, animSpan(elec, ' ' + cur()))),
+    h('div', { class: 'shift-card r' }, h('label', {}, 'مبيعات آجلة'), h('b', {}, animSpan(cred, ' ' + cur()))),
+    h('div', { class: 'shift-card r' }, h('label', {}, 'المرتجعات'), h('b', {}, animSpan(ret, ' ' + cur()))),
+    h('div', { class: 'shift-card g' }, h('label', {}, 'صافي الدخل (كاش + إلكتروني)'), h('b', {}, animSpan(cash + elec - ret, ' ' + cur()))),
+    h('div', { class: 'shift-card b' }, h('label', {}, 'ربح الشفت'), h('b', {}, animSpan(profit, ' ' + cur()))),
   ));
 }
 
@@ -1407,6 +1526,7 @@ document.addEventListener('keydown', e => {
   }
   if (e.ctrlKey || e.altKey || e.metaKey) return;
   if ($('#modal-root').children.length) return; // مودال مفتوح
+  if (e.key === '+') return; // زر الزائد مخصص للحاسبة — لا يُسرَّب إلى بحث نقطة البيع
   const t = tabs.find(x => x.id === activeTabId);
     if (!t || !['pos','returnsale'].includes(t.type) || !t.state.searchInput) return;
   const ae = document.activeElement;
@@ -2008,7 +2128,7 @@ function renderPurchase(tab) {
   st.drawTotals = drawTotals;
   function drawTotals() {
     const t = st.items.reduce((s, it) => s + it.buyPrice * it.qty, 0);
-    totalEl.firstChild.textContent = fmt(Math.max(0, t - st.discount));
+    animNum(totalEl.firstChild, Math.max(0, t - st.discount));
   }
   const footer = h('div', { class: 'pos-footer' },
     h('div', { class: 'totals-row' },
@@ -2063,7 +2183,7 @@ async function savePurchaseModal(tab) {
   const m = openModal({
     title: 'طريقة تسديد قائمة الشراء', icon: 'cash',
     body: h('div', {},
-      h('div', { class: 'sum-card n', style: { marginBottom: '14px' } }, h('label', {}, `إجمالي القائمة للمذخر «${sup.name}»`), h('b', {}, `${fmt(total)} ${cur()}`)),
+      h('div', { class: 'sum-card n', style: { marginBottom: '14px' } }, h('label', {}, `إجمالي القائمة للمذخر «${sup.name}»`), h('b', {}, animSpan(total, ' ' + cur()))),
       h('div', { class: 'f-field' }, h('label', {}, 'خصم المذخر (نسبة %)'), h('div', { class: 'input-group' }, discPctInp,
         h('span', { style: { alignSelf: 'center', fontWeight: 900 } }, `% ≈ ${fmt(total * num(discPctInp.value) / 100)} ${cur()}`)))),
     actions: [
@@ -2219,14 +2339,14 @@ function renderSalesReport(tab) {
     const tRet = rets.reduce((x, s) => x + s.net, 0);
     footBox.innerHTML = '';
     footBox.append(
-      h('div', { class: 'sum-card n' }, h('label', {}, 'التكلفة الكلية'), h('b', {}, fmt(tCost))),
-      h('div', { class: 'sum-card r' }, h('label', {}, 'مجموع المرتجعات'), h('b', {}, fmt(tRet))),
-      h('div', { class: 'sum-card b' }, h('label', {}, 'البيع الكلي (قبل الخصم)'), h('b', {}, fmt(tSale))),
-      h('div', { class: 'sum-card r' }, h('label', {}, 'الخصم الكلي'), h('b', {}, fmt(tDisc))),
-      h('div', { class: 'sum-card g' }, h('label', {}, 'كاش'), h('b', {}, fmt(cashNet))),
-      h('div', { class: 'sum-card b' }, h('label', {}, 'إلكتروني (منفصل)'), h('b', {}, fmt(elecNet))),
-      h('div', { class: 'sum-card r' }, h('label', {}, 'آجل (خارج الدخل)'), h('b', {}, fmt(credNet))),
-      h('div', { class: 'sum-card big' }, h('label', {}, 'صافي الدخل (كاش + إلكتروني)'), h('b', {}, `${fmt(cashNet + elecNet)} ${cur()}`)));
+      h('div', { class: 'sum-card n' }, h('label', {}, 'التكلفة الكلية'), h('b', {}, animSpan(tCost))),
+      h('div', { class: 'sum-card r' }, h('label', {}, 'مجموع المرتجعات'), h('b', {}, animSpan(tRet))),
+      h('div', { class: 'sum-card b' }, h('label', {}, 'البيع الكلي (قبل الخصم)'), h('b', {}, animSpan(tSale))),
+      h('div', { class: 'sum-card r' }, h('label', {}, 'الخصم الكلي'), h('b', {}, animSpan(tDisc))),
+      h('div', { class: 'sum-card g' }, h('label', {}, 'كاش'), h('b', {}, animSpan(cashNet))),
+      h('div', { class: 'sum-card b' }, h('label', {}, 'إلكتروني (منفصل)'), h('b', {}, animSpan(elecNet))),
+      h('div', { class: 'sum-card r' }, h('label', {}, 'آجل (خارج الدخل)'), h('b', {}, animSpan(credNet))),
+      h('div', { class: 'sum-card big' }, h('label', {}, 'صافي الدخل (كاش + إلكتروني)'), h('b', {}, animSpan(cashNet + elecNet, ' ' + cur()))));
   }
   draw();
   tab.el.append(page);
@@ -2318,7 +2438,7 @@ function renderEditSale(tab) {
   custSel.addEventListener('change', () => st.customerId = custSel.value || null);
   function drawTotals() {
     const sub = st.editItems.reduce((s, it) => s + it.sale * it.qty, 0);
-    netEl.textContent = `${fmt(Math.max(0, sub - st.discount))} ${cur()}`;
+    animNum(netEl, Math.max(0, sub - st.discount), ' ' + cur());
   }
   center.append(itemsBox,
     h('div', { class: 'filter-bar', style: { marginTop: '12px' } },
@@ -2456,9 +2576,9 @@ function renderPurchaseReport(tab) {
     }));
     footBox.innerHTML = '';
     footBox.append(
-      h('div', { class: 'sum-card b' }, h('label', {}, 'مبلغ المشتريات الكلي'), h('b', {}, fmt(tBuy))),
-      h('div', { class: 'sum-card n' }, h('label', {}, 'قيمة بيع أصناف هذه القوائم'), h('b', {}, fmt(sellVal))),
-      h('div', { class: 'sum-card big' }, h('label', {}, 'الربح المتوقع من هذه المشتريات'), h('b', {}, `${fmt(sellVal - costVal)} ${cur()}`)));
+      h('div', { class: 'sum-card b' }, h('label', {}, 'مبلغ المشتريات الكلي'), h('b', {}, animSpan(tBuy))),
+      h('div', { class: 'sum-card n' }, h('label', {}, 'قيمة بيع أصناف هذه القوائم'), h('b', {}, animSpan(sellVal))),
+      h('div', { class: 'sum-card big' }, h('label', {}, 'الربح المتوقع من هذه المشتريات'), h('b', {}, animSpan(sellVal - costVal, ' ' + cur()))));
   }
   draw();
   tab.el.append(page);
@@ -2778,6 +2898,30 @@ function openAddSupplierModal(onDone) {
   nameInp.focus();
 }
 
+/* ★ تعديل رصيد المجهز يدوياً: الفرق يُسجَّل في الرصيد الافتتاحي ثم يُعاد حساب الدين المتراكم كاملاً */
+function openSupplierBalanceModal(sup, onDone) {
+  const balInp = h('input', { type: 'number', step: 'any', value: sup.debt || 0 });
+  openModal({
+    title: `تعديل الرصيد — ${sup.name}`, icon: 'edit',
+    body: h('div', { class: 'form-grid' },
+      h('div', { class: 'f-field full' }, h('div', { class: 'sum-card r', style: { textAlign: 'center' } }, h('label', {}, 'الرصيد الحالي'), h('b', {}, `${fmt(sup.debt || 0)} ${cur()}`))),
+      h('div', { class: 'f-field full' }, h('label', {}, 'الرصيد الجديد الصحيح'), balInp,
+        h('div', { class: 'f-hint' }, 'يُصحَّح عبر الرصيد الافتتاحي مع إعادة حساب كامل السجل — موجب = دين علينا، سالب = رصيد لنا'))),
+    actions: [
+      { label: 'إلغاء', cls: 'n', onClick: c => c() },
+      { label: 'حفظ الرصيد', cls: 'g', icon: 'check', big: true, onClick: async c => {
+        const target = num(balInp.value);
+        sup.openingDebt = (sup.openingDebt || 0) + (target - (sup.debt || 0));
+        await save('suppliers', sup);
+        await recomputeSupplierDebt(sup.id);
+        c(); if (onDone) onDone();
+        toast(`عُدّل رصيد «${sup.name}» إلى ${fmt(sup.debt || 0)} ${cur()}`);
+      } },
+    ],
+  });
+  setTimeout(() => { balInp.focus(); balInp.select(); }, 60);
+}
+
 /* ───────────────────────── 22) حسابات المجهزين ───────────────────────── */
 function renderSuppliers(tab) {
   const page = h('div', { class: 'page' });
@@ -2789,13 +2933,14 @@ function renderSuppliers(tab) {
   const tbody = h('tbody');
   state.suppliers.filter(s => !s.deleted).forEach(s => tbody.append(h('tr', {},
     h('td', { class: 'td-name' }, s.name),
-    h('td', { class: 'td-num', style: { color: (s.debt || 0) > 0 ? 'var(--red)' : 'var(--green)', fontWeight: 900, fontSize: '15px' } }, `${fmt(s.debt || 0)} ${cur()}`),
+    h('td', { class: 'td-num', style: { color: (s.debt || 0) > 0 ? 'var(--red)' : 'var(--green)', fontWeight: 900, fontSize: '15px' } }, animSpan(s.debt || 0, ' ' + cur())),
     h('td', { class: 'td-num' }, s.lastPurchase ? fmt(s.lastPurchase.amount) : '—'),
     h('td', { class: 'mono' }, s.lastPurchase ? fmtDate(s.lastPurchase.ts) : '—'),
     h('td', { class: 'td-num', style: { color: 'var(--green)' } }, s.lastPayment ? fmt(s.lastPayment.amount) : '—'),
     h('td', { class: 'mono' }, s.lastPayment ? fmtDate(s.lastPayment.ts) : '—'),
     h('td', {}, h('div', { class: 'row-act' },
       h('button', { class: 'btn g', style: { padding: '8px 16px', fontSize: '13px' }, onclick: () => openPaymentModal(s.id) }, h('span', { html: icon('cash') }), 'تسديد'),
+      h('button', { class: 'btn b', style: { padding: '8px 16px', fontSize: '13px' }, onclick: () => openSupplierBalanceModal(s, () => renderTabContent(tab)) }, h('span', { html: icon('edit') }), 'تعديل الرصيد'),
       h('button', { class: 'icon-btn del', title: 'حذف المذخر', html: icon('trash'), onclick: async () => {
         const yes = await confirmBox(`حذف المذخر «${s.name}»؟ (تبقى قوائمه محفوظة)`, { danger: true, okLabel: 'حذف' });
         if (yes) { s.deleted = true; await save('suppliers', s); renderTabContent(tab); }
@@ -2823,9 +2968,9 @@ function openPaymentModal(supplierId) {
     else discPct.value = amt ? Math.round(num(discAmt.value) / amt * 1000) / 10 : 0;
     const total = amt + num(discAmt.value);
     const after = kind === 'payment' ? current() - total : current() - amt;
-    afterEl.textContent = `${fmt(after)} ${cur()}`;
+    animNum(afterEl, after, ' ' + cur());
     afterEl.style.color = after > 0 ? 'var(--red)' : 'var(--green)';
-    debtEl.textContent = `${fmt(current())} ${cur()}`;
+    animNum(debtEl, current(), ' ' + cur());
   }
   supSel.addEventListener('change', () => recalc());
   amtInp.addEventListener('input', () => recalc(true));
@@ -2867,6 +3012,125 @@ function openPaymentModal(supplierId) {
   amtInp.focus();
 }
 
+/* ───────────────────────── 22-ب) الديون — حسابات الزبائن الآجلة ─────────────────────────
+   كل زبون بيع له آجل له حساب: دينه المتراكم + تسديد يُنقص الدين ويوزَّع على فواتيره من الأقدم أولاً */
+function renderDebts(tab) {
+  const st = tab.state;
+  st.q = st.q || '';
+  const page = h('div', { class: 'page' });
+  const qInp = h('input', { placeholder: 'ابحث باسم الزبون أو هاتفه…', value: st.q, autocomplete: 'off', style: { flex: 1, border: 'none', outline: 'none', fontWeight: 800 } });
+  qInp.addEventListener('input', () => { st.q = qInp.value; draw(); });
+  page.append(h('div', { class: 'page-head' },
+    h('div', { class: 'page-title' }, h('span', { html: icon('dollar') }), 'الديون — حسابات الآجل'),
+    h('div', { class: 'spacer' }),
+    h('div', { class: 'search-box', style: { height: '44px', maxWidth: '320px' } }, h('span', { html: icon('search') }), qInp)));
+  const bodyBox = h('div', { class: 'page-body' });
+  const footBox = h('div', { class: 'page-footer' });
+  page.append(bodyBox, footBox);
+  function draw() {
+    const q = st.q.trim().toLowerCase();
+    const rows = state.customers
+      .filter(c => !c.deleted && (c.debt || 0) > 0)
+      .filter(c => !q || String(c.name).toLowerCase().includes(q) || String(c.phone || '').includes(q))
+      .sort((a, b) => (b.debt || 0) - (a.debt || 0));
+    bodyBox.innerHTML = ''; footBox.innerHTML = '';
+    const tbody = h('tbody');
+    rows.forEach(c => {
+      const lists = state.sales.filter(s => s.type === 'sale' && s.pay === 'credit' && s.customerId === c.id && (s.remaining || 0) > 0).sort((a, b) => a.ts - b.ts);
+      tbody.append(h('tr', {},
+        h('td', { class: 'td-name' }, c.name, c.phone ? h('small', {}, c.phone) : null),
+        h('td', { class: 'td-num' }, lists.length),
+        h('td', { class: 'mono' }, lists.length ? fmtDate(lists[0].ts) : '—'),
+        h('td', { class: 'td-num', style: { color: 'var(--red)', fontWeight: 900, fontSize: '16px' } }, animSpan(c.debt || 0, ' ' + cur())),
+        h('td', {}, h('div', { class: 'row-act' },
+          h('button', { class: 'btn g', style: { padding: '8px 16px', fontSize: '13px' }, onclick: () => openCustomerPayModal(c, () => renderTabContent(tab)) }, h('span', { html: icon('cash') }), 'تسديد'),
+          h('button', { class: 'btn b', style: { padding: '8px 16px', fontSize: '13px' }, onclick: () => openCustomerStatement(c) }, h('span', { html: icon('receipt') }), 'كشف حساب')))));
+    });
+    bodyBox.append(h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'الزبون'), h('th', {}, 'فواتير عليها متبقٍ'), h('th', {}, 'أقدم فاتورة'), h('th', {}, 'الدين المتراكم'), h('th', {}, 'إجراء'))), tbody)));
+    if (!rows.length) bodyBox.append(h('div', { class: 'empty-note' }, q ? 'لا نتائج مطابقة للبحث' : 'لا ديون مستحقة — كل الزبائن مسدّدون'));
+    const total = state.customers.filter(c => !c.deleted).reduce((s, c) => s + (c.debt || 0), 0);
+    const debtors = state.customers.filter(c => !c.deleted && (c.debt || 0) > 0).length;
+    footBox.append(
+      h('div', { class: 'sum-card n' }, h('label', {}, 'زبائن عليهم دين'), h('b', {}, animSpan(debtors))),
+      h('div', { class: 'sum-card big' }, h('label', {}, 'إجمالي الديون المستحقة'), h('b', {}, animSpan(total, ' ' + cur()))));
+  }
+  draw();
+  tab.el.append(page);
+}
+
+/* تسديد دين زبون: لا يقبل أكثر من الدين، ويُوزَّع على فواتيره الآجلة من الأقدم للأحدث */
+function openCustomerPayModal(cust, onDone) {
+  const amtInp = h('input', { type: 'number', min: 0, step: 'any', placeholder: '0' });
+  const debtEl = h('b', { style: { fontSize: '26px', color: 'var(--red)' } }, `${fmt(cust.debt || 0)} ${cur()}`);
+  const afterEl = h('b', { style: { fontSize: '17px' } }, `${fmt(cust.debt || 0)} ${cur()}`);
+  const recalc = () => {
+    const after = (cust.debt || 0) - num(amtInp.value);
+    animNum(afterEl, after, ' ' + cur());
+    afterEl.style.color = after > 0 ? 'var(--red)' : 'var(--green)';
+    animNum(debtEl, cust.debt || 0, ' ' + cur());
+  };
+  amtInp.addEventListener('input', recalc);
+  openModal({
+    title: `تسديد دين — ${cust.name}`, icon: 'cash',
+    body: h('div', { class: 'form-grid' },
+      h('div', { class: 'f-field full' }, h('div', { class: 'sum-card r', style: { textAlign: 'center' } }, h('label', {}, 'الدين المتراكم الحالي'), debtEl)),
+      h('div', { class: 'f-field full' }, h('label', {}, 'المبلغ المسدد ', h('span', { class: 'req' }, '*')), amtInp),
+      h('div', { class: 'f-field full' }, h('div', { class: 'sum-card n', style: { textAlign: 'center' } }, h('label', {}, 'الدين بعد التسديد'), afterEl))),
+    actions: [
+      { label: 'إلغاء', cls: 'n', onClick: c => c() },
+      { label: 'تنفيذ وحفظ', cls: 'g', icon: 'check', big: true, onClick: async c => {
+        let amt = num(amtInp.value);
+        if (amt <= 0) return toast('أدخل المبلغ المسدد', 'r');
+        if (amt > (cust.debt || 0)) amt = cust.debt || 0; // لا يُقبل أكثر من الدين
+        const ts = Date.now(); const acc = me();
+        await save('payments', { id: uid(), customerId: cust.id, customerName: cust.name, amount: amt, kind: 'customer',
+          employeeId: acc.id, employeeName: acc.name, ts, date: dateStr(ts), time: timeStr(ts) });
+        let left = amt;
+        const openSales = state.sales.filter(s => s.type === 'sale' && s.pay === 'credit' && s.customerId === cust.id && (s.remaining || 0) > 0).sort((a, b) => a.ts - b.ts);
+        for (const s of openSales) {
+          if (left <= 0) break;
+          const cut = Math.min(s.remaining, left);
+          s.remaining -= cut; left -= cut;
+          await save('sales', s);
+        }
+        cust.debt = (cust.debt || 0) - amt;
+        await save('customers', cust);
+        c(); if (onDone) onDone();
+        toast(`تم تسديد ${fmt(amt)} ${cur()} من دين «${cust.name}» — المتبقي: ${fmt(cust.debt || 0)} ${cur()}`);
+      } },
+    ],
+  });
+  recalc();
+  setTimeout(() => amtInp.focus(), 60);
+}
+
+/* كشف حساب زبون: كل فواتيره الآجلة وتسديداته برصيد متراكم متحرك */
+function openCustomerStatement(cust) {
+  const evs = [];
+  state.sales.filter(s => s.type === 'sale' && s.pay === 'credit' && s.customerId === cust.id)
+    .forEach(s => evs.push({ ts: s.ts, kind: 'sale', doc: s, amount: (s.net || 0) - (s.paid || 0) }));
+  state.payments.filter(p => p.kind === 'customer' && p.customerId === cust.id && !p.deleted)
+    .forEach(p => evs.push({ ts: p.ts, kind: 'pay', doc: p, amount: p.amount }));
+  evs.sort((a, b) => a.ts - b.ts);
+  let run = 0; evs.forEach(e => { run += e.kind === 'sale' ? e.amount : -e.amount; e.after = run; });
+  const tbody = h('tbody');
+  [...evs].reverse().forEach(e => tbody.append(h('tr', {},
+    h('td', {}, h('span', { class: 'badge ' + (e.kind === 'sale' ? 'r' : 'g') }, e.kind === 'sale' ? 'فاتورة آجلة' : 'تسديد')),
+    h('td', { class: 'mono' }, fmtDate(e.ts)), h('td', { class: 'mono' }, fmtTime(e.ts)),
+    h('td', {}, e.doc.employeeName || '—'),
+    h('td', { class: 'td-num', style: { color: e.kind === 'sale' ? 'var(--red)' : 'var(--green)' } }, `${e.kind === 'sale' ? '+' : '−'} ${fmt(e.amount)}`),
+    h('td', { class: 'td-num', style: { fontWeight: 900, color: e.after > 0 ? 'var(--red)' : 'var(--green)' } }, fmt(e.after)))));
+  openModal({
+    title: `كشف حساب — ${cust.name}`, icon: 'receipt', xwide: true,
+    body: h('div', {},
+      h('div', { class: 'sum-card r', style: { textAlign: 'center', marginBottom: '14px' } }, h('label', {}, 'الدين المتراكم الحالي'), h('b', {}, animSpan(cust.debt || 0, ' ' + cur()))),
+      evs.length ? h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl' },
+        h('thead', {}, h('tr', {}, h('th', {}, 'العملية'), h('th', {}, 'التاريخ'), h('th', {}, 'الوقت'), h('th', {}, 'الموظف'), h('th', {}, 'المبلغ'), h('th', {}, 'الرصيد المتراكم'))), tbody))
+        : h('div', { class: 'empty-note' }, 'لا حركات آجلة لهذا الزبون بعد')),
+  });
+}
+
 /* ───────────────────────── 23) الإعدادات ───────────────────────── */
 function renderSettings(tab) {
   const st = tab.state;
@@ -2874,7 +3138,7 @@ function renderSettings(tab) {
   const acc = me();
   const page = h('div', { class: 'page', style: { overflowY: 'auto' } });
   page.append(h('div', { class: 'page-head' }, h('div', { class: 'page-title' }, h('span', { html: icon('settings') }), 'الإعدادات')));
-    const SECTIONS = [['profile','حسابي'],['pharmacy','الصيدلية والنظام'],['printer','الطابعة والملصقات'],['accounts','إدارة الحسابات'],['companies','الشركات'],['scanner','الماسح الذكي'],['backup','النسخ الاحتياطي']];
+    const SECTIONS = [['profile','حسابي'],['pharmacy','الصيدلية والنظام'],['printer','الطابعة والملصقات'],['studio','استوديو التصميم'],['accounts','إدارة الحسابات'],['companies','الشركات'],['scanner','الماسح الذكي'],['backup','النسخ الاحتياطي']];
     const nav = h('div', { class: 'settings-nav' }, SECTIONS // الصلاحيات مفتوحة: كل الحسابات ترى كل الأقسام حالياً (بطلبك)
     .map(([k, l]) => h('div', { class: 'set-chip' + (st.section === k ? ' active' : ''), onclick: () => { st.section = k; renderTabContent(tab); } }, l)));
   page.append(nav);
@@ -2928,8 +3192,11 @@ function renderSettings(tab) {
     else if (st.section === 'printer') {
     /* ★ إعدادات طابعة الملصقات: كل شيء من داخل التطبيق — الطباعة بعدها صامتة بضغطة واحدة */
     state.settings.printer = state.settings.printer || { name: '', w: 38, h: 25 };
+    state.settings.invoicePrinter = state.settings.invoicePrinter || { name: '' };
     const pr = state.settings.printer;
+    const invPr = state.settings.invoicePrinter;
     const prSel = h('select', {}, h('option', { value: '' }, '— الطابعة الافتراضية للنظام —'));
+    const invPrSel = h('select', {}, h('option', { value: '' }, '— الطابعة الافتراضية للنظام —'));
     const statusEl = h('div', { class: 'f-hint' }, 'جارٍ قراءة طابعات النظام…');
     (async () => {
       if (!(window.desktop && window.desktop.print)) { statusEl.textContent = 'قائمة الطابعات متاحة داخل تطبيق سطح المكتب فقط'; return; }
@@ -2937,24 +3204,33 @@ function renderSettings(tab) {
       statusEl.textContent = list.length ? `تم العثور على ${list.length} طابعة في النظام` : 'لم يُعثر على أي طابعة مثبتة';
       list.forEach(x => prSel.append(h('option', { value: x.name, selected: pr.name === x.name },
         x.name + (x.isDefault ? ' (افتراضية)' : ''))));
+      list.forEach(x => invPrSel.append(h('option', { value: x.name, selected: invPr.name === x.name },
+        x.name + (x.isDefault ? ' (افتراضية)' : ''))));
     })();
     const wInp = h('input', { type: 'number', min: 20, max: 120, value: pr.w || 38 });
     const hInp = h('input', { type: 'number', min: 10, max: 120, value: pr.h || 25 });
     const savePr = async () => {
       pr.name = prSel.value; pr.w = num(wInp.value) || 38; pr.h = num(hInp.value) || 25;
+      invPr.name = invPrSel.value;
       await save('settings', state.settings);
     };
     box.append(h('div', { class: 'form-grid', style: { maxWidth: '620px' } },
       h('div', { class: 'f-field full' }, h('label', {}, 'طابعة الملصقات (Xprinter)'), prSel, statusEl),
       h('div', { class: 'f-field' }, h('label', {}, 'عرض الملصق (مم)'), wInp),
       h('div', { class: 'f-field' }, h('label', {}, 'ارتفاع الملصق (مم)'), hInp),
+      h('div', { class: 'f-field full' }, h('label', {}, 'طابعة الفواتير (80مم)'), invPrSel,
+        h('div', { class: 'f-hint' }, 'تُطبع عليها فاتورة البيع المصمَّمة في «استوديو التصميم». التشغيل/الإيقاف من مفتاح الطباعة بجانب الخصم في نقطة البيع.')),
       h('div', { class: 'f-field full' }, h('div', { class: 'f-hint' },
         'لملصقاتك الحالية: العرض 38 والارتفاع 25. الاتجاه يُفرض عمودياً تلقائياً لكل ملصق — لن تُطبع صفحة عرضية ولن يُهدر أي ملصق. تأكد أيضاً أن مقاس الورق في تعريف الطابعة بويندوز هو 38×25مم.')),
       h('div', { class: 'f-field full', style: { display: 'flex', gap: '10px', flexWrap: 'wrap' } },
         h('button', { class: 'btn g', onclick: async () => { await savePr(); toast('حُفظت إعدادات الطابعة — الطباعة الآن صامتة دائماً'); } },
           h('span', { html: icon('check') }), 'حفظ إعدادات الطابعة'),
         h('button', { class: 'btn b', onclick: async () => { await savePr(); printBarcodeLabels('اختبار طباعة — ' + (state.settings.pharmacyName || ''), '000001', 1); } },
-          h('span', { html: icon('print') }), 'طباعة ملصق تجريبي'))));
+          h('span', { html: icon('print') }), 'طباعة ملصق تجريبي'),
+        h('button', { class: 'btn b', onclick: async () => { await savePr(); printSaleInvoice(invDemoSale()); } },
+          h('span', { html: icon('receipt') }), 'طباعة فاتورة تجريبية'),
+        h('button', { class: 'btn n', onclick: () => { st.section = 'studio'; renderTabContent(tab); } },
+          h('span', { html: icon('edit') }), 'فتح استوديو التصميم'))));
   }
   else if (st.section === 'accounts') {
     const list = h('div', {});
@@ -3048,6 +3324,7 @@ function renderSettings(tab) {
             h('div', { style: { marginTop: '8px', color: 'var(--muted)' } }, 'المفتاح مجاني وثابت بلا انتهاء صلاحية، والحد المجاني يكفي فواتير الصيدلية اليومية بمرات. لا تشاركه مع أحد.')))),
       h('div', { class: 'f-field full' }, h('button', { class: 'btn b', onclick: () => openTab('scanner') }, h('span', { html: icon('camera') }), 'فتح الماسح الذكي'))));
   }
+  else if (st.section === 'studio') { renderDesignStudio(box); }
   else if (st.section === 'backup') {
     const fileInp = h('input', { type: 'file', accept: '.json', style: { display: 'none' } });
     fileInp.addEventListener('change', () => {
@@ -3087,6 +3364,475 @@ function renderSettings(tab) {
       } }, h('span', { html: icon('upload') }), 'رفع كل البيانات المحلية إلى السحابة')) : null));
   }
   tab.el.append(page);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   استوديو تصميم الفاتورة — محرر مرئي لطابعات 80مم (ورق بطول مفتوح)
+   الرأس والتذييل ثابتان، وجدول الأصناف يتمدد من الوسط بين خطّي «بداية/نهاية الجدول»
+   ════════════════════════════════════════════════════════════════════ */
+const INV_FONTS = ['Cairo','Alexandria','Tajawal','Almarai','Amiri','Changa','El Messiri','Noto Kufi Arabic','Lateef','Scheherazade New','Aref Ruqaa','Marhey'];
+const INV_VARS = [
+  ['pharmacyName','اسم الصيدلية'],['invNo','رقم الفاتورة'],['date','التاريخ'],['time','الوقت'],
+  ['customerName','اسم الزبون'],['employeeName','الموظف'],['itemCount','عدد الأصناف'],
+  ['subtotal','المجموع'],['discount','الخصم'],['net','المطلوب'],['paid','المدفوع'],['remaining','المتبقي']
+];
+const INV_COLS = [['التسلسل',7],['العلاج',26],['التعبئة',11],['العدد',9],['السعر',10],['المجموع',11]]; // العرض الكلي 74مم داخل ورقة 76مم
+
+function invDefaultDesign() {
+  let n = 0; const id = () => 'el' + Date.now().toString(36) + '_' + (n++);
+  const txt = (t, y, size, bold, font, align) => ({ id: id(), t: 'text', x: 2, y, w: 76, h: Math.max(4, size * 0.55), txt: t, font: font || 'Cairo', size, bold: !!bold, color: '#111111', align: align || 'center' });
+  const line = y => ({ id: id(), t: 'shape', shape: 'hline', x: 2, y, w: 76, h: 0.4, stroke: '#111111', fill: 'none', radius: 0 });
+  return {
+    pageW: 80, pageH: 92, tableTop: 33, tableBottom: 50, rowH: 6.5,
+    elements: [
+      txt('صيدلية درب الشفاء', 2, 15, true, 'Alexandria'),
+      txt('{{date}}   {{time}}', 10.5, 9, false),
+      txt('فاتورة رقم: {{invNo}}', 16, 9.5, true),
+      txt('الزبون: {{customerName}}', 21.5, 9, false, 'Cairo', 'right'),
+      txt('الكاشير: {{employeeName}}', 26.5, 9, false, 'Cairo', 'right'),
+      line(31.8),
+      line(51.4),
+      txt('المجموع: {{subtotal}}', 52.6, 10, false, 'Cairo', 'right'),
+      txt('الخصم: {{discount}}', 58.2, 10, false, 'Cairo', 'right'),
+      txt('المطلوب: {{net}}', 63.8, 12.5, true, 'Alexandria', 'right'),
+      txt('المدفوع: {{paid}}   المتبقي: {{remaining}}', 70.4, 9.5, false, 'Cairo', 'right'),
+      line(76.4),
+      txt('شكراً لثقتكم — نتمنى لكم دوام الصحة', 78, 9, false),
+      txt('عدد الأصناف: {{itemCount}}', 84, 8.5, false),
+    ]
+  };
+}
+/* قراءة التصميم مع ترميم دفاعي (RTDB قد يحوّل مصفوفة العناصر إلى كائن مفهرس) */
+function invDesign() {
+  const raw = (state.settings && state.settings.invoiceDesign) || null;
+  const d = (raw && typeof raw === 'object' && raw.elements) ? raw : invDefaultDesign();
+  let els = d.elements; if (!Array.isArray(els)) els = els && typeof els === 'object' ? Object.values(els) : [];
+  const cl = (v, lo, hi, df) => { v = +v; return isFinite(v) ? Math.min(hi, Math.max(lo, v)) : df; };
+  const out = {
+    pageW: cl(d.pageW, 50, 120, 80), pageH: cl(d.pageH, 40, 400, 92),
+    tableTop: cl(d.tableTop, 4, 390, 33), tableBottom: cl(d.tableBottom, 6, 395, 50),
+    rowH: cl(d.rowH, 4, 20, 6.5),
+    elements: els.filter(e => e && typeof e === 'object').map(e => ({ ...e })),
+  };
+  if (out.tableBottom <= out.tableTop + 4) out.tableBottom = out.tableTop + 8;
+  return out;
+}
+function invVarMap(sale) {
+  const items = Array.isArray(sale.items) ? sale.items : [];
+  const net = Math.max(0, (sale.subtotal || 0) - (sale.discount || 0));
+  return {
+    pharmacyName: (state.settings && state.settings.pharmacyName) || 'صيدلية درب الشفاء',
+    invNo: String(sale.id || '').replace(/[^0-9a-zA-Z]/g, '').slice(-6).toUpperCase() || '—',
+    date: sale.date || dateStr(sale.ts), time: fmtTime(sale.ts),
+    customerName: sale.customerName || 'زبون نقدي', employeeName: sale.employeeName || '—',
+    itemCount: items.length,
+    subtotal: fmt(sale.subtotal || 0), discount: fmt(sale.discount || 0), net: fmt(net),
+    paid: fmt(sale.paid != null ? sale.paid : net), remaining: fmt(sale.remaining || 0),
+  };
+}
+/* بناء مستند الفاتورة: الرأس ثابت، التذييل ينزاح بمقدار تمدد الجدول، والطول مفتوح (قص تلقائي) */
+function invBuildInvoice(sale) {
+  const d = invDesign();
+  const items = Array.isArray(sale.items) ? sale.items : [];
+  const vals = invVarMap(sale);
+  const fillVars = s => String(s == null ? '' : s).replace(/\{\{(\w+)\}\}/g, (m, k) => vals[k] != null ? esc(vals[k]) : m);
+  const mm = n => (+n).toFixed(2) + 'mm';
+  const tableH = d.rowH * (items.length + 1);
+  const delta = Math.max(0, tableH - (d.tableBottom - d.tableTop)); // التمدد من الوسط فقط
+  const elHtml = (e, yOff) => {
+    const pos = `position:absolute;right:${mm(e.x || 0)};top:${mm((e.y || 0) + yOff)};width:${mm(e.w || 10)};height:${mm(e.h || 5)};box-sizing:border-box;`;
+    if (e.t === 'img') return e.src ? `<img src="${esc(e.src)}" style="${pos}object-fit:contain;display:block" alt="">` : '';
+    if (e.t === 'shape') {
+      if (e.shape === 'hline') return `<div style="${pos}height:0;border-top:0.4mm solid ${esc(e.stroke || '#111')}"></div>`;
+      if (e.shape === 'vline') return `<div style="${pos}width:0;border-right:0.4mm solid ${esc(e.stroke || '#111')}"></div>`;
+      const rad = e.shape === 'ellipse' ? '50%' : (e.shape === 'rrect' ? mm(e.radius || 1.2) : '0');
+      return `<div style="${pos}border:0.35mm solid ${esc(e.stroke || '#111')};border-radius:${rad};background:${e.fill && e.fill !== 'none' ? esc(e.fill) : 'transparent'}"></div>`;
+    }
+    return `<div style="${pos}font-family:'${esc(e.font || 'Cairo')}',sans-serif;font-size:${(+e.size || 9).toFixed(1)}pt;font-weight:${e.bold ? 800 : 400};color:${esc(e.color || '#111')};text-align:${e.align === 'right' ? 'right' : e.align === 'left' ? 'left' : 'center'};line-height:1.15;overflow:hidden;word-break:break-word">${fillVars(e.txt)}</div>`;
+  };
+  const center = e => (e.y || 0) + (e.h || 0) / 2;
+  const header = d.elements.filter(e => center(e) < d.tableTop).map(e => elHtml(e, 0)).join('');
+  const footer = d.elements.filter(e => center(e) >= d.tableBottom).map(e => elHtml(e, delta)).join('');
+  /* جدول الأصناف: مستطيلات مدورة مرصوصة — العناوين بتعبئة غامقة قليلاً والخلايا رصاصي فاتح وكلها بتحديد أسود */
+  const cellCss = `box-sizing:border-box;border:0.35mm solid #000;border-radius:1.1mm;margin:0.3mm;padding:0.4mm 0.6mm;display:flex;align-items:center;justify-content:center;text-align:center;overflow:hidden;line-height:1.1;font-size:8.5pt;font-family:'Cairo',sans-serif`;
+  const rowHtml = (cells, hdr) => `<div style="display:flex;direction:rtl;height:${mm(d.rowH)}">${cells.map((c, i) =>
+    `<div style="width:${mm(INV_COLS[i][1])};${cellCss};background:${hdr ? '#d9dee5' : '#f3f4f6'};font-weight:${hdr ? 800 : 400}">${c}</div>`).join('')}</div>`;
+  let rowsHtml = rowHtml(INV_COLS.map(c => esc(c[0])), true);
+  items.forEach((it, i) => {
+    rowsHtml += rowHtml([String(i + 1), esc(it.name || ''), esc(it.unitName || ''), esc(fmt(it.qty)), esc(fmt(it.sale)), esc(fmt(it.total != null ? it.total : it.sale * it.qty))], false);
+  });
+  const table = `<div style="position:absolute;right:2mm;top:${mm(d.tableTop)};width:76mm">${rowsHtml}</div>`;
+  const hMm = d.pageH + delta;
+  const css = `*{margin:0;padding:0}html,body{background:#fff}.invpage{position:relative;width:${mm(d.pageW)};height:${mm(hMm)};background:#fff;direction:rtl;overflow:hidden}`;
+  const body = `<div class="invpage">${header}${table}${footer}</div>`;
+  const doc = `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none';style-src 'unsafe-inline' https://fonts.googleapis.com;font-src https://fonts.gstatic.com;img-src data:">
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;800;900&family=Alexandria:wght@700;800;900&family=Tajawal:wght@400;700;800&family=Almarai:wght@400;700;800&family=Amiri:wght@400;700&family=Changa:wght@400;700;800&family=El+Messiri:wght@400;700&family=Noto+Kufi+Arabic:wght@400;700;800&family=Lateef:wght@400;700&family=Scheherazade+New:wght@400;700&family=Aref+Ruqaa:wght@400;700&family=Marhey:wght@400;700&display=swap" rel="stylesheet">
+<style>${css}</style></head><body>${body}</body></html>`;
+  return { doc, body, css, hMm, wMm: d.pageW };
+}
+/* فاتورة تجريبية للمعاينة والاختبار */
+function invDemoSale() {
+  const ts = Date.now();
+  return {
+    id: 'demo123456', type: 'sale', ts, date: dateStr(ts),
+    customerName: 'زبون تجريبي', employeeName: (me() || {}).name || 'الموظف',
+    subtotal: 23500, discount: 500, net: 23000, paid: 20000, remaining: 3000,
+    items: [
+      { name: 'بنادول إكسترا 24 قرص', unitName: 'علبة', qty: 2, sale: 3000, total: 6000 },
+      { name: 'أموكسيسيلين 500mg كبسول', unitName: 'شريط', qty: 1, sale: 4500, total: 4500 },
+      { name: 'فيتامين C فوار 1000', unitName: 'قطعة', qty: 3, sale: 2500, total: 7500 },
+      { name: 'شراب كحة للأطفال 120ml', unitName: 'قنينة', qty: 1, sale: 5500, total: 5500 },
+    ],
+  };
+}
+/* سقوط المتصفح: طباعة عبر نافذة النظام بمقاس صفحة ديناميكي 80مم × الطول المحسوب */
+function browserPrintInvoice(bodyHtml, css, hMm, wMm) {
+  const old = document.getElementById('print-root'); if (old) old.remove();
+  const oldSt = document.getElementById('inv-print-style'); if (oldSt) oldSt.remove();
+  const st = h('style', { id: 'inv-print-style' });
+  st.textContent = `@page{size:${wMm}mm ${Math.ceil(hMm)}mm;margin:0}\n@media print{#print-root{display:block;position:absolute;inset:0}}\n#print-root{width:${wMm}mm}\n` + css;
+  document.head.append(st);
+  const root = h('div', { id: 'print-root', class: 'print-area' });
+  root.innerHTML = bodyHtml;
+  document.body.append(root);
+  setTimeout(() => { window.print(); setTimeout(() => { root.remove(); st.remove(); }, 600); }, 150);
+}
+/* طباعة الفاتورة: صامتة على طابعة الفواتير المختارة داخل Electron، وتسقط على نافذة النظام عند الفشل */
+function printSaleInvoice(sale) {
+  try {
+    const { doc, body, css, hMm, wMm } = invBuildInvoice(sale);
+    const devName = ((state.settings && state.settings.invoicePrinter) || {}).name || '';
+    if (window.desktop && window.desktop.print && typeof window.desktop.print.silent === 'function') {
+      window.desktop.print.silent({ deviceName: devName, widthMm: wMm, heightMm: Math.ceil(hMm), qty: 1, html: doc })
+        .then(r => { if (!r || !r.ok) { console.warn('invoice print:', r && r.reason); browserPrintInvoice(body, css, hMm, wMm); } })
+        .catch(() => browserPrintInvoice(body, css, hMm, wMm));
+      return;
+    }
+    browserPrintInvoice(body, css, hMm, wMm);
+  } catch (err) { console.error(err); toast('تعذّرت طباعة الفاتورة', 'r'); }
+}
+
+/* المحرر المرئي: ورقة بيضاء على سطح رمادي — سحب/تحجيم/تكبير بعجلة Ctrl — تراجع/إعادة — خطّا الجدول قابلان للسحب */
+function renderDesignStudio(host) {
+  let d = invDesign();
+  let zoom = 1.35, selId = null, lastArrowT = 0;
+  const undoStack = [], redoStack = [];
+  const PX = 96 / 25.4; /* بكسل لكل ملم */
+  const mmpx = v => (v * PX * zoom) + 'px';
+
+  host.innerHTML = '';
+  host.style.padding = '0';
+  host.style.overflow = 'hidden';
+
+  let persistT = null;
+  const persist = () => {
+    state.settings.invoiceDesign = d;
+    DB.put('settings', state.settings);
+    Sync.push('settings', state.settings);
+  };
+  const persistSoon = () => { clearTimeout(persistT); persistT = setTimeout(persist, 500); };
+  const snap = () => JSON.stringify(d);
+  const commit = () => { undoStack.push(snap()); if (undoStack.length > 50) undoStack.shift(); redoStack.length = 0; persistSoon(); };
+  const undo = () => { if (!undoStack.length) return; redoStack.push(snap()); d = JSON.parse(undoStack.pop()); persistSoon(); drawAll(); };
+  const redo = () => { if (!redoStack.length) return; undoStack.push(snap()); d = JSON.parse(redoStack.pop()); persistSoon(); drawAll(); };
+
+  const newId = () => 'el' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const sel = () => d.elements.find(x => x.id === selId) || null;
+
+  /* ── عنصر مرسوم داخل الورقة ── */
+  function elNode(e) {
+    const n = h('div', { class: 'ds-el' + (e.id === selId ? ' sel' : ''), dataset: { id: e.id } });
+    n.style.right = mmpx(e.x); n.style.top = mmpx(e.y); n.style.width = mmpx(e.w); n.style.height = mmpx(e.h);
+    if (e.t === 'img') {
+      n.append(h('img', { src: e.src, draggable: false, style: { width: '100%', height: '100%', objectFit: 'contain', display: 'block', pointerEvents: 'none' } }));
+    } else if (e.t === 'shape') {
+      if (e.shape === 'hline') { n.style.height = '0'; n.style.borderTop = '1.5px solid ' + (e.stroke || '#111'); }
+      else if (e.shape === 'vline') { n.style.width = '0'; n.style.borderRight = '1.5px solid ' + (e.stroke || '#111'); }
+      else {
+        n.style.border = '1.5px solid ' + (e.stroke || '#111');
+        n.style.borderRadius = e.shape === 'ellipse' ? '50%' : (e.shape === 'rrect' ? mmpx(e.radius || 1.2) : '0');
+        if (e.fill && e.fill !== 'none') n.style.background = e.fill;
+      }
+    } else {
+      n.style.cssText += `font-family:'${e.font || 'Cairo'}',sans-serif;font-size:${((+e.size || 9) * 1.333 * zoom).toFixed(1)}px;font-weight:${e.bold ? 800 : 400};color:${e.color || '#111'};text-align:${e.align || 'center'};line-height:1.15;overflow:hidden;word-break:break-word;`;
+      n.textContent = e.txt || '';
+    }
+    /* سحب العنصر (right-based: السحب يميناً يُنقص الإزاحة) */
+    n.addEventListener('pointerdown', ev => {
+      if (ev.target.classList.contains('rs')) return;
+      ev.preventDefault(); ev.stopPropagation();
+      if (selId !== e.id) { selId = e.id; drawAll(); }
+      const node = pageEl.querySelector(`[data-id="${e.id}"]`);
+      const x0 = ev.clientX, y0 = ev.clientY, sx = e.x, sy = e.y;
+      let moved = false;
+      const mv = e2 => {
+        const dx = (e2.clientX - x0) / (PX * zoom), dy = (e2.clientY - y0) / (PX * zoom);
+        if (!moved && Math.abs(dx) + Math.abs(dy) < 0.15) return;
+        moved = true;
+        e.x = Math.min(d.pageW - 1, Math.max(-1, sx - dx));
+        e.y = Math.min(d.pageH - 1, Math.max(0, sy + dy));
+        if (node) { node.style.right = mmpx(e.x); node.style.top = mmpx(e.y); }
+      };
+      const up = () => {
+        document.removeEventListener('pointermove', mv); document.removeEventListener('pointerup', up);
+        if (moved) { commit(); drawAll(); }
+      };
+      document.addEventListener('pointermove', mv); document.addEventListener('pointerup', up);
+    });
+    /* مقابض التحجيم الأربعة */
+    [['nw', 'nwse-resize'], ['se', 'nwse-resize'], ['ne', 'nesw-resize'], ['sw', 'nesw-resize']].forEach(([corner, cur2]) => {
+      const rs = h('span', { class: 'rs', style: {
+        ...(corner.includes('n') ? { top: '-5px' } : { bottom: '-5px' }),
+        ...(corner.includes('e') ? { right: '-5px' } : { left: '-5px' }), cursor: cur2 } });
+      rs.addEventListener('pointerdown', ev => {
+        ev.preventDefault(); ev.stopPropagation();
+        const x0 = ev.clientX, y0 = ev.clientY, sx = e.x, sy = e.y, sw = e.w, sh = e.h;
+        const isLineH = e.shape === 'hline', isLineV = e.shape === 'vline';
+        const mv = e2 => {
+          const dx = (e2.clientX - x0) / (PX * zoom), dy = (e2.clientY - y0) / (PX * zoom);
+          const west = corner.includes('w'), north = corner.includes('n');
+          if (!isLineV) {
+            if (west) { e.w = Math.max(1, sw - dx); }
+            else { const nx = Math.min(sx + sw - 1, Math.max(0, sx - dx)); e.w = sx + sw - nx; e.x = nx; }
+          }
+          if (!isLineH) {
+            if (north) { e.y = Math.max(0, sy + dy); e.h = Math.max(1, sh - dy); }
+            else e.h = Math.max(1, sh + dy);
+          }
+          const node = pageEl.querySelector(`[data-id="${e.id}"]`);
+          if (node) { node.style.right = mmpx(e.x); node.style.top = mmpx(e.y); node.style.width = mmpx(e.w); node.style.height = mmpx(e.h); }
+        };
+        const up = () => { document.removeEventListener('pointermove', mv); document.removeEventListener('pointerup', up); commit(); drawAll(); };
+        document.addEventListener('pointermove', mv); document.addEventListener('pointerup', up);
+      });
+      n.append(rs);
+    });
+    return n;
+  }
+
+  /* ── شريطا الأدوات ── */
+  const bar1 = h('div', { class: 'ds-toolbar' });
+  const bar2 = h('div', { class: 'ds-toolbar', style: { borderTop: '1px solid var(--line)' } });
+  const mkBtn = (label, onclick, cls, title) => h('button', { class: 'ds-btn' + (cls ? ' ' + cls : ''), title: title || '', onclick }, label);
+  const addEl = el => { commit(); d.elements.push(el); selId = el.id; drawAll(); };
+  const addText = txt => addEl({ id: newId(), t: 'text', x: 6, y: 6, w: 68, h: 7, txt: txt || 'نص جديد', font: 'Cairo', size: 10, bold: false, color: '#111111', align: 'center' });
+  const addShape = shape => addEl({ id: newId(), t: 'shape', shape, x: 10, y: 10, w: shape === 'vline' ? 0.4 : 40, h: shape === 'hline' ? 0.4 : 14, fill: 'none', stroke: '#111111', radius: 2 });
+  const delSel = () => { if (!selId) return; commit(); d.elements = d.elements.filter(x => x.id !== selId); selId = null; drawAll(); };
+  const dupSel = () => {
+    const s = sel(); if (!s) return;
+    commit();
+    const cp = { ...JSON.parse(JSON.stringify(s)), id: newId(), x: s.x + 2, y: s.y + 2 };
+    d.elements.push(cp); selId = cp.id; drawAll();
+  };
+
+  const imgInp = h('input', { type: 'file', accept: 'image/*,.svg', style: { display: 'none' } });
+  imgInp.addEventListener('change', () => {
+    const f = imgInp.files[0]; imgInp.value = '';
+    if (!f) return;
+    if (/svg/i.test(f.type) || /\.svg$/i.test(f.name)) {
+      const r = new FileReader();
+      r.onload = () => {
+        let s = String(r.result || '');
+        if (s.length > 400000) return toast('ملف SVG كبير جداً', 'r');
+        s = s.replace(/<script[\s\S]*?(<\/script\s*>|$)/gi, '').replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '').replace(/javascript\s*:/gi, '');
+        if (!/^\s*(<\?xml[^>]*>\s*)?<svg[\s>]/i.test(s)) return toast('ملف SVG غير صالح', 'r');
+        addEl({ id: newId(), t: 'img', x: 25, y: 5, w: 30, h: 12, src: 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(s))) });
+      };
+      r.readAsText(f);
+      return;
+    }
+    if (!/^image\/(png|jpe?g|webp|gif)$/i.test(f.type)) return toast('اختر صورة PNG/JPG/WebP أو ملف SVG', 'r');
+    if (f.size > 3 * 1024 * 1024) return toast('الصورة كبيرة — الحد الأقصى 3MB', 'r');
+    const r = new FileReader();
+    r.onload = () => {
+      const im = new Image();
+      im.onload = () => {
+        const k = Math.min(1, 400 / Math.max(im.width, im.height));
+        const cv = document.createElement('canvas');
+        cv.width = Math.max(1, Math.round(im.width * k)); cv.height = Math.max(1, Math.round(im.height * k));
+        cv.getContext('2d').drawImage(im, 0, 0, cv.width, cv.height);
+        const url = cv.toDataURL('image/png');
+        if (url.length > 400000) return toast('الصورة كبيرة بعد الضغط — جرّب أصغر', 'r');
+        addEl({ id: newId(), t: 'img', x: 25, y: 5, w: 30, h: Math.max(5, 30 * im.height / im.width), src: url });
+      };
+      im.onerror = () => toast('تعذّر فتح الصورة', 'r');
+      im.src = r.result;
+    };
+    r.readAsDataURL(f);
+  });
+
+  const pageHInp = h('input', { class: 'ds-inp', type: 'number', min: 40, max: 400, value: d.pageH, title: 'ارتفاع الورقة بالملم — يتمدد تلقائياً مع عدد الأصناف' });
+  pageHInp.addEventListener('change', () => {
+    commit();
+    d.pageH = Math.min(400, Math.max(40, num(pageHInp.value) || 92));
+    if (d.tableTop > d.pageH - 10) d.tableTop = d.pageH - 10;
+    if (d.tableBottom > d.pageH - 4) d.tableBottom = d.pageH - 4;
+    drawAll();
+  });
+  const preview = () => {
+    persist();
+    const { body, css } = invBuildInvoice(invDemoSale());
+    openModal({ title: 'معاينة الفاتورة (ببيانات تجريبية)', icon: 'eye', wide: true,
+      body: h('div', { style: { display: 'flex', justifyContent: 'center', background: '#6b7686', borderRadius: '12px', padding: '18px' } },
+        h('div', { html: `<style>${css}</style>${body}`, style: { boxShadow: '0 8px 30px rgba(0,0,0,.4)' } })) });
+  };
+
+  bar1.append(
+    mkBtn('＋ نص', () => addText(), '', 'إضافة نص'),
+    mkBtn('🖼 صورة / SVG', () => imgInp.click(), '', 'إضافة صورة أو شكل SVG والتحكم به مثل الورد'),
+    mkBtn('▭ مستطيل', () => addShape('rect')),
+    mkBtn('▢ مدوّر الحواف', () => addShape('rrect')),
+    mkBtn('◯ دائرة', () => addShape('ellipse')),
+    mkBtn('― خط أفقي', () => addShape('hline')),
+    mkBtn('│ خط عمودي', () => addShape('vline')),
+    h('span', { class: 'ds-sep' }),
+    mkBtn('حذف', delSel, 'danger', 'حذف العنصر المحدد (Delete)'),
+    mkBtn('تكرار', dupSel, '', 'Ctrl+D'),
+    h('span', { class: 'ds-sep' }),
+    mkBtn('↩ تراجع', undo, '', 'Ctrl+Z'),
+    mkBtn('↪ إعادة', redo, '', 'Ctrl+Y'),
+    h('span', { class: 'ds-sep' }),
+    h('label', { style: { fontSize: '11.5px', fontWeight: 800, color: 'var(--muted)' } }, 'ارتفاع الورقة (مم):'), pageHInp,
+    h('span', { class: 'ds-sep' }),
+    mkBtn('استعادة الافتراضي', async () => {
+      const yes = await confirmBox('استعادة التصميم الافتراضي؟ سيُفقد التصميم الحالي.', { danger: true, okLabel: 'استعادة' });
+      if (!yes) return;
+      commit(); d = invDefaultDesign(); selId = null; drawAll(); persist();
+      toast('استُعيد التصميم الافتراضي', 'b');
+    }, 'danger'),
+    h('span', { style: { flex: 1 } }),
+    mkBtn('حفظ التصميم', () => { persist(); toast('حُفظ تصميم الفاتورة ويُزامَن مع الأجهزة'); }, 'primary'),
+    mkBtn('معاينة', preview),
+    mkBtn('طباعة تجريبية', () => { persist(); printSaleInvoice(invDemoSale()); }));
+
+  /* خصائص العنصر المحدد */
+  const fontSel = h('select', { class: 'ds-sel' }, INV_FONTS.map(f => h('option', { value: f }, f)));
+  const sizeInp = h('input', { class: 'ds-inp', type: 'number', min: 5, max: 40, step: 0.5, title: 'حجم الخط (pt)' });
+  const boldBtn = mkBtn('B', () => { const s = sel(); if (!s) return; commit(); s.bold = !s.bold; drawAll(); }, '', 'عريض');
+  const colorInp = h('input', { class: 'ds-color', type: 'color', title: 'لون النص' });
+  const alignSel = h('select', { class: 'ds-sel' }, h('option', { value: 'right' }, 'يمين'), h('option', { value: 'center' }, 'وسط'), h('option', { value: 'left' }, 'يسار'));
+  const fillInp = h('input', { class: 'ds-color', type: 'color', title: 'لون التعبئة' });
+  const fillNoneBtn = mkBtn('بلا تعبئة', () => { const s = sel(); if (!s) return; commit(); s.fill = 'none'; drawAll(); });
+  const strokeInp = h('input', { class: 'ds-color', type: 'color', title: 'لون الحدود' });
+  const radiusInp = h('input', { class: 'ds-inp', type: 'number', min: 0, max: 20, step: 0.5, title: 'نصف قطر التدوير (مم)' });
+  const wInp = h('input', { class: 'ds-inp', type: 'number', min: 1, max: 120, step: 0.5, title: 'العرض (مم)' });
+  const hInp = h('input', { class: 'ds-inp', type: 'number', min: 1, max: 400, step: 0.5, title: 'الارتفاع (مم)' });
+  const txtInp = h('input', { class: 'ds-sel', style: { minWidth: '180px' }, placeholder: 'محتوى النص…' });
+  const bind = (inp, fn) => inp.addEventListener('change', () => { const s = sel(); if (!s) return; commit(); fn(s); drawAll(); });
+  bind(fontSel, s => s.font = fontSel.value);
+  bind(sizeInp, s => s.size = Math.min(40, Math.max(5, num(sizeInp.value) || 9)));
+  bind(colorInp, s => s.color = colorInp.value);
+  bind(alignSel, s => s.align = alignSel.value);
+  bind(fillInp, s => s.fill = fillInp.value);
+  bind(strokeInp, s => s.stroke = strokeInp.value);
+  bind(radiusInp, s => s.radius = Math.max(0, num(radiusInp.value)));
+  bind(wInp, s => s.w = Math.max(1, num(wInp.value) || s.w));
+  bind(hInp, s => s.h = Math.max(1, num(hInp.value) || s.h));
+  txtInp.addEventListener('input', () => { const s = sel(); if (!s || s.t !== 'text') return; s.txt = txtInp.value; persistSoon(); const node = pageEl.querySelector(`[data-id="${s.id}"]`); if (node) node.textContent = s.txt; });
+  txtInp.addEventListener('change', () => { commit(); drawAll(); });
+
+  bar2.append(
+    h('label', { style: { fontSize: '11.5px', fontWeight: 800, color: 'var(--muted)' } }, 'متغيرات الفاتورة:'),
+    ...INV_VARS.map(([k, label]) => h('button', { class: 'ds-var', title: 'إضافة متغير «' + label + '» كنص قابل للسحب', onclick: () => addText('{{' + k + '}}') }, label)),
+    h('span', { class: 'ds-sep' }),
+    fontSel, sizeInp, boldBtn, colorInp, alignSel, txtInp,
+    h('span', { class: 'ds-sep' }),
+    h('label', { style: { fontSize: '11.5px', fontWeight: 800, color: 'var(--muted)' } }, 'تعبئة:'), fillInp, fillNoneBtn,
+    h('label', { style: { fontSize: '11.5px', fontWeight: 800, color: 'var(--muted)' } }, 'حدود:'), strokeInp,
+    h('label', { style: { fontSize: '11.5px', fontWeight: 800, color: 'var(--muted)' } }, 'تدوير:'), radiusInp,
+    h('label', { style: { fontSize: '11.5px', fontWeight: 800, color: 'var(--muted)' } }, 'ع×ا:'), wInp, hInp);
+
+  const stage = h('div', { class: 'ds-stage' });
+  const pageEl = h('div', { class: 'ds-page' });
+  stage.append(pageEl);
+  const status = h('div', { class: 'ds-status' });
+  host.append(bar1, bar2, stage, status, imgInp);
+
+  function updateProps() {
+    const s = sel();
+    [fontSel, sizeInp, boldBtn, colorInp, alignSel, fillInp, fillNoneBtn, strokeInp, radiusInp, wInp, hInp, txtInp].forEach(x => x.disabled = !s);
+    if (!s) { txtInp.value = ''; return; }
+    fontSel.value = s.font || 'Cairo';
+    sizeInp.value = s.size || 9;
+    colorInp.value = s.color || '#111111';
+    alignSel.value = s.align || 'center';
+    fillInp.value = s.fill && s.fill !== 'none' ? s.fill : '#ffffff';
+    strokeInp.value = s.stroke || '#111111';
+    radiusInp.value = s.radius || 0;
+    wInp.value = Math.round((s.w || 0) * 10) / 10;
+    hInp.value = Math.round((s.h || 0) * 10) / 10;
+    txtInp.value = s.t === 'text' ? (s.txt || '') : '';
+    txtInp.style.display = s.t === 'text' ? '' : 'none';
+    fontSel.style.display = sizeInp.style.display = boldBtn.style.display = colorInp.style.display = alignSel.style.display = s.t === 'text' ? '' : 'none';
+    fillInp.style.display = fillNoneBtn.style.display = radiusInp.style.display = s.t === 'shape' && s.shape !== 'hline' && s.shape !== 'vline' ? '' : 'none';
+    radiusInp.style.display = s.t === 'shape' && s.shape === 'rrect' ? '' : 'none';
+    strokeInp.style.display = s.t === 'shape' ? '' : 'none';
+  }
+
+  function drawAll() {
+    pageEl.innerHTML = '';
+    pageEl.style.width = (d.pageW * PX * zoom) + 'px';
+    pageEl.style.height = (d.pageH * PX * zoom) + 'px';
+    pageEl.append(h('div', { class: 'ds-band', style: { top: (d.tableTop * PX * zoom) + 'px', height: ((d.tableBottom - d.tableTop) * PX * zoom) + 'px' } }));
+    d.elements.forEach(e => pageEl.append(elNode(e)));
+    [['tableTop', 'بداية جدول الأصناف — اسحبني'], ['tableBottom', 'نهاية الجدول — اسحبني']].forEach(([k, label]) => {
+      const mk = h('div', { class: 'ds-marker', style: { top: (d[k] * PX * zoom) + 'px' } }, h('span', {}, label));
+      mk.addEventListener('pointerdown', ev => {
+        ev.preventDefault(); ev.stopPropagation();
+        const y0 = ev.clientY, v0 = d[k];
+        const band = pageEl.querySelector('.ds-band');
+        const mv = e2 => {
+          d[k] = Math.min(d.pageH - 4, Math.max(4, v0 + (e2.clientY - y0) / (PX * zoom)));
+          if (d.tableBottom <= d.tableTop + 5) { if (k === 'tableTop') d.tableBottom = d.tableTop + 5; else d.tableTop = d.tableBottom - 5; }
+          mk.style.top = (d[k] * PX * zoom) + 'px';
+          if (band) { band.style.top = (d.tableTop * PX * zoom) + 'px'; band.style.height = ((d.tableBottom - d.tableTop) * PX * zoom) + 'px'; }
+        };
+        const up = () => { document.removeEventListener('pointermove', mv); document.removeEventListener('pointerup', up); commit(); drawAll(); };
+        document.addEventListener('pointermove', mv); document.addEventListener('pointerup', up);
+      });
+      pageEl.append(mk);
+    });
+    updateProps();
+    status.textContent = `الورقة ${d.pageW}×${d.pageH}مم • ${d.elements.length} عنصر • التكبير ${Math.round(zoom * 100)}% — Ctrl+عجلة الماوس: تكبير/تصغير • Ctrl+Z تراجع • Ctrl+Y إعادة • Ctrl+D تكرار • Delete حذف • الأسهم تحريك (Shift أسرع)`;
+  }
+
+  /* Ctrl + عجلة الماوس = تكبير/تصغير */
+  stage.addEventListener('wheel', e => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    zoom = Math.min(3, Math.max(0.5, zoom * (e.deltaY < 0 ? 1.12 : 0.89)));
+    drawAll();
+  }, { passive: false });
+  /* نقرة على الخلفية تلغي التحديد */
+  stage.addEventListener('pointerdown', e => { if (e.target === stage) { selId = null; drawAll(); } });
+  /* اختصارات لوحة المفاتيح — تتوقف تلقائياً عند مغادرة الاستوديو */
+  const onKey = e => {
+    if (!host.isConnected) { document.removeEventListener('keydown', onKey); return; }
+    if ($('#modal-root').children.length) return;
+    const ae = document.activeElement;
+    if (ae && (/^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName) || ae.isContentEditable)) return;
+    if (e.ctrlKey && !e.shiftKey && (e.key === 'z' || e.key === 'Z')) { e.preventDefault(); undo(); return; }
+    if (e.ctrlKey && (e.key === 'y' || e.key === 'Y' || (e.shiftKey && (e.key === 'z' || e.key === 'Z')))) { e.preventDefault(); redo(); return; }
+    if (e.ctrlKey && (e.key === 'd' || e.key === 'D')) { e.preventDefault(); dupSel(); return; }
+    const s = sel(); if (!s) return;
+    if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); delSel(); return; }
+    if (e.key === 'Escape') { selId = null; drawAll(); return; }
+    if (e.key.startsWith('Arrow')) {
+      e.preventDefault();
+      const now = Date.now();
+      if (now - lastArrowT > 700) { undoStack.push(snap()); if (undoStack.length > 50) undoStack.shift(); redoStack.length = 0; }
+      lastArrowT = now;
+      const step = e.shiftKey ? 2 : 0.5;
+      if (e.key === 'ArrowUp') s.y = Math.max(0, s.y - step);
+      if (e.key === 'ArrowDown') s.y = Math.min(d.pageH, s.y + step);
+      if (e.key === 'ArrowLeft') s.x = Math.min(d.pageW, s.x + step);   /* right-based: يسار يزيد الإزاحة */
+      if (e.key === 'ArrowRight') s.x = Math.max(0, s.x - step);
+      drawAll(); persistSoon();
+    }
+  };
+  document.addEventListener('keydown', onKey);
+  drawAll();
 }
 
 /* ───────────────────────── 24) تبويب الماسح الذكي ───────────────────────── */
@@ -3210,8 +3956,8 @@ function renderReturnSale(tab) {
   discInp.addEventListener('input', () => { st.discount = num(discInp.value); st.renderTotals(); });
   st.renderTotals = () => {
     const sub = st.cart.reduce((s, it) => s + it.sale * it.qty, 0);
-    subEl.textContent = fmt(sub);
-    grandEl.firstChild.textContent = fmt(Math.max(0, sub - st.discount));
+    animNum(subEl, sub);
+    animNum(grandEl.firstChild, Math.max(0, sub - st.discount));
   };
   const footer = h('div', { class: 'pos-footer' },
     h('div', { class: 'totals-row' },
@@ -3302,7 +4048,7 @@ function renderReturnPurchase(tab) {
   const supSel = h('select', {}, h('option', { value: '' }, '— اختر المذخر —'),
     state.suppliers.filter(s => !s.deleted).map(s => h('option', { value: s.id, selected: st.supplierId === s.id }, s.name)));
   const debtEl = h('b', { style: { color: 'var(--red)', fontSize: '15px' } }, '—');
-  const drawDebt = () => { const s = findSup(st.supplierId); debtEl.textContent = s ? `${fmt(s.debt || 0)} ${cur()}` : '—'; };
+  const drawDebt = () => { const s = findSup(st.supplierId); if (s) animNum(debtEl, s.debt || 0, ' ' + cur()); else debtEl.textContent = '—'; };
   supSel.addEventListener('change', () => { st.supplierId = supSel.value || null; drawDebt(); });
   drawDebt();
   center.append(h('div', { class: 'filter-bar' },
@@ -3373,7 +4119,7 @@ function renderReturnPurchase(tab) {
   };
 
   const totalEl = h('div', { class: 'tval' }, h('span', {}, '0'), ' ', h('small', {}, cur()));
-  function drawTotals() { totalEl.firstChild.textContent = fmt(st.items.reduce((s, it) => s + it.buyPrice * it.qty, 0)); }
+  function drawTotals() { animNum(totalEl.firstChild, st.items.reduce((s, it) => s + it.buyPrice * it.qty, 0)); }
   const footer = h('div', { class: 'pos-footer' },
     h('div', { class: 'totals-row' },
       h('div', { class: 'total-card grand red-grand' }, h('label', {}, 'إجمالي المُرجَع للمذخر'), totalEl)),
@@ -3413,8 +4159,8 @@ async function saveReturnPurchaseModal(tab) {
   openModal({
     title: 'تسوية إرجاع الشراء', icon: 'refresh',
     body: h('div', {},
-      h('div', { class: 'sum-card r', style: { marginBottom: '10px' } }, h('label', {}, `قيمة الأصناف المُرجعة للمذخر «${sup.name}»`), h('b', {}, `${fmt(total)} ${cur()}`)),
-      h('div', { class: 'sum-card n' }, h('label', {}, 'الدين الحالي قبل الإرجاع'), h('b', {}, `${fmt(sup.debt || 0)} ${cur()}`))),
+      h('div', { class: 'sum-card r', style: { marginBottom: '10px' } }, h('label', {}, `قيمة الأصناف المُرجعة للمذخر «${sup.name}»`), h('b', {}, animSpan(total, ' ' + cur()))),
+      h('div', { class: 'sum-card n' }, h('label', {}, 'الدين الحالي قبل الإرجاع'), h('b', {}, animSpan(sup.debt || 0, ' ' + cur())))),
     actions: [
       { label: 'إلغاء', cls: 'n', onClick: c => c() },
       { label: 'آجل (يُنقص الدين)', cls: 'r', icon: 'clock', big: true, onClick: c => { c(); finalizeReturnPurchase(tab, 'credit'); } },
@@ -3530,10 +4276,10 @@ function renderStatement(tab) {
     const rets = evs.filter(e => e.kind === 'buyret').reduce((s, e) => s + e.doc.total, 0);
     const pays = evs.filter(e => e.kind === 'pay' || e.kind === 'deposit').reduce((s, e) => s + e.doc.amount + (e.doc.discount || 0), 0);
     footBox.append(
-      h('div', { class: 'sum-card b' }, h('label', {}, 'إجمالي المشتريات'), h('b', {}, fmt(buys))),
-      h('div', { class: 'sum-card r' }, h('label', {}, 'إجمالي الاسترجاعات'), h('b', {}, fmt(rets))),
-      h('div', { class: 'sum-card g' }, h('label', {}, 'إجمالي التسديدات والإيداعات'), h('b', {}, fmt(pays))),
-      h('div', { class: 'sum-card big' }, h('label', {}, 'الدين المتراكم الحالي'), h('b', {}, `${fmt(sup ? sup.debt || 0 : 0)} ${cur()}`)));
+      h('div', { class: 'sum-card b' }, h('label', {}, 'إجمالي المشتريات'), h('b', {}, animSpan(buys))),
+      h('div', { class: 'sum-card r' }, h('label', {}, 'إجمالي الاسترجاعات'), h('b', {}, animSpan(rets))),
+      h('div', { class: 'sum-card g' }, h('label', {}, 'إجمالي التسديدات والإيداعات'), h('b', {}, animSpan(pays))),
+      h('div', { class: 'sum-card big' }, h('label', {}, 'الدين المتراكم الحالي'), h('b', {}, animSpan(sup ? sup.debt || 0 : 0, ' ' + cur()))));
   }
   draw();
   tab.el.append(page);
@@ -3622,7 +4368,7 @@ async function init() {
 }
 document.addEventListener('DOMContentLoaded', init);
 
-/* ═══════════════ الحاسبة العلمية العائمة — اضغط F1 للفتح والإغلاق ═══════════════ */
+/* ═══════════════ الحاسبة العلمية العائمة — اضغط + للفتح و Esc للإغلاق ═══════════════ */
 const CalcEngine = (() => {
   const S = { deg: true, ans: 0 };
   const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
@@ -3804,7 +4550,7 @@ function openCalc() {
 
   const head = h('div', { class: 'calc-head' },
     h('span', { class: 'calc-title' }, 'الحاسبة'),
-    h('small', {}, 'F1 للإغلاق'),
+    h('small', {}, '+ للفتح • Esc للإغلاق'),
     h('button', { type: 'button', tabindex: '-1', class: 'calc-x', title: 'إغلاق', html: icon('close'), onclick: closeCalc }));
   head.addEventListener('pointerdown', e => {
     if (e.target.closest('.calc-x')) return;
@@ -3823,7 +4569,7 @@ function openCalc() {
     head.addEventListener('pointercancel', up);
   });
   win.addEventListener('keydown', e => {
-    if (e.key === 'F1') return;            /* يمر للمستمع العام ليغلق الحاسبة */
+    if (e.key === '+') return;            /* يمر للمستمع العام — ويُحجب هناك داخل الحقول فيُكتب عادياً */
     e.stopPropagation();                   /* لا يتسرّب أي ضغط إلى نقطة البيع */
     if (e.key === 'Escape') { e.preventDefault(); closeCalc(); }
   });
@@ -3839,12 +4585,31 @@ function openCalc() {
 }
 function toggleCalc() { if (document.getElementById('calc-win')) closeCalc(); else openCalc(); }
 document.addEventListener('keydown', e => {
-  if (e.key !== 'F1' || e.ctrlKey || e.altKey || e.metaKey) return;
+  if (e.key !== '+' || e.ctrlKey || e.altKey || e.metaKey) return;
+  const ae2 = e.target;
+  if (ae2 && (/^(INPUT|TEXTAREA|SELECT)$/.test(ae2.tagName) || ae2.isContentEditable)) return;   /* داخل حقل إدخال = يُكتب + عادياً */
   e.preventDefault();
   if (!state.session && !document.getElementById('calc-win')) return;   /* لا تفتح قبل تسجيل الدخول */
   toggleCalc();
 });
 window.addEventListener('resize', () => { const w = document.getElementById('calc-win'); if (w && w._place) w._place(); });
+/* ═══ الوضع النهاري / الليلي — مفتاح شمس (يمين) وقمر (يسار) مجاور لأزرار النافذة، يُحفظ محلياً ═══ */
+const THEME_SUN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M2.5 12h2.4M19.1 12h2.4M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M19.1 4.9l-1.7 1.7M6.6 17.4l-1.7 1.7"/></svg>';
+const THEME_MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>';
+function themeToggle() {
+  const isDark = () => document.documentElement.getAttribute('data-theme') === 'dark';
+  const btn = h('button', { class: 'theme-sw' + (isDark() ? ' on' : ''), title: 'التبديل بين الوضع النهاري والليلي' });
+  btn.append(h('span', { class: 'th-sun', html: THEME_SUN }), h('span', { class: 'th-moon', html: THEME_MOON }));
+  btn.addEventListener('click', () => {
+    const dark = !isDark();
+    if (dark) document.documentElement.setAttribute('data-theme', 'dark');
+    else document.documentElement.removeAttribute('data-theme');
+    try { localStorage.setItem('ds_theme', dark ? 'dark' : 'light'); } catch (e) {}
+    btn.classList.toggle('on', dark);
+  });
+  return btn;
+}
+
 /* ═══ أزرار النافذة (تصغير / إغلاق) ═══ */
 const WIN_MIN_IC = '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M5 18h14"/></svg>';
 function winControls() {
