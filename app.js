@@ -2776,6 +2776,626 @@ function renderInventory(tab) {
   tab.el.append(page);
 }
 
+/* ───────────────────────── 20-ب) مخزن مفاتيح الذكاء الاصطناعي: عدد غير محدود، يُرفع للسحابة، ويدور تلقائياً ───────────────────────── */
+const KeyPool = (() => {
+  let list = [], loaded = null, polling = false, listening = false, cssDone = false;
+  const subs = new Set();
+  const S = x => String(x == null ? '' : x).trim();
+  const cloudReady = () => typeof Sync !== 'undefined' && Sync.ready && Sync.db;
+  const notify = () => subs.forEach(f => { try { f(); } catch (_) {} });
+  const persistLocal = () => DB.put('meta', { id: 'aikeys', list: JSON.parse(JSON.stringify(list)) }).catch(() => {});
+  const norm = k => ({
+    id: S(k.id), key: S(k.key), label: S(k.label), addedAt: +k.addedAt || 0, disabled: !!k.disabled, bad: S(k.bad), used: +k.used || 0,
+    ex: { pro: +(k.ex && k.ex.pro) || 0, flash: +(k.ex && k.ex.flash) || 0 },
+    exAt: { pro: +(k.exAt && k.exAt.pro) || 0, flash: +(k.exAt && k.exAt.flash) || 0 },
+  });
+  const pushCloud = k => {
+    if (!cloudReady()) return;
+    try { Sync.db.ref('pos/aiKeys/' + k.id).set(JSON.parse(JSON.stringify(k))).catch(e => console.warn('aiKeys cloud:', e)); } catch (_) {}
+  };
+  const upsert = k => {
+    const n = norm(k || {});
+    if (!n.id || !n.key) return;
+    const i = list.findIndex(x => x.id === n.id);
+    if (i >= 0) list[i] = n; else list.push(n);
+  };
+
+  /* الاستماع للسحابة: أي مفتاح يُضاف أو تتغير حالته على أي جهاز يصل لكل الأجهزة */
+  function listen() {
+    if (listening || polling) return;
+    polling = true;
+    const t = setInterval(() => {
+      if (!cloudReady()) return;
+      clearInterval(t); polling = false; listening = true;
+      const ref = Sync.db.ref('pos/aiKeys');
+      const apply = snap => { const v = snap.val(); if (v && v.id) { upsert(v); persistLocal(); notify(); } };
+      ref.on('child_added', apply, e => console.warn('aiKeys:', e));
+      ref.on('child_changed', apply, e => console.warn('aiKeys:', e));
+      ref.on('child_removed', snap => { const id = snap.key; list = list.filter(x => x.id !== id); persistLocal(); notify(); }, e => console.warn('aiKeys:', e));
+      ref.once('value').then(s => { const c = s.val() || {}; list.forEach(k => { if (!c[k.id]) pushCloud(k); }); }).catch(() => {});
+    }, 1500);
+  }
+  function load() {
+    if (!loaded) loaded = (async () => {
+      try { const m = await DB.get('meta', 'aikeys'); if (m && Array.isArray(m.list)) m.list.forEach(upsert); } catch (_) {}
+      notify();
+    })();
+    listen();
+    return loaded;
+  }
+
+  /* الأولوية: مفتاح استُهلك سابقاً وعاد متاحاً (الأقدم استهلاكاً أولاً)، ثم المفاتيح التي لم تُستهلك بترتيب إضافتها */
+  function next(tried, tier) {
+    const now = Date.now();
+    const av = list.filter(k => !k.disabled && !k.bad && !tried.has(k.id) && k.ex[tier] <= now);
+    const back = av.filter(k => k.exAt[tier] > 0).sort((a, b) => a.exAt[tier] - b.exAt[tier]);
+    const fresh = av.filter(k => !(k.exAt[tier] > 0)).sort((a, b) => a.addedAt - b.addedAt);
+    return back[0] || fresh[0] || null;
+  }
+  const mark = (id, fn) => { const k = list.find(x => x.id === id); if (!k) return; fn(k); persistLocal(); pushCloud(k); notify(); };
+  const exhaust = (id, tier, until) => mark(id, k => { k.ex[tier] = until; k.exAt[tier] = Date.now(); });
+  const markBad = (id, why) => mark(id, k => { k.bad = S(why).slice(0, 80) || 'مرفوض'; });
+  const touch = id => mark(id, k => { k.used = (k.used || 0) + 1; });
+  const resetState = id => mark(id, k => { k.bad = ''; k.ex = { pro: 0, flash: 0 }; });
+  const toggle = id => mark(id, k => { k.disabled = !k.disabled; if (!k.disabled) k.bad = ''; });
+  const soonest = tier => {
+    const now = Date.now();
+    const t = list.filter(k => !k.disabled && !k.bad && k.ex[tier] > now).map(k => k.ex[tier]);
+    return t.length ? Math.min(...t) : 0;
+  };
+  async function remove(id) {
+    list = list.filter(x => x.id !== id);
+    persistLocal(); notify();
+    if (cloudReady()) { try { await Sync.db.ref('pos/aiKeys/' + id).remove(); } catch (e) { console.warn('aiKeys remove:', e); } }
+  }
+  async function addMany(text, label) {
+    await load();
+    const keys = String(text || '').split(/[\s,;]+/).map(S).filter(Boolean);
+    let added = 0, dup = 0, bad = 0;
+    for (const key of keys) {
+      if (!/^[A-Za-z0-9_\-]{20,}$/.test(key)) { bad++; continue; }
+      if (list.some(x => x.key === key)) { dup++; continue; }
+      const k = norm({ id: uid(), key, label: keys.length === 1 ? label : '', addedAt: Date.now() + added });
+      list.push(k); pushCloud(k); added++;
+    }
+    persistLocal(); notify();
+    return { added, dup, bad };
+  }
+
+  function css() {
+    if (cssDone) return; cssDone = true;
+    const st = document.createElement('style'); st.id = 'kp-css';
+    st.textContent = `
+.kp-wrap{display:flex;flex-direction:column;gap:12px}
+.kp-ta,.kp-in{width:100%;border:1.5px solid var(--line);border-radius:12px;padding:10px 13px;font-weight:700;outline:none;font-family:inherit}
+.kp-ta{direction:ltr;resize:vertical}
+.kp-list{display:flex;flex-direction:column;gap:8px;max-height:46vh;overflow:auto}
+.kp-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;border:1px solid var(--line);border-radius:14px;padding:9px 12px}
+.kp-row.cur{border-color:#14b8a6;box-shadow:0 0 0 3px rgba(20,184,166,.16)}
+.kp-name{font-weight:900}
+.kp-mask{direction:ltr;font-family:monospace;color:var(--muted);font-weight:700}
+.kp-chip{display:inline-block;padding:0 10px;border-radius:999px;font-size:12px;font-weight:900;line-height:1.9}
+.kp-chip.ok{background:#d9f7e6;color:#047857}.kp-chip.warn{background:#fff0c9;color:#a16207}.kp-chip.bad{background:#ffdcdc;color:#b91c1c}.kp-chip.na{background:#e6ecec;color:#52615f}.kp-chip.cur{background:#14b8a6;color:#fff}
+.kp-sp{flex:1}
+.kp-info{font-weight:800;font-size:13px;color:var(--muted);line-height:1.9}
+`;
+    document.head.append(st);
+  }
+
+  function openManager() {
+    css();
+    const ta = h('textarea', { class: 'kp-ta', rows: 3, dir: 'ltr', placeholder: 'AIza…  الصق مفتاحاً أو عدة مفاتيح (كل مفتاح في سطر)' });
+    const lbl = h('input', { class: 'kp-in', placeholder: 'اسم اختياري للمفتاح (يُستعمل عند إضافة مفتاح واحد)' });
+    const info = h('div', { class: 'kp-info' });
+    const box = h('div', { class: 'kp-list' });
+    const draw = () => {
+      box.innerHTML = '';
+      const now = Date.now();
+      const cur = next(new Set(), 'pro');
+      const rows = [...list].sort((a, b) => a.addedAt - b.addedAt);
+      const ready = rows.filter(k => !k.disabled && !k.bad && k.ex.pro <= now).length;
+      info.textContent = `${rows.length} مفتاح — جاهز الآن للموديل الأذكى: ${ready}. المفاتيح محفوظة في السحابة وتصل لكل الأجهزة، ويُستخدم أول مفتاح جاهز وعند استهلاكه يُنتقل للتالي تلقائياً، وأي مفتاح يعود متاحاً تكون له الأولوية.`;
+      if (!rows.length) { box.append(h('div', { class: 'empty-note' }, 'لا توجد مفاتيح بعد — الصق مفاتيحك بالأعلى')); return; }
+      rows.forEach((k, i) => {
+        let chip;
+        if (k.bad) chip = h('span', { class: 'kp-chip bad' }, 'مرفوض: ' + k.bad);
+        else if (k.disabled) chip = h('span', { class: 'kp-chip na' }, 'معطّل');
+        else if (k.ex.pro > now) chip = h('span', { class: 'kp-chip warn' }, `مستهلك حتى ${fmtDate(k.ex.pro)} ${fmtTime(k.ex.pro)}`);
+        else chip = h('span', { class: 'kp-chip ok' }, k.exAt.pro > 0 ? 'عاد متاحاً — له الأولوية' : 'جاهز');
+        box.append(h('div', { class: 'kp-row' + (cur && cur.id === k.id ? ' cur' : '') },
+          h('span', { class: 'kp-name' }, k.label || `مفتاح ${i + 1}`),
+          h('span', { class: 'kp-mask' }, k.key.slice(0, 6) + '…' + k.key.slice(-4)),
+          chip,
+          cur && cur.id === k.id ? h('span', { class: 'kp-chip cur' }, 'يُستخدم الآن') : null,
+          h('span', { class: 'kp-chip na' }, `استُخدم ${k.used} مرة`),
+          h('span', { class: 'kp-sp' }),
+          (k.bad || k.ex.pro > now || k.ex.flash > now) ? h('button', { class: 'mini-btn blue', onclick: () => resetState(k.id) }, 'تصفير الحالة') : null,
+          h('button', { class: 'mini-btn blue', onclick: () => toggle(k.id) }, k.disabled ? 'تفعيل' : 'تعطيل'),
+          h('button', { class: 'mini-btn red', onclick: async () => {
+            if (await confirmBox('حذف هذا المفتاح نهائياً من كل الأجهزة؟', { danger: true, okLabel: 'حذف' })) { await remove(k.id); toast('حُذف المفتاح', 'b'); }
+          } }, 'حذف')));
+      });
+    };
+    const addBtn = h('button', { class: 'btn g', onclick: async () => {
+      if (!ta.value.trim()) return toast('الصق المفتاح أولاً', 'r');
+      const r = await addMany(ta.value, lbl.value);
+      if (!r.added && !r.dup) return toast('لم يُقبل أي مفتاح — تأكد من نسخه كاملاً', 'r');
+      ta.value = ''; lbl.value = '';
+      toast(`أُضيف ${r.added} مفتاح` + (r.dup ? ` — ${r.dup} مكرر` : '') + (r.bad ? ` — ${r.bad} غير صالح` : ''), r.added ? 'g' : 'r');
+    } }, h('span', { html: icon('plus') }), 'إضافة وحفظ في السحابة');
+    const body = h('div', { class: 'kp-wrap' }, ta, lbl, h('div', {}, addBtn), info, box);
+    openModal({ title: 'مفاتيح الموسوعة الدوائية', icon: 'lock', body, wide: true, onClose: () => subs.delete(draw) });
+    subs.add(draw);
+    load().then(draw);
+    draw();
+  }
+
+  return { load, next, exhaust, markBad, touch, soonest, openManager, count: () => list.length };
+})();
+
+/* ───────────────────────── 20-أ) الموسوعة الدوائية الذكية: Gemini + بحث ويب موثّق + ذاكرة محلية وسحابية ───────────────────────── */
+const DrugInfo = (() => {
+  const A = x => Array.isArray(x) ? x : (x && typeof x === 'object' ? Object.values(x) : (x ? [x] : []));
+  const S = x => String(x == null ? '' : x).trim();
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const inflight = new Map();
+  let uidN = 0, cssDone = false;
+
+  /* الاسم العلمي → مكوّناته (تركيبة إن وُجد + أو / أو &) ثم مفتاح تخزين موحّد مرتّب أبجدياً */
+  const splitParts = sci => S(sci)
+    .replace(/\(.*?\)/g, ' ')
+    .split(/\s*(?:\+|\/|&|,|;|\band\b)\s*/i)
+    .map(x => x.replace(/\d+(?:[.,]\d+)?\s*(?:mg|mcg|µg|ug|gm|g|ml|iu|%|units?)(?![a-z])/ig, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  const keyOf = ps => ps.map(x => x.toLowerCase().replace(/[^a-z0-9\u0600-\u06FF]+/g, '_').replace(/^_+|_+$/g, '')).filter(Boolean).sort().join('__').slice(0, 200);
+
+  /* ── اختيار أذكى موديل متاح للمفتاح: Pro أولاً ثم Flash احتياطاً ── */
+  let mCache = { k: '', list: null, ts: 0 };
+  async function listModels(apiKey) {
+    if (mCache.list && mCache.k === apiKey && Date.now() - mCache.ts < 600000) return mCache.list;
+    try {
+      const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000', { headers: { 'x-goog-api-key': apiKey } });
+      if (!r.ok) return null;
+      const d = await r.json();
+      const names = (d.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => String(m.name || '').replace(/^models\//, ''));
+      mCache = { k: apiKey, list: names, ts: Date.now() };
+      return names;
+    } catch (_) { return null; }
+  }
+  function order(avail) {
+    const FALL = ['gemini-pro-latest', 'gemini-2.5-pro', 'gemini-flash-latest', 'gemini-2.5-flash'];
+    if (!avail || !avail.length) return FALL;
+    const bad = /(tts|image|live|audio|robotics|computer|embedding|learnlm|vision|gemma|nano|lite|customtools|exp)/;
+    const ver = n => { const m = /gemini-(\d+(?:\.\d+)?)/.exec(n); return m ? parseFloat(m[1]) : 0; };
+    const pros = avail.filter(n => /^gemini-.*pro/.test(n) && !bad.test(n))
+      .sort((a, b) => ((b === 'gemini-pro-latest') - (a === 'gemini-pro-latest')) || (ver(b) - ver(a)) || (/preview/.test(a) - /preview/.test(b)));
+    const flash = ['gemini-flash-latest', 'gemini-2.5-flash'].filter(n => avail.includes(n));
+    const out = [...pros.slice(0, 4), ...flash];
+    return out.length ? out : FALL;
+  }
+
+  function buildPrompt(p, ps) {
+    const clean = v => S(v).replace(/["\r\n]+/g, ' ');
+    const combo = ps.length > 1;
+    return `You are a senior clinical pharmacist and drug-information specialist. Use Google Search to verify EVERY fact against authoritative sources only (FDA/DailyMed labels, EMA SmPC, MHRA/BNF, WHO, NHS, MedlinePlus, Mayo Clinic, Drugs.com professional monographs, LactMed, NICE). Never guess. If a fact cannot be verified, write "غير مؤكد" for that field instead of inventing it.
+
+Drug (scientific name as entered by the pharmacy): "${clean(p.scientificName)}"
+${combo ? 'This is a FIXED-DOSE COMBINATION of: ' + ps.join(' + ') + '. Describe the combination product as a whole (uses, dosing of the combination, safety of the combination). In "moa.steps" give one item per component. Mention component-specific warnings where they differ.' : 'This is a single active ingredient.'}
+Local product for context only: trade name "${clean(p.brandName)}", form "${clean(p.form)}", strength "${clean(p.dose)}".
+
+Write ALL text values in clear Arabic for a pharmacist. Keep drug names, doses, units and brand names in English (Latin) letters.
+Strict brevity so everything fits on one screen: every string at most 200 characters; every array at most 6 items.
+Rules:
+- "brands": up to 8 brand names of this exact generic (or this exact combination) that are genuinely marketed in Iraq or commonly written in Iraqi prescriptions. "n" = brand name in English, "c" = manufacturer. Include only brands you are certain exist, otherwise return an empty array.
+- "doses": one object per commercially available strength/form, with: f = form and strength, who = patient group (adult / child with age or weight), d = dose and frequency, how = route and timing (with or without food, etc.), tip = key counseling advice for the patient or "".
+- "safe": for each of preg, lact, child, htn, dm, kid, liv, heart: s = one of "safe","caution","unsafe","unknown"; t = short reason with trimester or dose adjustment where relevant. For child also set "age" = minimum allowed age/weight (for example "≥ 12 سنة") or "غير مؤكد".
+- "adv.contra": absolute contraindications (cases where the pharmacist must NOT dispense).
+- Do not put markdown, citations, links or footnote marks inside any string.
+Return ONLY one JSON object, starting with { and ending with }, in exactly this shape:
+{"brands":[{"n":"","c":""}],"uses":{"sum":"","list":[""]},"doses":[{"f":"","who":"","d":"","how":"","tip":""}],"moa":{"sum":"","steps":[""]},"adv":{"common":[""],"serious":[""],"contra":[""]},"safe":{"preg":{"s":"","t":""},"lact":{"s":"","t":""},"child":{"s":"","age":"","t":""},"htn":{"s":"","t":""},"dm":{"s":"","t":""},"kid":{"s":"","t":""},"liv":{"s":"","t":""},"heart":{"s":"","t":""}},"extra":{"cls":"","onset":"","half":"","inter":[""],"tips":[""],"store":""}}`;
+  }
+
+  function parseJson(text) {
+    const t = String(text || '').replace(/```json|```/g, '').trim();
+    const s = t.indexOf('{'), e = t.lastIndexOf('}');
+    if (s < 0 || e < 0) return null;
+    try { return JSON.parse(t.slice(s, e + 1)); } catch (_) { return null; }
+  }
+
+  async function callModel(model, key, prompt, grounded) {
+    const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 180000);
+    try {
+      const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 32000 } };
+      if (grounded) body.tools = [{ google_search: {} }];
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body), signal: ctl.signal,
+      });
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        const msg = S(e && e.error && e.error.message).slice(0, 160);
+        let raw = ''; try { raw = JSON.stringify(e).slice(0, 3000); } catch (_) {}
+        return { ok: false, status: res.status, msg, raw, fatal: res.status === 401 || res.status === 403 || (res.status === 400 && /api key/i.test(msg)) };
+      }
+      const data = await res.json();
+      const c0 = data.candidates && data.candidates[0];
+      const text = ((c0 && c0.content && c0.content.parts) || []).map(x => x.text || '').join('');
+      const gm = (c0 && c0.groundingMetadata) || {};
+      const sources = A(gm.groundingChunks).map(g => g && g.web ? { t: S(g.web.title), u: S(g.web.uri) } : null).filter(Boolean);
+      if (!text.trim()) return { ok: false, status: 0, msg: (c0 && c0.finishReason) || 'ردّ فارغ' };
+      return { ok: true, text, sources };
+    } catch (e) {
+      return { ok: false, status: 0, msg: e && e.name === 'AbortError' ? 'انتهت المهلة' : 'تعذّر الاتصال' };
+    } finally { clearTimeout(to); }
+  }
+
+  /* التوليد: بحث ويب موثّق أولاً عبر كل الموديلات، ولا يُسمح بالتوليد بلا بحث إلا إذا رفضت الموديلات أداة البحث نفسها */
+  /* منتصف ليل توقيت المحيط الهادئ = موعد تصفير الحصة اليومية لمفاتيح Gemini */
+  function nextPTMidnight() {
+    const now = Date.now();
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(new Date(now));
+    const g = t => +parts.find(x => x.type === t).value;
+    const hh = g('hour') % 24;
+    return now + (86400 - (hh * 3600 + g('minute') * 60 + g('second'))) * 1000 + 1000;
+  }
+  function quotaUntil(r) {
+    const raw = (r.raw || '') + ' ' + (r.msg || '');
+    if (/PerDay|per day|daily/i.test(raw)) return nextPTMidnight();
+    const m = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(raw);
+    return Date.now() + ((m ? Math.ceil(parseFloat(m[1])) + 2 : 65) * 1000);
+  }
+
+  /* التوليد: يبدأ بأذكى موديل عبر المفاتيح بالترتيب؛ عند استهلاك مفتاح ينتقل للتالي، ولا ينزل لموديل أخف إلا بعد استهلاك كل المفاتيح */
+  async function generate(p, ps, key) {
+    if (navigator.onLine === false) throw new Error('لا يوجد اتصال بالإنترنت — أول بحث عن أي دواء يحتاج الإنترنت');
+    await KeyPool.load();
+    if (!KeyPool.count()) throw new Error('لا توجد مفاتيح — أضفها من: الإعدادات ← الماسح الذكي ← مفاتيح الموسوعة الدوائية');
+    const prompt = buildPrompt(p, ps);
+    const errs = [];
+    for (const tier of ['pro', 'flash']) {
+      const tried = new Set();
+      for (let ent = KeyPool.next(tried, tier); ent; ent = KeyPool.next(tried, tier)) {
+        tried.add(ent.id);
+        const models = order(await listModels(ent.key)).filter(n => tier === 'pro' ? /pro/.test(n) : !/pro/.test(n)).slice(0, tier === 'pro' ? 4 : 2);
+        let hits = 0, until = 0, dead = false;
+        for (const model of models) {
+          let quota = false;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            let r = await callModel(model, ent.key, prompt, true);
+            if (!r.ok && r.status === 400 && /tool|search|ground/i.test(r.msg)) r = await callModel(model, ent.key, prompt, false);
+            if (r.ok) {
+              const obj = parseJson(r.text);
+              if (obj && (obj.uses || obj.doses)) {
+                KeyPool.touch(ent.id);
+                return { key, sci: S(p.scientificName), parts: ps, data: obj, sources: r.sources, grounded: r.sources.length > 0, model, createdAt: Date.now(), v: 1 };
+              }
+              errs.push(`${model}: ردّ غير صالح`); break;
+            }
+            if (r.fatal && /api key|leaked|expired|invalid|disabled/i.test(r.msg + ' ' + (r.raw || ''))) { KeyPool.markBad(ent.id, r.msg); dead = true; break; }
+            if (r.status === 429) { quota = true; const u = quotaUntil(r); until = until ? Math.min(until, u) : u; break; }
+            errs.push(`${model} (${r.status || '—'}): ${r.msg || 'خطأ'}`);
+            if ([500, 503].includes(r.status) && attempt === 0) { await sleep(3000); continue; }
+            break;
+          }
+          if (dead) break;
+          if (quota) hits++;
+        }
+        if (!dead && models.length && hits === models.length) KeyPool.exhaust(ent.id, tier, until);
+      }
+    }
+    const soon = KeyPool.soonest('pro');
+    throw new Error((soon ? 'كل المفاتيح مستهلكة حالياً — أقربها يتوفر ' + fmtDate(soon) + ' ' + fmtTime(soon) + '. ' : '') + (errs.join(' ║ ') || 'لا يوجد مفتاح جاهز — راجع المفاتيح'));
+  }
+
+  /* ── الذاكرة: محلية (IndexedDB) ثم سحابية (Firebase) — يُستدعى الذكاء الاصطناعي لأول بحث فقط ── */
+  const cloudReady = () => typeof Sync !== 'undefined' && Sync.ready && Sync.db;
+  async function lookup(key) {
+    try {
+      const loc = await DB.get('meta', 'drug:' + key);
+      if (loc && loc.data) { if (loc.cloud === false) store(loc); return loc; }
+    } catch (_) {}
+    if (cloudReady()) {
+      try {
+        const snap = await Promise.race([Sync.db.ref('pos/drugInfo/' + key).once('value'), new Promise((_, rej) => setTimeout(() => rej(new Error('t')), 7000))]);
+        const v = snap.val();
+        if (v && v.data) {
+          const rec = { ...v, id: 'drug:' + key, cloud: true };
+          try { await DB.put('meta', rec); } catch (_) {}
+          return rec;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+  async function store(rec) {
+    let ok = false;
+    if (cloudReady()) {
+      try {
+        const doc = JSON.parse(JSON.stringify(rec)); delete doc.id; delete doc.cloud;
+        await Promise.race([Sync.db.ref('pos/drugInfo/' + rec.key).set(doc), new Promise((_, rej) => setTimeout(() => rej(new Error('t')), 8000))]);
+        ok = true;
+      } catch (e) { console.warn('drugInfo cloud:', e); }
+    }
+    rec.cloud = ok;
+    try { await DB.put('meta', { ...rec, id: 'drug:' + rec.key }); } catch (_) {}
+  }
+
+  /* ── الأيقونة المجسّمة ── */
+  function capsule() {
+    const n = ++uidN;
+    return `<svg viewBox="0 0 64 64" aria-hidden="true"><defs>
+      <linearGradient id="dc1-${n}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8af0ff"/><stop offset="1" stop-color="#1f7ae0"/></linearGradient>
+      <linearGradient id="dc2-${n}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff8a7a"/><stop offset="1" stop-color="#d4213d"/></linearGradient>
+      <linearGradient id="dc3-${n}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff2a8"/><stop offset="1" stop-color="#f5a60b"/></linearGradient>
+      <linearGradient id="dc4-${n}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".85"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>
+      <ellipse cx="30" cy="57" rx="18" ry="3.2" fill="#0b2f2c" opacity=".22"/>
+      <g transform="rotate(-38 30 31)">
+        <rect x="6" y="20" width="48" height="22" rx="11" fill="url(#dc1-${n})"/>
+        <path d="M30 20h13a11 11 0 0 1 0 22H30z" fill="url(#dc2-${n})"/>
+        <rect x="10" y="23" width="40" height="6" rx="3" fill="url(#dc4-${n})"/>
+        <rect x="6" y="20" width="48" height="22" rx="11" fill="none" stroke="#0b2f2c" stroke-opacity=".18"/>
+      </g>
+      <path d="M50 4l2.4 6.6 6.6 2.4-6.6 2.4L50 22l-2.4-6.6L41 13l6.6-2.4z" fill="url(#dc3-${n})" stroke="#c78400" stroke-width=".6"/>
+    </svg>`;
+  }
+
+  function css() {
+    if (cssDone) return; cssDone = true;
+    const st = document.createElement('style'); st.id = 'di-css';
+    st.textContent = `
+.di-3d{width:46px;height:46px;border:0;border-radius:14px;padding:6px;cursor:pointer;display:grid;place-items:center;background:linear-gradient(145deg,#fff,#d9ebe8);box-shadow:0 5px 0 #aecbc7,0 12px 18px rgba(11,47,44,.28),inset 0 2px 0 #fff;transition:transform .18s ease,box-shadow .18s ease;animation:diFloat 3.2s ease-in-out infinite}
+.di-3d svg{width:100%;height:100%;filter:drop-shadow(0 3px 3px rgba(0,0,0,.25))}
+.di-3d:hover{transform:perspective(320px) rotateX(12deg) rotateY(-14deg) translateY(-3px);box-shadow:0 8px 0 #aecbc7,0 18px 24px rgba(11,47,44,.32),inset 0 2px 0 #fff;animation:none}
+.di-3d:active{transform:translateY(4px);box-shadow:0 1px 0 #aecbc7,0 4px 8px rgba(11,47,44,.25),inset 0 2px 0 #fff}
+.di-3d:focus-visible{outline:3px solid #14b8a6;outline-offset:3px}
+@keyframes diFloat{0%,100%{translate:0 0}50%{translate:0 -3px}}
+@keyframes diBlink{50%{opacity:0}}
+@keyframes diSpin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.di-3d{animation:none}.di-spin{animation:none}}
+.di-box{width:min(1340px,98vw)!important;max-width:none!important;height:93vh!important;max-height:93vh!important;display:flex!important;flex-direction:column}
+.di-box .modal-body{flex:1;min-height:0;padding:0!important;overflow:hidden!important}
+.di-root{height:100%;display:flex;flex-direction:column;background:#eaf3f1;color:#14302d;font-family:inherit;direction:rtl}
+.di-top{flex:none;display:flex;gap:22px;align-items:center;padding:12px 20px;background:linear-gradient(120deg,#0b2f2c,#14544d);color:#effaf7}
+.di-id{display:flex;gap:14px;align-items:center;flex:1.2;min-width:0}
+.di-svg{width:62px;height:62px;flex:none;filter:drop-shadow(0 8px 8px rgba(0,0,0,.35));transform:perspective(300px) rotateY(-14deg) rotateX(6deg)}
+.di-svg svg{width:100%;height:100%}
+.di-lbl{font-size:11.5px;font-weight:800;color:#9fd8cf}
+.di-trade{font-size:21px;font-weight:900;line-height:1.35;direction:ltr;text-align:right}
+.di-trade small{font-size:12px;font-weight:700;color:#9fd8cf;margin-inline-start:8px}
+.di-sci{font-size:14.5px;font-weight:800;direction:ltr;text-align:right;color:#d9fff7}
+.di-sci .di-chip{margin-inline-start:8px;direction:rtl}
+.di-brands{flex:1;min-width:0}
+.di-bl{display:flex;flex-wrap:wrap;gap:6px;margin-top:5px}
+.di-bchip{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.22);border-radius:10px;padding:3px 10px;font-size:12.5px;font-weight:800;direction:ltr}
+.di-bchip small{font-weight:700;color:#9fd8cf;margin-inline-start:6px}
+.di-grid{flex:1;min-height:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:minmax(0,.86fr) minmax(0,1.14fr);gap:11px;padding:11px 14px}
+.di-card{background:#fff;border-radius:16px;border:1px solid #d3e5e2;box-shadow:0 8px 22px rgba(11,47,44,.08);display:flex;flex-direction:column;min-height:0;overflow:hidden}
+.di-card>header{flex:none;display:flex;align-items:center;gap:8px;padding:8px 13px;font-size:14px;color:#fff}
+.di-card>header .ic{width:17px;height:17px}
+.di-card.c1>header{background:linear-gradient(90deg,#0f766e,#14b8a6)}
+.di-card.c2>header{background:linear-gradient(90deg,#1d4ed8,#3b82f6)}
+.di-card.c3>header{background:linear-gradient(90deg,#6d28d9,#8b5cf6)}
+.di-card.c4>header{background:linear-gradient(90deg,#b91c1c,#ef4444)}
+.di-card.c5>header{background:linear-gradient(90deg,#047857,#10b981)}
+.di-card.c6>header{background:linear-gradient(90deg,#b45309,#f59e0b)}
+.di-cb{flex:1;min-height:0;overflow:auto;padding:9px 13px 11px;font-size:12.6px;line-height:1.72;font-weight:600;scrollbar-width:thin}
+.di-p{margin-bottom:5px}
+.di-li{position:relative;padding-inline-start:14px;margin-bottom:2px}
+.di-li:before{content:"";position:absolute;inset-inline-start:2px;top:.72em;width:6px;height:6px;border-radius:50%;background:#14b8a6}
+.di-lab{font-weight:900;font-size:12px;color:#0f766e;margin:6px 0 2px}
+.di-lab.bad{color:#c0392b}
+.di-dose{border:1px solid #dcebe8;border-radius:10px;padding:5px 9px;margin-bottom:6px;background:#f6fbfa}
+.di-dh{font-weight:900;color:#1d4ed8;direction:ltr;text-align:right}
+.di-tip{color:#0f766e}
+.di-srow{display:flex;gap:8px;align-items:flex-start;padding:4px 0;border-bottom:1px dashed #dfebe8}
+.di-srow>b{flex:none;width:74px;font-weight:900}
+.di-srow>span{flex:1;min-width:0}
+.di-chip{display:inline-block;flex:none;padding:0 9px;border-radius:999px;font-size:11.5px;font-weight:900;line-height:1.8}
+.di-chip.ok{background:#d9f7e6;color:#047857}.di-chip.warn{background:#fff0c9;color:#a16207}.di-chip.bad{background:#ffdcdc;color:#b91c1c}.di-chip.na{background:#e6ecec;color:#52615f}
+.di-chip.combo{background:#fff0c9;color:#7a4b00}
+.di-meta{display:inline-block;background:#fdf3dc;color:#7a4b00;border-radius:9px;padding:0 9px;margin:0 0 4px 6px;font-size:11.8px;font-weight:800}
+.di-foot{flex:none;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 16px 9px;font-size:11.5px;font-weight:700;color:#4a6764;border-top:1px solid #d3e5e2;background:#f4faf9}
+.di-src{background:#e3f1ee;border-radius:8px;padding:0 8px;direction:ltr}
+.di-foot .di-chip{font-size:11px}
+.di-regen{margin-inline-start:auto;border:1px solid #b5d3ce;background:#fff;color:#0f766e;font:inherit;font-weight:900;font-size:11.5px;border-radius:9px;padding:3px 11px;cursor:pointer}
+.di-regen:hover{background:#e3f1ee}
+.di-caret{display:inline-block;width:2px;height:1em;background:#14b8a6;margin:0 2px;vertical-align:-2px;animation:diBlink .8s steps(1) infinite}
+.di-load{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:30px}
+.di-spin{width:54px;height:54px;border-radius:50%;border:5px solid #cfe5e1;border-top-color:#14b8a6;animation:diSpin 1s linear infinite}
+.di-lmsg{font-size:16px;font-weight:900;color:#0f766e}
+.di-lsub{font-size:12.5px;font-weight:700;color:#4a6764;max-width:420px;line-height:1.8}
+.di-err{background:#fff;border:1.5px solid #f3b4b4;color:#b91c1c;border-radius:14px;padding:14px 18px;font-weight:800;line-height:1.9;max-width:640px;direction:rtl;word-break:break-word}
+.di-retry{border:0;background:#14b8a6;color:#fff;font:inherit;font-weight:900;border-radius:11px;padding:9px 22px;cursor:pointer}
+@media (max-width:1000px){.di-grid{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(3,minmax(0,1fr));overflow:auto}.di-top{flex-wrap:wrap}}
+`;
+    document.head.append(st);
+  }
+
+  /* ── الكتابة التدريجية: تظهر كل النصوص بالترتيب، والنقر على أي مكان يُظهرها فوراً ── */
+  function typeInto(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = []; let n;
+    while ((n = walker.nextNode())) {
+      if (!n.nodeValue.trim()) continue;
+      if (n.parentNode && n.parentNode.closest && n.parentNode.closest('button')) continue;
+      nodes.push({ n, t: n.nodeValue });
+    }
+    const parents = [...new Set(nodes.map(o => o.n.parentNode))];
+    parents.forEach(x => { x.style.visibility = 'hidden'; });
+    nodes.forEach(o => { o.n.nodeValue = ''; });
+    const total = nodes.reduce((s, o) => s + o.t.length, 0);
+    const perFrame = Math.max(3, Math.ceil(total / 300));
+    const caret = document.createElement('span'); caret.className = 'di-caret';
+    let i = 0, c = 0, raf = 0, done = false;
+    const finish = () => {
+      if (done) return; done = true; cancelAnimationFrame(raf);
+      nodes.forEach(o => { o.n.nodeValue = o.t; });
+      parents.forEach(x => { x.style.visibility = ''; });
+      caret.remove();
+    };
+    const step = () => {
+      if (done) return;
+      let k = perFrame;
+      while (k > 0 && i < nodes.length) {
+        const o = nodes[i];
+        if (o.n.parentNode.style.visibility === 'hidden') o.n.parentNode.style.visibility = '';
+        const take = Math.min(k, o.t.length - c);
+        c += take; k -= take; o.n.nodeValue = o.t.slice(0, c);
+        if (c >= o.t.length) { i++; c = 0; }
+      }
+      if (i >= nodes.length) { finish(); return; }
+      const cur = nodes[i].n;
+      if (cur.parentNode) cur.parentNode.insertBefore(caret, cur.nextSibling);
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return { finish };
+  }
+
+  /* ── التصميم: كل الفقرات في شاشة واحدة ── */
+  function render(p, ps, rec, onAgain) {
+    const d = rec.data || {};
+    const combo = ps.length > 1;
+    const li = t => S(t) ? h('div', { class: 'di-li' }, S(t)) : null;
+    const para = t => S(t) ? h('div', { class: 'di-p' }, S(t)) : null;
+    const group = (label, arr, cls = '') => { const a = A(arr).map(S).filter(Boolean); return a.length ? [h('div', { class: 'di-lab ' + cls }, label), a.map(li)] : []; };
+    const card = (c, title, ic, kids) => h('section', { class: 'di-card ' + c },
+      h('header', {}, h('span', { html: icon(ic) }), h('b', {}, title)),
+      h('div', { class: 'di-cb' }, kids));
+    const chip = s => {
+      const m = { safe: ['آمن', 'ok'], caution: ['بحذر', 'warn'], unsafe: ['ممنوع', 'bad'] }[S(s).toLowerCase()] || ['غير مؤكد', 'na'];
+      return h('span', { class: 'di-chip ' + m[1] }, m[0]);
+    };
+    const obj = x => (x && typeof x === 'object') ? x : {};
+
+    const brands = A(d.brands).map(b => (b && typeof b === 'object') ? { n: S(b.n), c: S(b.c) } : { n: S(b), c: '' }).filter(b => b.n);
+    const top = h('div', { class: 'di-top' },
+      h('div', { class: 'di-id' },
+        h('div', { class: 'di-svg', html: capsule() }),
+        h('div', { style: { minWidth: 0 } },
+          h('div', { class: 'di-lbl' }, 'الاسم التجاري (من النظام)'),
+          h('div', { class: 'di-trade' }, S(p.brandName), p.company ? h('small', {}, S(p.company)) : null),
+          h('div', { class: 'di-lbl', style: { marginTop: '4px' } }, 'الاسم العلمي'),
+          h('div', { class: 'di-sci' }, combo ? ps.join(' + ') : S(p.scientificName), combo ? h('span', { class: 'di-chip combo' }, 'تركيبة دوائية') : null))),
+      h('div', { class: 'di-brands' },
+        h('div', { class: 'di-lbl' }, 'الأسماء الشائعة في العراق (المكتوبة بالوصفات)'),
+        h('div', { class: 'di-bl' }, brands.length
+          ? brands.map(b => h('span', { class: 'di-bchip' }, b.n, b.c ? h('small', {}, b.c) : null))
+          : h('span', { class: 'di-lbl' }, 'لا توجد أسماء مؤكدة'))));
+
+    const uses = obj(d.uses), moa = obj(d.moa), adv = obj(d.adv), safe = obj(d.safe), extra = obj(d.extra);
+    const doses = A(d.doses).map(x => (x && typeof x === 'object') ? x : { f: S(x) });
+    const SAFE_ROWS = [['preg', 'الحامل'], ['lact', 'المرضعة'], ['child', 'الأطفال'], ['htn', 'مريض الضغط'], ['dm', 'مريض السكري'], ['kid', 'مريض الكلى'], ['liv', 'مريض الكبد'], ['heart', 'مريض القلب']];
+
+    const grid = h('div', { class: 'di-grid' },
+      card('c1', 'الاستخدامات', 'check', [para(uses.sum), A(uses.list).map(li)]),
+      card('c2', 'الجرعات وطريقة الإعطاء', 'pill', doses.length ? doses.map(x => h('div', { class: 'di-dose' },
+        h('div', { class: 'di-dh' }, S(x.f) + (S(x.who) ? ' — ' + S(x.who) : '')),
+        S(x.d) ? h('div', {}, 'الجرعة: ' + S(x.d)) : null,
+        S(x.how) ? h('div', {}, 'الإعطاء: ' + S(x.how)) : null,
+        S(x.tip) ? h('div', { class: 'di-tip' }, 'نصيحة: ' + S(x.tip)) : null)) : para('غير مؤكد')),
+      card('c3', 'آلية العمل (Mechanism of Action)', 'refresh', [para(moa.sum), A(moa.steps).map(li)]),
+      card('c4', 'الآثار الجانبية وموانع الصرف', 'warn', [
+        group('آثار شائعة', adv.common),
+        group('آثار خطيرة — تستدعي مراجعة الطبيب', adv.serious, 'bad'),
+        group('ممنوع الصرف / موانع الاستعمال', adv.contra, 'bad')]),
+      card('c5', 'الأمان للحالات الخاصة', 'users', SAFE_ROWS.map(([k, label]) => {
+        const o = obj(safe[k]);
+        const txt = (k === 'child' && S(o.age) ? 'العمر: ' + S(o.age) + (S(o.t) ? ' — ' : '') : '') + S(o.t);
+        return h('div', { class: 'di-srow' }, h('b', {}, label), chip(o.s), h('span', {}, txt));
+      })),
+      card('c6', 'تفاصيل أخرى مهمة', 'star', [
+        S(extra.cls) ? h('span', { class: 'di-meta' }, 'الفئة: ' + S(extra.cls)) : null,
+        S(extra.onset) ? h('span', { class: 'di-meta' }, 'بدء التأثير: ' + S(extra.onset)) : null,
+        S(extra.half) ? h('span', { class: 'di-meta' }, 'عمر النصف: ' + S(extra.half)) : null,
+        group('التداخلات الدوائية المهمة', extra.inter),
+        group('نصائح للمريض', extra.tips),
+        S(extra.store) ? h('div', { class: 'di-lab' }, 'التخزين') : null,
+        S(extra.store) ? para(extra.store) : null]));
+
+    const hostOf = s => { const t = S(s.t); if (t) return t; try { return new URL(s.u).hostname.replace(/^www\./, ''); } catch (_) { return ''; } };
+    const srcs = [...new Set(A(rec.sources).map(hostOf).filter(Boolean))].slice(0, 6);
+    const foot = h('div', { class: 'di-foot' },
+      rec.grounded ? h('span', { class: 'di-chip ok' }, 'موثّق ببحث ويب') : h('span', { class: 'di-chip warn' }, 'بلا مصادر ويب — راجع النشرة الدوائية'),
+      srcs.length ? h('span', {}, 'المصادر:') : null,
+      srcs.map(s => h('span', { class: 'di-src' }, s)),
+      h('span', {}, 'حُفظ: ' + fmtDate(rec.createdAt)),
+      h('button', { class: 'di-regen', onclick: onAgain }, 'تحديث بالذكاء الاصطناعي'),
+      h('button', { class: 'di-regen', style: { marginInlineStart: '0' }, onclick: () => KeyPool.openManager() }, 'المفاتيح'));
+
+    return [top, grid, foot];
+  }
+
+  /* ── الفتح ── */
+  async function open(p) {
+    const sci = S(p.scientificName);
+    if (!sci) return toast('أدخل الاسم العلمي للصنف أولاً من «تعديل الصنف»', 'r');
+    const ps = splitParts(sci), key = keyOf(ps);
+    if (!key) return toast('الاسم العلمي غير صالح للبحث', 'r');
+    css();
+    let alive = true, typer = null, tm = 0;
+    const root = h('div', { class: 'di-root' });
+    const m = openModal({ title: 'الموسوعة الدوائية الذكية', icon: 'pill', body: root, noPad: true,
+      onClose: () => { alive = false; clearInterval(tm); if (typer) typer.finish(); } });
+    m.box.classList.add('di-box');
+    root.addEventListener('click', () => { if (typer) typer.finish(); });
+
+    const loading = (msg, sub) => {
+      clearInterval(tm);
+      root.innerHTML = '';
+      root.append(h('div', { class: 'di-load' }, h('div', { class: 'di-spin' }), h('div', { class: 'di-lmsg', id: 'di-lmsg' }, msg), h('div', { class: 'di-lsub' }, sub || '')));
+    };
+    const show = rec => {
+      if (!alive) return;
+      clearInterval(tm);
+      root.innerHTML = '';
+      root.append(...render(p, ps, rec, again));
+      typer = typeInto(root);
+    };
+    const fail = e => {
+      if (!alive) return;
+      clearInterval(tm);
+      root.innerHTML = '';
+      root.append(h('div', { class: 'di-load' },
+        h('div', { class: 'di-err' }, (e && e.message) || 'تعذّر جلب المعلومات'),
+        h('button', { class: 'di-retry', onclick: () => run(false) }, 'إعادة المحاولة'),
+        h('button', { class: 'di-regen', style: { margin: '0' }, onclick: () => KeyPool.openManager() }, 'إدارة المفاتيح')));
+    };
+    const run = async force => {
+      if (!alive) return;
+      loading('جارٍ تحضير المعلومات…');
+      try {
+        let rec = force ? null : await lookup(key);
+        if (!rec) {
+          loading('جارٍ البحث في المصادر الطبية الموثوقة…', 'أول بحث عن هذا الدواء يستغرق من 20 إلى 90 ثانية، وبعدها يُخزَّن ويظهر فوراً لكل الأجهزة.');
+          const steps = ['جارٍ البحث في المصادر الطبية الموثوقة…', 'جارٍ مطابقة المعلومات مع النشرات الدوائية الرسمية…', 'جارٍ التحقق من الجرعات والأمان…', 'جارٍ ترتيب المعلومات…'];
+          let si = 0;
+          tm = setInterval(() => { const el = root.querySelector('#di-lmsg'); si = (si + 1) % steps.length; if (el) el.textContent = steps[si]; }, 7000);
+          if (inflight.has(key)) rec = await inflight.get(key);
+          else {
+            const pr = generate(p, ps, key);
+            inflight.set(key, pr);
+            try { rec = await pr; } finally { inflight.delete(key); }
+            await store(rec);
+          }
+        }
+        show(rec);
+      } catch (e) { fail(e); }
+    };
+    const again = async () => {
+      if (!(await confirmBox('سيُستهلك من الحصة اليومية للمفتاح ويستبدل المعلومات المخزنة لهذا الدواء في كل الأجهزة. متابعة؟', { okLabel: 'تحديث' }))) return;
+      run(true);
+    };
+    run(false);
+  }
+
+  function button(p) {
+    css();
+    return h('button', { class: 'di-3d', title: 'معلومات الدواء الذكية', 'aria-label': 'معلومات الدواء الذكية', html: capsule(), onclick: () => open(p) });
+  }
+
+  return { button, open };
+})();
+
 /* ───────────────────────── 21) تفاصيل الصنف + حركة المادة ───────────────────────── */
 function renderProductDetails(tab) {
   const p = findProd(tab.props.productId);
@@ -2787,6 +3407,7 @@ function renderProductDetails(tab) {
   page.append(h('div', { class: 'page-head' },
     h('div', { class: 'page-title' }, h('span', { html: icon('pill') }), p.brandName , coTag(p)),
     p.featured ? h('span', { class: 'badge g' }, 'مميز') : null,
+    DrugInfo.button(p),
     h('div', { class: 'spacer' }),
     h('button', { class: 'btn b', onclick: () => openTab('product', { productId: p.id }) }, h('span', { html: icon('edit') }), 'تعديل الصنف')));
   page.append(h('div', { class: 'stat-cards' },
@@ -3322,7 +3943,9 @@ function renderSettings(tab) {
             h('div', {}, '4) انسخ المفتاح (يبدأ بـ AIza…) والصقه في الخانة أعلاه ثم اضغط «حفظ المفتاح».'),
             h('div', {}, '5) اضغط «اختبار المفتاح» للتأكد — ثم افتح الماسح من الزر أسفل.'),
             h('div', { style: { marginTop: '8px', color: 'var(--muted)' } }, 'المفتاح مجاني وثابت بلا انتهاء صلاحية، والحد المجاني يكفي فواتير الصيدلية اليومية بمرات. لا تشاركه مع أحد.')))),
-      h('div', { class: 'f-field full' }, h('button', { class: 'btn b', onclick: () => openTab('scanner') }, h('span', { html: icon('camera') }), 'فتح الماسح الذكي'))));
+      h('div', { class: 'f-field full', style: { display: 'flex', gap: '10px', flexWrap: 'wrap' } },
+        h('button', { class: 'btn b', onclick: () => openTab('scanner') }, h('span', { html: icon('camera') }), 'فتح الماسح الذكي'),
+        h('button', { class: 'btn g', onclick: () => KeyPool.openManager() }, h('span', { html: icon('lock') }), 'مفاتيح الموسوعة الدوائية'))));
   }
   else if (st.section === 'studio') { renderDesignStudio(box); }
   else if (st.section === 'backup') {
