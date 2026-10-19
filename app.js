@@ -255,7 +255,9 @@ const findProd = id => state.products.find(p => p.id === id && !p.deleted);
 function productActions(p, tab, extra = []) {
   const inCart = tab && (tab.type === 'pos' || tab.type === 'purchase');
   const canDelete = tab && tab.type === 'inventory';
+  const dz = (tab && tab.type === 'pos' && typeof DoseCalc !== 'undefined') ? DoseCalc.button(p) : null;
   return h('div', { class: 'row-act' },
+    dz,
     h('button', { class: 'icon-btn view', title: 'تفاصيل وحركة المادة', html: icon('eye'),
       onclick: () => openTab('details', { productId: p.id }) }),
     h('button', { class: 'icon-btn edit', title: 'تعديل المنتج', html: icon('edit'),
@@ -2786,8 +2788,8 @@ const KeyPool = (() => {
   const persistLocal = () => DB.put('meta', { id: 'aikeys', list: JSON.parse(JSON.stringify(list)) }).catch(() => {});
   const norm = k => ({
     id: S(k.id), key: S(k.key), label: S(k.label), addedAt: +k.addedAt || 0, disabled: !!k.disabled, bad: S(k.bad), used: +k.used || 0,
-    ex: { pro: +(k.ex && k.ex.pro) || 0, flash: +(k.ex && k.ex.flash) || 0 },
-    exAt: { pro: +(k.exAt && k.exAt.pro) || 0, flash: +(k.exAt && k.exAt.flash) || 0 },
+    ex: Object.fromEntries(Object.entries(k.ex || {}).map(([a, b]) => [a, +b || 0])),
+    exAt: Object.fromEntries(Object.entries(k.exAt || {}).map(([a, b]) => [a, +b || 0])),
   });
   const pushCloud = k => {
     if (!cloudReady()) return;
@@ -2825,11 +2827,11 @@ const KeyPool = (() => {
   }
 
   /* الأولوية: مفتاح استُهلك سابقاً وعاد متاحاً (الأقدم استهلاكاً أولاً)، ثم المفاتيح التي لم تُستهلك بترتيب إضافتها */
-  function next(tried, tier) {
+  function next(tried, tier, can) {
     const now = Date.now();
-    const av = list.filter(k => !k.disabled && !k.bad && !tried.has(k.id) && k.ex[tier] <= now);
-    const back = av.filter(k => k.exAt[tier] > 0).sort((a, b) => a.exAt[tier] - b.exAt[tier]);
-    const fresh = av.filter(k => !(k.exAt[tier] > 0)).sort((a, b) => a.addedAt - b.addedAt);
+    const av = list.filter(k => !k.disabled && !k.bad && !tried.has(k.id) && (k.ex[tier] || 0) <= now && (!can || can(k)));
+    const back = av.filter(k => (k.exAt[tier] || 0) > 0).sort((a, b) => a.exAt[tier] - b.exAt[tier]);
+    const fresh = av.filter(k => !((k.exAt[tier] || 0) > 0)).sort((a, b) => a.addedAt - b.addedAt);
     return back[0] || fresh[0] || null;
   }
   const mark = (id, fn) => { const k = list.find(x => x.id === id); if (!k) return; fn(k); persistLocal(); pushCloud(k); notify(); };
@@ -2930,8 +2932,833 @@ const KeyPool = (() => {
     draw();
   }
 
-  return { load, next, exhaust, markBad, touch, soonest, openManager, count: () => list.length };
+  /* ═════ تفضيلات مشتركة بين الأجهزة + اكتشاف النماذج + ترتيب الأذكى ═════ */
+  const arr = x => Array.isArray(x) ? x : (x && typeof x === 'object' ? Object.values(x) : []);
+  const mkey = n => String(n).replace(/[.#$\/\[\]]/g, '_');
+  const unkey = s => String(s).replace(/_/g, '.');
+  let prefs = { mode: 'auto', list: [], verify: true };
+  let prefsP = null, prefsPoll = false, prefsListening = false;
+  const normPrefs = p => ({ mode: p && p.mode === 'manual' ? 'manual' : 'auto', list: arr(p && p.list).map(S).filter(Boolean), verify: !(p && p.verify === false) });
+  function loadPrefs() {
+    if (!prefsP) prefsP = (async () => {
+      try { const m = await DB.get('meta', 'aiprefs'); if (m && m.p) prefs = normPrefs(m.p); } catch (_) {}
+      notify();
+    })();
+    if (!prefsListening && !prefsPoll) {
+      prefsPoll = true;
+      const t = setInterval(() => {
+        if (!cloudReady()) return;
+        clearInterval(t); prefsPoll = false; prefsListening = true;
+        Sync.db.ref('pos/aiPrefs').on('value', s => {
+          const v = s.val();
+          if (v) { prefs = normPrefs(v); DB.put('meta', { id: 'aiprefs', p: prefs }).catch(() => {}); notify(); }
+        }, e => console.warn('aiPrefs:', e));
+      }, 1500);
+    }
+    return prefsP;
+  }
+  const loadAll = async () => { await load(); await loadPrefs(); };
+  function setPrefs(patch) {
+    prefs = normPrefs({ ...prefs, ...patch });
+    DB.put('meta', { id: 'aiprefs', p: prefs }).catch(() => {});
+    if (cloudReady()) { try { Sync.db.ref('pos/aiPrefs').set(JSON.parse(JSON.stringify(prefs))).catch(() => {}); } catch (_) {} }
+    notify();
+  }
+
+  const mCache2 = new Map();
+  const mErr = new Map();
+  async function models(apiKey, force) {
+    const c = mCache2.get(apiKey);
+    if (!force && c && Date.now() - c.ts < 600000) return c.list;
+    try {
+      const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=' + encodeURIComponent(apiKey));
+      if (!r.ok) {
+        let msg = '';
+        try { const e = await r.json(); msg = S(e && e.error && e.error.message).slice(0, 120); } catch (_) {}
+        mErr.set(apiKey, `HTTP ${r.status}${msg ? ': ' + msg : ''}`);
+        return null;
+      }
+      const d = await r.json();
+      const names = (d.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => String(m.name || '').replace(/^models\//, ''));
+      mCache2.set(apiKey, { list: names, ts: Date.now() });
+      mErr.delete(apiKey);
+      return names;
+    } catch (e) {
+      mErr.set(apiKey, 'تعذّر الاتصال بخوادم Google: ' + ((e && e.message) || ''));
+      return null;
+    }
+  }
+  const canUse = (k, model) => { const c = mCache2.get(k.key); return !c || !c.list || c.list.includes(model); };
+  const BAD = /(tts|image|live|audio|robotics|computer|embedding|learnlm|vision|gemma|nano|lite|customtools|exp|thinking|aqa)/;
+  const ver = n => { const m = /gemini-(\d+(?:\.\d+)?)/.exec(n); return m ? parseFloat(m[1]) : 0; };
+  const isPro = n => /pro/.test(n);
+  const cmp = (a, b) => (isPro(b) - isPro(a)) || (ver(b) - ver(a)) || (/preview/.test(a) - /preview/.test(b)) || a.localeCompare(b);
+  const rank = names => [...new Set(names)].filter(n => /^gemini-/.test(n) && !BAD.test(n)).sort(cmp);
+  const allCached = () => [...new Set([].concat(...list.map(k => (mCache2.get(k.key) || {}).list || [])))];
+  const pickList = () => allCached().filter(n => /^gemini-/.test(n) && !/(tts|image|live|audio|embedding|robotics|computer)/.test(n)).sort(cmp);
+
+  /* ترتيب النماذج: تلقائي = الأذكى (Pro الأحدث) أولاً ثم Flash احتياطاً، أو يدوي بترتيبك */
+  async function plan() {
+    await loadPrefs();
+    const keys = list.filter(k => !k.disabled && !k.bad);
+    const lists = await Promise.all(keys.map(k => models(k.key)));
+    const all = [].concat(...lists.filter(Boolean));
+    let order = [];
+    if (prefs.mode === 'manual' && prefs.list.length) order = all.length ? prefs.list.filter(n => all.includes(n)) : prefs.list.slice();
+    if (!order.length) {
+      const r = rank(all);
+      order = [...r.filter(isPro).slice(0, 4), ...r.filter(n => !isPro(n)).slice(0, 2)];
+    }
+    if (!order.length) order = ['gemini-2.5-pro', 'gemini-pro-latest', 'gemini-2.5-flash', 'gemini-flash-latest'];
+    return order;
+  }
+  const soonestAny = () => {
+    const now = Date.now(); let m = 0;
+    list.forEach(k => { if (k.disabled || k.bad) return; Object.values(k.ex).forEach(u => { if (u > now && (!m || u < m)) m = u; }); });
+    return m;
+  };
+
+  let css2Done = false;
+  function css2() {
+    if (css2Done) return; css2Done = true;
+    const st = document.createElement('style'); st.id = 'kp-css2';
+    st.textContent = `
+.kp-card{border:1px solid var(--line);border-radius:16px;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.kp-h{font-weight:900;font-size:15px}
+.kp-seg{display:flex;gap:8px;flex-wrap:wrap}
+.kp-seg button{border:1.5px solid var(--line);background:transparent;color:inherit;font:inherit;font-weight:800;border-radius:12px;padding:8px 16px;cursor:pointer}
+.kp-seg button.on{background:#14b8a6;border-color:#14b8a6;color:#fff}
+.kp-chk{display:flex;align-items:center;gap:8px;font-weight:800;cursor:pointer;line-height:1.8}
+.kp-ord{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.kp-m{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:12px;padding:5px 10px;font-weight:800;direction:ltr}
+.kp-m b{color:#14b8a6}
+.kp-m button{border:0;background:transparent;color:inherit;cursor:pointer;font-weight:900;padding:0 4px}
+.kp-sel{border:1.5px solid var(--line);border-radius:10px;padding:7px 10px;font:inherit;font-weight:700;background:transparent;color:inherit;direction:ltr}
+`;
+    document.head.append(st);
+  }
+
+  function renderPanel(box) {
+    css(); css2();
+    let seen = false, order = [], busy = false;
+    const wrap = h('div', { class: 'kp-wrap', style: { maxWidth: '920px' } });
+    box.append(wrap);
+    const ta = h('textarea', { class: 'kp-ta', rows: 3, dir: 'ltr', placeholder: 'AIza…  الصق مفتاحاً أو عدة مفاتيح (كل مفتاح في سطر)' });
+    const lbl = h('input', { class: 'kp-in', placeholder: 'اسم اختياري (يُستعمل عند إضافة مفتاح واحد)' });
+    const scanBtn = h('button', { class: 'btn b', onclick: () => scan() }, 'فحص النماذج المتاحة لكل المفاتيح');
+    const sum = h('div', { class: 'kp-info' });
+    const stratBox = h('div', { class: 'kp-card' });
+    const rowsBox = h('div', { class: 'kp-list', style: { maxHeight: 'none' } });
+    const addBtn = h('button', { class: 'btn g', onclick: async () => {
+      if (!ta.value.trim()) return toast('الصق المفتاح أولاً', 'r');
+      const r = await addMany(ta.value, lbl.value);
+      if (!r.added && !r.dup) return toast('لم يُقبل أي مفتاح — تأكد من نسخه كاملاً', 'r');
+      ta.value = ''; lbl.value = '';
+      toast(`أُضيف ${r.added} مفتاح` + (r.dup ? ` — ${r.dup} مكرر` : '') + (r.bad ? ` — ${r.bad} غير صالح` : ''), r.added ? 'g' : 'r');
+      scan();
+    } }, h('span', { html: icon('plus') }), 'إضافة وحفظ في السحابة');
+    wrap.append(
+      h('div', { class: 'kp-card' }, h('div', { class: 'kp-h' }, 'إضافة مفاتيح Gemini (30 مفتاحاً وأكثر)'), ta, lbl,
+        h('div', { style: { display: 'flex', gap: '10px', flexWrap: 'wrap' } }, addBtn, scanBtn), sum),
+      stratBox,
+      h('div', { class: 'kp-card' }, h('div', { class: 'kp-h' }, 'المفاتيح المحفوظة'), rowsBox));
+
+    const drawStrat = () => {
+      stratBox.innerHTML = '';
+      const chk = h('input', { type: 'checkbox', onchange: e => setPrefs({ verify: e.target.checked }) });
+      chk.checked = prefs.verify;
+      const modeBtn = (m, t) => h('button', { class: prefs.mode === m ? 'on' : '', onclick: () => {
+        if (m === 'manual' && !prefs.list.length) setPrefs({ mode: 'manual', list: order.slice() }); else setPrefs({ mode: m });
+      } }, t);
+      const orderBox = h('div', { class: 'kp-ord' });
+      if (prefs.mode === 'auto' || !prefs.list.length) {
+        order.forEach((m, i) => orderBox.append(h('span', { class: 'kp-m' }, h('b', {}, String(i + 1)), m)));
+      } else {
+        const L = prefs.list;
+        L.forEach((m, i) => orderBox.append(h('span', { class: 'kp-m' }, h('b', {}, String(i + 1)), m,
+          h('button', { title: 'أعلى', onclick: () => { if (i) { const c = L.slice(); [c[i - 1], c[i]] = [c[i], c[i - 1]]; setPrefs({ list: c }); } } }, '▲'),
+          h('button', { title: 'أسفل', onclick: () => { if (i < L.length - 1) { const c = L.slice(); [c[i + 1], c[i]] = [c[i], c[i + 1]]; setPrefs({ list: c }); } } }, '▼'),
+          h('button', { title: 'حذف', onclick: () => setPrefs({ list: L.filter((_, j) => j !== i) }) }, '✕'))));
+        const rest = pickList().filter(n => !L.includes(n));
+        if (rest.length) {
+          const sel = h('select', { class: 'kp-sel' }, h('option', { value: '' }, '+ إضافة نموذج…'), rest.map(n => h('option', { value: n }, n)));
+          sel.onchange = () => { if (sel.value) setPrefs({ list: [...L, sel.value] }); };
+          orderBox.append(sel);
+        }
+      }
+      stratBox.append(
+        h('div', { class: 'kp-h' }, 'استراتيجية اختيار النموذج'),
+        h('div', { class: 'kp-seg' }, modeBtn('auto', 'تلقائي — الأذكى أولاً'), modeBtn('manual', 'يدوي — أرتّب بنفسي')),
+        h('label', { class: 'kp-chk' }, chk, 'تدقيق مزدوج: كل نتيجة تُراجع مرة ثانية ببحث طبي مستقل قبل حفظها (يستهلك ضعف الحصة لكنه أدق)'),
+        h('div', { class: 'kp-info' }, prefs.mode === 'auto' || !prefs.list.length
+          ? 'يجرّب النظام أقوى نموذج متاح (Pro) عبر كل المفاتيح بالترتيب، ولا ينزل لنموذج أخف إلا إذا استُهلك الأقوى في كل المفاتيح. ترتيب الاستخدام الحالي:'
+          : 'يجرّب النظام النماذج بالترتيب الذي تحدده، ولكل نموذج يدور على كل المفاتيح:'),
+        orderBox);
+    };
+
+    const drawRows = () => {
+      rowsBox.innerHTML = '';
+      const now = Date.now(), top = order[0] ? mkey(order[0]) : '';
+      const cur = top ? next(new Set(), top, k => canUse(k, order[0])) : null;
+      const rows = [...list].sort((a, b) => a.addedAt - b.addedAt);
+      const ready = rows.filter(k => !k.disabled && !k.bad && (!top || (k.ex[top] || 0) <= now)).length;
+      sum.textContent = `${rows.length} مفتاح — جاهز للنموذج الأذكى (${order[0] || '—'}): ${ready}. كلها محفوظة في السحابة ومشتركة بين كل الأجهزة، وعند استهلاك مفتاح أثناء البحث يكمل التالي فوراً، وأي مفتاح يعود متاحاً تكون له الأولوية.`;
+      if (!rows.length) { rowsBox.append(h('div', { class: 'empty-note' }, 'لا توجد مفاتيح بعد — الصق مفاتيحك بالأعلى')); return; }
+      rows.forEach((k, i) => {
+        const ml = (mCache2.get(k.key) || {}).list;
+        const best = ml ? (rank(ml)[0] || '—') : '';
+        let stc;
+        if (k.bad) stc = h('span', { class: 'kp-chip bad' }, 'مرفوض: ' + k.bad);
+        else if (k.disabled) stc = h('span', { class: 'kp-chip na' }, 'معطّل');
+        else if (top && (k.ex[top] || 0) > now) stc = h('span', { class: 'kp-chip warn' }, `الأذكى مستهلك حتى ${fmtDate(k.ex[top])} ${fmtTime(k.ex[top])}`);
+        else stc = h('span', { class: 'kp-chip ok' }, (top && (k.exAt[top] || 0) > 0) ? 'عاد متاحاً — له الأولوية' : 'جاهز');
+        const others = Object.entries(k.ex).filter(([m, u]) => u > now && m !== top).map(([m, u]) => h('span', { class: 'kp-chip warn' }, `${unkey(m)} حتى ${fmtTime(u)}`));
+        rowsBox.append(h('div', { class: 'kp-row' + (cur && cur.id === k.id ? ' cur' : '') },
+          h('span', { class: 'kp-name' }, k.label || `مفتاح ${i + 1}`),
+          h('span', { class: 'kp-mask' }, k.key.slice(0, 6) + '…' + k.key.slice(-4)),
+          stc,
+          cur && cur.id === k.id ? h('span', { class: 'kp-chip cur' }, 'يُستخدم الآن') : null,
+          ml ? h('span', { class: 'kp-chip na' }, `${ml.length} نموذج — الأفضل: ${best}`) : h('span', { class: 'kp-chip na' }, 'لم يُفحص'),
+          others,
+          h('span', { class: 'kp-chip na' }, `استُخدم ${k.used} مرة`),
+          h('span', { class: 'kp-sp' }),
+          h('button', { class: 'mini-btn blue', onclick: async () => {
+            const l = await models(k.key, true);
+            toast(l ? `${l.length} نموذج متاح — الأفضل: ${rank(l)[0] || '—'}` : 'فشل الفحص — ' + (mErr.get(k.key) || 'سبب غير معروف'), l ? 'g' : 'r');
+            refresh();
+          } }, 'فحص'),
+          (k.bad || Object.values(k.ex).some(u => u > now)) ? h('button', { class: 'mini-btn blue', onclick: () => resetState(k.id) }, 'تصفير الحالة') : null,
+          h('button', { class: 'mini-btn blue', onclick: () => toggle(k.id) }, k.disabled ? 'تفعيل' : 'تعطيل'),
+          h('button', { class: 'mini-btn red', onclick: async () => {
+            if (await confirmBox('حذف هذا المفتاح نهائياً من كل الأجهزة؟', { danger: true, okLabel: 'حذف' })) { await remove(k.id); toast('حُذف المفتاح', 'b'); }
+          } }, 'حذف')));
+      });
+    };
+
+    const refresh = async () => {
+      if (!seen && box.isConnected) seen = true;
+      if (seen && !box.isConnected) { subs.delete(refresh); return; }
+      order = await plan();
+      drawStrat(); drawRows();
+    };
+    const scan = async () => {
+      if (busy) return;
+      busy = true; scanBtn.disabled = true; scanBtn.textContent = 'جارٍ الفحص…';
+      try { await Promise.all(list.filter(k => !k.disabled).map(k => models(k.key, true))); } catch (_) {}
+      busy = false; scanBtn.disabled = false; scanBtn.textContent = 'فحص النماذج المتاحة لكل المفاتيح';
+      refresh();
+    };
+    subs.add(refresh);
+    loadAll().then(() => scan());
+    refresh();
+  }
+
+  function openManagerNew() {
+    const body = h('div', {});
+    renderPanel(body);
+    openModal({ title: 'مفاتيح الذكاء الاصطناعي', icon: 'lock', body, wide: true });
+  }
+
+  return { load: loadAll, next, exhaust, markBad, touch, soonest, soonestAny, openManager: openManagerNew, renderPanel, plan, models, canUse, mk: mkey, getPrefs: () => prefs, count: () => list.length };
 })();
+
+/* ───────────────────────── 20-ب2) مركز الذكاء الاصطناعي: مفاتيح متعددة المزوّدين + ترتيب الأذكى + تدوير تلقائي ───────────────────────── */
+const AIHub = (() => {
+  const S = x => String(x == null ? '' : x).trim();
+  const arr = x => Array.isArray(x) ? x : (x && typeof x === 'object' ? Object.values(x) : []);
+  const cloudReady = () => typeof Sync !== 'undefined' && Sync.ready && Sync.db;
+  const mkey = n => String(n).replace(/[.#$\/\[\]]/g, '_');
+  const unkey = s => String(s).replace(/_/g, '.');
+  const subs = new Set();
+  const notify = () => subs.forEach(f => { try { f(); } catch (_) {} });
+
+  function nextPTMidnight() {
+    const now = Date.now();
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(new Date(now));
+    const g = t => +parts.find(x => x.type === t).value;
+    return now + (86400 - ((g('hour') % 24) * 3600 + g('minute') * 60 + g('second'))) * 1000 + 1000;
+  }
+  const nextUTCMidnight = () => { const d = new Date(); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) + 1000; };
+
+  async function http(url, init, ms) {
+    const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), ms || 180000);
+    try {
+      const res = await fetch(url, { ...init, signal: ctl.signal });
+      let data = null, txt = '';
+      try { txt = await res.text(); data = JSON.parse(txt); } catch (_) {}
+      return { res, data, txt };
+    } finally { clearTimeout(to); }
+  }
+
+  /* تصنيف الأخطاء: مفتاح مرفوض / مفتاح مستهلك (حتى متى) / خطأ مؤقت / أداة بحث غير مدعومة */
+  function fail(pid, res, data, txt) {
+    const status = res.status, raw = String(txt || '').slice(0, 3000);
+    const em = data && (data.error ? (data.error.message || (typeof data.error === 'string' ? data.error : '')) : (data.message || data.detail || ''));
+    const msg = S(typeof em === 'string' ? em : '').slice(0, 160) || S(raw).slice(0, 160);
+    const low = (msg + ' ' + raw).toLowerCase();
+    const o = { ok: false, status, msg, retry: false };
+    if (status === 401 || (status === 403 && /api key|permission|authentic|leaked|invalid|forbidden|unauthor/.test(low)) || (status === 400 && /(api[ _-]?key|x-api-key)/.test(low) && /(invalid|not valid|incorrect)/.test(low))) { o.keyBad = true; return o; }
+    if (status === 402 || /insufficient[_ ]quota|credit balance|insufficient balance|out of credits/.test(low)) { o.until = Date.now() + 6 * 3600 * 1000; return o; }
+    if (status === 404 && /model|not found|no longer|does not exist/i.test(low)) { o.noModel = true; o.msg = 'هذا النموذج لم يعد متاحاً — تخطّاه'; return o; }
+    if (status === 429 && /limit:\s*0\b/.test(low)) { o.noModel = true; o.msg = 'هذا النموذج غير مشمول بالحصة المجانية لهذا المفتاح (الحد 0)'; return o; }
+    if (status === 429) {
+      if (/perday|per day|daily|requests per day|tokens per day|rpd/.test(low)) o.until = pid === 'gemini' ? nextPTMidnight() : nextUTCMidnight();
+      else {
+        const ra = parseFloat(res.headers && res.headers.get && res.headers.get('retry-after'));
+        const m = /"retrydelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(low);
+        o.until = Date.now() + ((isFinite(ra) ? Math.ceil(ra) : m ? Math.ceil(parseFloat(m[1])) + 2 : 65) * 1000);
+      }
+      return o;
+    }
+    if (status === 400 && /tool|search|ground|plugin|web_search/.test(low)) o.toolRejected = true;
+    if ([500, 502, 503, 504, 529].includes(status)) o.retry = true;
+    return o;
+  }
+  const listErr = (pid, res, data, txt) => { const f = fail(pid, res, data, txt); return new Error(`HTTP ${res.status}${f.msg ? ': ' + f.msg : ''}`); };
+
+  /* ── المزوّدون ── */
+  const GB = 'https://generativelanguage.googleapis.com/v1beta';
+  const aHdr = key => ({ 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' });
+  const listOA = (pid, base) => async key => {
+    const { res, data, txt } = await http(base + '/models', { headers: { Authorization: 'Bearer ' + key } }, 30000);
+    if (!res.ok) throw listErr(pid, res, data, txt);
+    return arr(data && data.data).map(m => S(m.id)).filter(Boolean);
+  };
+  const chat = (pid, base, o = {}) => async (key, model, prompt, lite) => {
+    const run = async search => {
+      const body = { model, messages: [{ role: 'user', content: lite ? 'ping' : prompt }], max_tokens: lite ? 5 : (o.max || 8000) };
+      if (search && !lite && o.search) Object.assign(body, o.search);
+      const { res, data, txt } = await http(base + '/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key }, body: JSON.stringify(body) }, lite ? 30000 : 180000);
+      if (!res.ok) return fail(pid, res, data, txt);
+      const msg = data && data.choices && data.choices[0] && data.choices[0].message;
+      const text = S(msg && (typeof msg.content === 'string' ? msg.content : arr(msg.content).map(x => x.text || '').join('')));
+      if (!text) return { ok: false, status: 0, msg: 'ردّ فارغ', retry: false };
+      const sources = [];
+      arr(data.citations).forEach(u => { if (typeof u === 'string') sources.push({ t: '', u }); });
+      arr(data.search_results).forEach(s => { if (s && s.url) sources.push({ t: S(s.title), u: S(s.url) }); });
+      arr(msg && msg.annotations).forEach(a => { const c = a && (a.url_citation || a); if (c && c.url) sources.push({ t: S(c.title), u: S(c.url) }); });
+      return { ok: true, text, sources };
+    };
+    let r = await run(true);
+    if (!r.ok && r.toolRejected) r = await run(false);
+    return r;
+  };
+  const vOf = (n, re) => { const m = re.exec(n); return m ? parseFloat(m[1]) : 0; };
+
+  const P = {
+    gemini: {
+      label: 'Google Gemini', short: 'Gemini', grounded: true, top: 4, detect: /^AIza/,
+      fallback: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+      list: async key => {
+        const { res, data, txt } = await http(GB + '/models?pageSize=1000&key=' + encodeURIComponent(key), {}, 30000);
+        if (!res.ok) throw listErr('gemini', res, data, txt);
+        return arr(data && data.models).filter(m => arr(m.supportedGenerationMethods).includes('generateContent')).map(m => String(m.name || '').replace(/^models\//, ''));
+      },
+      score: n => {
+        if (!/^gemini-/.test(n) || /(tts|image|live|audio|robotics|computer|embedding|learnlm|vision|gemma|nano|lite|customtools|exp|thinking|aqa|deep-research)/.test(n)) return -1;
+        return (/pro/.test(n) ? 80 : 55) + vOf(n, /gemini-(\d+(?:\.\d+)?)/) * 3 - (/preview/.test(n) ? 1 : 0);
+      },
+      call: async (key, model, prompt) => {
+        const run = async grounded => {
+          const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 32000 } };
+          if (grounded) body.tools = [{ google_search: {} }];
+          const { res, data, txt } = await http(`${GB}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          if (!res.ok) return fail('gemini', res, data, txt);
+          const c0 = data && data.candidates && data.candidates[0];
+          const text = arr(c0 && c0.content && c0.content.parts).map(x => x.text || '').join('');
+          if (!text.trim()) return { ok: false, status: 0, msg: (c0 && c0.finishReason) || 'ردّ فارغ', retry: false };
+          const gm = (c0 && c0.groundingMetadata) || {};
+          const sources = arr(gm.groundingChunks).map(g => g && g.web ? { t: S(g.web.title), u: S(g.web.uri) } : null).filter(Boolean);
+          return { ok: true, text, sources };
+        };
+        let r = await run(true);
+        if (!r.ok && (r.toolRejected || r.status === 429 || r.status === 403)) r = await run(false);
+        return r;
+      },
+    },
+    anthropic: {
+      label: 'Anthropic Claude', short: 'Claude', grounded: true, top: 2, detect: /^sk-ant-/,
+      fallback: ['claude-opus-5-5', 'claude-sonnet-5-5'],
+      list: async key => {
+        const { res, data, txt } = await http('https://api.anthropic.com/v1/models?limit=100', { headers: aHdr(key) }, 30000);
+        if (!res.ok) throw listErr('anthropic', res, data, txt);
+        return arr(data && data.data).map(m => S(m.id)).filter(Boolean);
+      },
+      score: n => {
+        const f = /(mythos|fable|opus|sonnet|haiku)/.exec(n);
+        if (!/^claude-/.test(n) || !f) return -1;
+        const m = /claude-(?:(?:opus|sonnet|haiku|fable|mythos)-)?(\d+)(?:-(\d{1,2})(?=-|$))?/.exec(n);
+        const v = m ? (+m[1] + (m[2] ? +m[2] / 10 : 0)) : 0;
+        return { mythos: 99, fable: 96, opus: 94, sonnet: 84, haiku: 56 }[f[1]] + v * 2;
+      },
+      call: async (key, model, prompt) => {
+        const run = async tools => {
+          const body = { model, max_tokens: 16000, messages: [{ role: 'user', content: prompt }] };
+          if (tools) body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: 6 }];
+          const { res, data, txt } = await http('https://api.anthropic.com/v1/messages', { method: 'POST', headers: aHdr(key), body: JSON.stringify(body) });
+          if (!res.ok) return fail('anthropic', res, data, txt);
+          const blocks = arr(data && data.content);
+          const text = blocks.filter(b => b.type === 'text').map(b => b.text || '').join('');
+          if (!text.trim()) return { ok: false, status: 0, msg: S(data && data.stop_reason) || 'ردّ فارغ', retry: false };
+          const sources = [];
+          blocks.forEach(b => { if (b.type === 'web_search_tool_result') arr(b.content).forEach(x => { if (x && x.url) sources.push({ t: S(x.title), u: S(x.url) }); }); });
+          return { ok: true, text, sources };
+        };
+        let r = await run(true);
+        if (!r.ok && (r.toolRejected || r.status === 429 || r.status === 402)) r = await run(false);
+        return r;
+      },
+    },
+    openai: {
+      label: 'OpenAI ChatGPT', short: 'ChatGPT', grounded: true, top: 2, detect: /^sk-(?!ant-|or-)[A-Za-z0-9_\-]{30,}$/,
+      fallback: ['gpt-5', 'gpt-4.1'],
+      list: listOA('openai', 'https://api.openai.com/v1'),
+      score: n => {
+        if (!/^(gpt-|o\d|chatgpt)/.test(n) || /(audio|realtime|tts|transcribe|image|embedding|moderation|instruct|search|vision|codex|dall|whisper|chat-latest|-16k|gpt-3|davinci|babbage)/.test(n)) return -1;
+        let s;
+        const g = /^gpt-(\d+(?:\.\d+)?)/.exec(n), o = /^o(\d)/.exec(n);
+        if (g) { const v = parseFloat(g[1]); s = v >= 5 ? 88 + (v - 5) * 3 : v >= 4 ? 62 + (v - 4) * 10 : 40; }
+        else if (o) s = 74 + (+o[1]) * 2;
+        else s = 50;
+        if (/pro/.test(n)) s += 6;
+        if (/mini/.test(n)) s -= 22;
+        if (/nano/.test(n)) s -= 35;
+        return s;
+      },
+      call: async (key, model, prompt) => {
+        const run = async tool => {
+          const body = { model, input: prompt, max_output_tokens: 16000 };
+          if (tool) body.tools = [{ type: tool }];
+          const { res, data, txt } = await http('https://api.openai.com/v1/responses', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key }, body: JSON.stringify(body) });
+          if (!res.ok) return fail('openai', res, data, txt);
+          let text = ''; const sources = [];
+          arr(data && data.output).forEach(o => { if (o.type === 'message') arr(o.content).forEach(c => { if (c.type === 'output_text') { text += c.text || ''; arr(c.annotations).forEach(a => { if (a && a.type === 'url_citation' && a.url) sources.push({ t: S(a.title), u: S(a.url) }); }); } }); });
+          if (!text.trim()) return { ok: false, status: 0, msg: S(data && data.incomplete_details && data.incomplete_details.reason) || 'ردّ فارغ', retry: false };
+          return { ok: true, text, sources };
+        };
+        let r = await run
+      },
+    },
+    perplexity: {
+      label: 'Perplexity (بحث ويب مدمج)', short: 'Perplexity', grounded: true, top: 2, detect: /^pplx-/,
+      static: ['sonar-reasoning-pro', 'sonar-pro', 'sonar'], fallback: ['sonar-reasoning-pro', 'sonar-pro'],
+      score: n => ({ 'sonar-reasoning-pro': 84, 'sonar-pro': 80, 'sonar': 58 }[n] || -1),
+      call: chat('perplexity', 'https://api.perplexity.ai', { max: 8000 }),
+    },
+    xai: {
+      label: 'xAI Grok', short: 'Grok', grounded: false, top: 2, detect: /^xai-/,
+      fallback: ['grok-4'], list: listOA('xai', 'https://api.x.ai/v1'),
+      score: n => (!/^grok-/.test(n) || /(image|vision|imagine|video)/.test(n)) ? -1 : 70 + vOf(n, /grok-(\d+(?:\.\d+)?)/) * 4 - (/mini/.test(n) ? 15 : 0),
+      call: chat('xai', 'https://api.x.ai/v1', { max: 12000 }),
+    },
+    deepseek: {
+      label: 'DeepSeek', short: 'DeepSeek', grounded: false, top: 2, detect: /^sk-[0-9a-f]{32}$/,
+      static: ['deepseek-reasoner', 'deepseek-chat'], fallback: ['deepseek-reasoner', 'deepseek-chat'],
+      score: n => ({ 'deepseek-reasoner': 66, 'deepseek-chat': 58 }[n] || -1),
+      call: chat('deepseek', 'https://api.deepseek.com', { max: 8000 }),
+    },
+    mistral: {
+      label: 'Mistral', short: 'Mistral', grounded: false, top: 1, detect: null,
+      fallback: ['mistral-large-latest'], list: listOA('mistral', 'https://api.mistral.ai/v1'),
+      score: n => /mistral-large/.test(n) ? 68 : /mistral-medium/.test(n) ? 58 : -1,
+      call: chat('mistral', 'https://api.mistral.ai/v1', { max: 8000 }),
+    },
+    groq: {
+      label: 'Groq', short: 'Groq', grounded: false, top: 1, detect: /^gsk_/,
+      fallback: ['openai/gpt-oss-120b'], list: listOA('groq', 'https://api.groq.com/openai/v1'),
+      score: n => /gpt-oss-120b/.test(n) ? 62 : /llama-3\.3-70b/.test(n) ? 56 : -1,
+      call: chat('groq', 'https://api.groq.com/openai/v1', { max: 8000 }),
+    },
+    openrouter: {
+      label: 'OpenRouter', short: 'OpenRouter', grounded: true, top: 2, detect: /^sk-or-/,
+      fallback: [], list: listOA('openrouter', 'https://openrouter.ai/api/v1'),
+      score: n => {
+        if (/:/.test(n)) return -1;
+        if (/anthropic\/claude-(opus|fable)/.test(n)) return 92;
+        if (/x-ai\/grok-4/.test(n)) return 84;
+        if (/openai\/gpt-5(?!.*(mini|nano|chat|image|codex))/.test(n)) return 86;
+        if (/google\/gemini-.*pro/.test(n) && !/image|preview-tts/.test(n)) return 82;
+        if (/anthropic\/claude-sonnet/.test(n)) return 80;
+        return -1;
+      },
+      call: chat('openrouter', 'https://openrouter.ai/api/v1', { max: 12000, search: { plugins: [{ id: 'web' }] } }),
+    },
+  };
+  const DETECT = ['gemini', 'anthropic', 'openrouter', 'groq', 'perplexity', 'xai', 'deepseek', 'openai'];
+  function detect(key) { for (const id of DETECT) { const p = P[id]; if (p.detect && p.detect.test(key)) return id; } return ''; }
+
+  /* ── مخزن المفاتيح (محلي + سحابي مشترك بين الأجهزة) ── */
+  let list = [], loaded = null, polling = false, listening = false;
+  const persistLocal = () => DB.put('meta', { id: 'aikeys', list: JSON.parse(JSON.stringify(list)) }).catch(() => {});
+  const norm = k => ({
+    id: S(k.id), key: S(k.key), provider: S(k.provider) || detect(S(k.key)) || 'gemini', label: S(k.label),
+    addedAt: +k.addedAt || 0, disabled: !!k.disabled, bad: S(k.bad), used: +k.used || 0,
+    ex: Object.fromEntries(Object.entries(k.ex || {}).map(([a, b]) => [a, +b || 0])),
+    exAt: Object.fromEntries(Object.entries(k.exAt || {}).map(([a, b]) => [a, +b || 0])),
+  });
+  const pushCloud = k => {
+    if (!cloudReady()) return;
+    try { Sync.db.ref('pos/aiKeys/' + k.id).set(JSON.parse(JSON.stringify(k))).catch(e => console.warn('aiKeys cloud:', e)); } catch (_) {}
+  };
+  const upsert = k => {
+    const n = norm(k || {});
+    if (!n.id || !n.key) return;
+    const i = list.findIndex(x => x.id === n.id);
+    if (i >= 0) list[i] = n; else list.push(n);
+  };
+  function listen() {
+    if (listening || polling) return;
+    polling = true;
+    const t = setInterval(() => {
+      if (!cloudReady()) return;
+      clearInterval(t); polling = false; listening = true;
+      const ref = Sync.db.ref('pos/aiKeys');
+      const apply = snap => { const v = snap.val(); if (v && v.id) { upsert(v); persistLocal(); notify(); } };
+      ref.on('child_added', apply, e => console.warn('aiKeys:', e));
+      ref.on('child_changed', apply, e => console.warn('aiKeys:', e));
+      ref.on('child_removed', snap => { const id = snap.key; list = list.filter(x => x.id !== id); persistLocal(); notify(); }, e => console.warn('aiKeys:', e));
+      ref.once('value').then(s => { const c = s.val() || {}; list.forEach(k => { if (!c[k.id]) pushCloud(k); }); }).catch(() => {});
+    }, 1500);
+  }
+  function load() {
+    if (!loaded) loaded = (async () => {
+      try { const m = await DB.get('meta', 'aikeys'); if (m && Array.isArray(m.list)) m.list.forEach(upsert); } catch (_) {}
+      notify();
+    })();
+    listen();
+    return loaded;
+  }
+
+  /* ── التفضيلات المشتركة ── */
+  let prefs = { mode: 'auto', list: [], verify: true }, prefsP = null, prefsPoll = false, prefsListening = false;
+  const normPrefs = p => ({
+    mode: p && p.mode === 'manual' ? 'manual' : 'auto',
+    list: arr(p && p.list).map(S).filter(Boolean).map(n => n.includes(':') ? n : 'gemini:' + n),
+    verify: !(p && p.verify === false),
+  });
+  function loadPrefs() {
+    if (!prefsP) prefsP = (async () => {
+      try { const m = await DB.get('meta', 'aiprefs'); if (m && m.p) prefs = normPrefs(m.p); } catch (_) {}
+      notify();
+    })();
+    if (!prefsListening && !prefsPoll) {
+      prefsPoll = true;
+      const t = setInterval(() => {
+        if (!cloudReady()) return;
+        clearInterval(t); prefsPoll = false; prefsListening = true;
+        Sync.db.ref('pos/aiPrefs').on('value', s => {
+          const v = s.val();
+          if (v) { prefs = normPrefs(v); DB.put('meta', { id: 'aiprefs', p: prefs }).catch(() => {}); notify(); }
+        }, e => console.warn('aiPrefs:', e));
+      }, 1500);
+    }
+    return prefsP;
+  }
+  const loadAll = async () => { await load(); await loadPrefs(); };
+  function setPrefs(patch) {
+    prefs = normPrefs({ ...prefs, ...patch });
+    DB.put('meta', { id: 'aiprefs', p: prefs }).catch(() => {});
+    if (cloudReady()) { try { Sync.db.ref('pos/aiPrefs').set(JSON.parse(JSON.stringify(prefs))).catch(() => {}); } catch (_) {} }
+    notify();
+  }
+
+  /* ── حالة المفاتيح والاستهلاك لكل نموذج ── */
+  function next(tried, modelId, can) {
+    const t = mkey(modelId), now = Date.now();
+    const av = list.filter(k => !k.disabled && !k.bad && !tried.has(k.id) && (k.ex[t] || 0) <= now && (!can || can(k)));
+    const back = av.filter(k => (k.exAt[t] || 0) > 0).sort((a, b) => a.exAt[t] - b.exAt[t]);
+    const fresh = av.filter(k => !((k.exAt[t] || 0) > 0)).sort((a, b) => a.addedAt - b.addedAt);
+    return back[0] || fresh[0] || null;
+  }
+  const mark = (id, fn) => { const k = list.find(x => x.id === id); if (!k) return; fn(k); persistLocal(); pushCloud(k); notify(); };
+  const exhaust = (id, modelId, until) => mark(id, k => { const t = mkey(modelId); k.ex[t] = until; k.exAt[t] = Date.now(); });
+  const markBad = (id, why) => mark(id, k => { k.bad = S(why).slice(0, 80) || 'مرفوض'; });
+  const touch = id => mark(id, k => { k.used = (k.used || 0) + 1; });
+  const resetState = id => mark(id, k => { k.bad = ''; k.ex = {}; });
+  const toggle = id => mark(id, k => { k.disabled = !k.disabled; if (!k.disabled) k.bad = ''; });
+  const soonest = modelId => {
+    const t = mkey(modelId), now = Date.now();
+    const a = list.filter(k => !k.disabled && !k.bad && (k.ex[t] || 0) > now).map(k => k.ex[t]);
+    return a.length ? Math.min(...a) : 0;
+  };
+  const soonestAny = () => {
+    const now = Date.now(); let m = 0;
+    list.forEach(k => { if (k.disabled || k.bad) return; Object.values(k.ex).forEach(u => { if (u > now && (!m || u < m)) m = u; }); });
+    return m;
+  };
+  async function remove(id) {
+    list = list.filter(x => x.id !== id);
+    persistLocal(); notify();
+    if (cloudReady()) { try { await Sync.db.ref('pos/aiKeys/' + id).remove(); } catch (e) { console.warn('aiKeys remove:', e); } }
+  }
+  async function addMany(text, provider, label) {
+    await load();
+    const toks = String(text || '').replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '').split(/[\s,;]+/).map(x => x.replace(/^["'`]+|["'`]+$/g, '').trim()).filter(Boolean);
+    const r = { added: 0, dup: 0, bad: 0, unknown: 0 };
+    for (const key of toks) {
+      if (!/^[\x21-\x7E]{12,}$/.test(key)) { r.bad++; continue; }
+      if (list.some(x => x.key === key)) { r.dup++; continue; }
+      const pid = provider || detect(key);
+      if (!pid) { r.unknown++; continue; }
+      const k = norm({ id: uid(), key, provider: pid, label: toks.length === 1 ? label : '', addedAt: Date.now() + r.added });
+      list.push(k); pushCloud(k); r.added++;
+    }
+    persistLocal(); notify();
+    return r;
+  }
+
+  /* ── اكتشاف النماذج + الترتيب: الأذكى أولاً مع أفضلية للنماذج التي تبحث في الويب ── */
+  const mCache = new Map(), mErr = new Map();
+  async function call(k, m, prompt, lite) {
+    const p = P[m.provider];
+    try { return await p.call(k.key, m.model, prompt, lite); }
+    catch (e) { return { ok: false, status: 0, retry: false, msg: e && e.name === 'AbortError' ? 'انتهت المهلة' : 'تعذّر الاتصال بـ ' + p.label }; }
+  }
+  async function models(k, force) {
+    const c = mCache.get(k.key);
+    if (!force && c && Date.now() - c.ts < 600000) return c.list;
+    const p = P[k.provider];
+    if (!p) return null;
+    try {
+      let names;
+      if (p.static) {
+        const mm = p.static[p.static.length - 1];
+        const r = await call(k, { provider: k.provider, model: mm }, 'ping', true);
+        if (!r.ok && !r.until) throw new Error(r.keyBad ? 'المفتاح مرفوض: ' + r.msg : `HTTP ${r.status || ''} ${r.msg || ''}`.trim());
+        names = p.static.slice();
+      } else names = await p.list(k.key);
+      mCache.set(k.key, { list: names, ts: Date.now() });
+      mErr.delete(k.key);
+      return names;
+    } catch (e) {
+      const m = (e && e.message) || '';
+      mErr.set(k.key, e && e.name === 'AbortError' ? 'انتهت المهلة' : (/Failed to fetch|NetworkError|Load failed/i.test(m) ? `تعذّر الاتصال بـ ${p.label} (الإنترنت أو منع المتصفح لهذا المزوّد)` : m || 'خطأ'));
+      return null;
+    }
+  }
+  const mkM = (pid, model, score) => ({ id: pid + ':' + model, provider: pid, model, score: score || 0, grounded: !!P[pid].grounded, label: P[pid].short + ' · ' + model });
+  const parseId = id => { const i = id.indexOf(':'); return i < 0 ? null : { provider: id.slice(0, i), model: id.slice(i + 1) }; };
+  const bannedPairs = new Set();
+  const isBanned = x => bannedPairs.has(x);
+  const banPair = (kid, mid) => bannedPairs.add(kid + '|' + mid);
+  const canUse = (k, m) => { if (k.provider !== m.provider || isBanned(k.id + '|' + m.id)) return false; const c = mCache.get(k.key); return !c || !c.list || !c.list.length || c.list.includes(m.model); };
+
+  async function plan() {
+    await loadPrefs();
+    const keys = list.filter(k => !k.disabled && !k.bad);
+    const sets = {};
+    await Promise.all(keys.map(async k => { const l = await models(k); sets[k.provider] = sets[k.provider] || new Set(); (l || []).forEach(n => sets[k.provider].add(n)); }));
+    const cand = [];
+    Object.keys(sets).forEach(pid => {
+      const p = P[pid]; if (!p) return;
+      let names = [...sets[pid]];
+      if (!names.length) names = p.fallback.slice();
+      const scored = names.map(n => ({ n, s: p.score(n) })).filter(x => x.s > 0).sort((a, b) => (b.s - a.s) || (a.n.length - b.n.length) || b.n.localeCompare(a.n));
+      const seen = new Set();
+      const dedup = [];
+      for (const x of scored) {
+        const base = x.n.replace(/-\d{8}$|-\d{4}-\d{2}-\d{2}$|-latest$/, '');
+        if (seen.has(base)) continue;
+        seen.add(base); dedup.push(x);
+      }
+      /* مزيج إلزامي: الأذكى أولاً ثم نموذجان اقتصاديان احتياطاً — حتى تعمل الموسوعة حتى لو كانت النماذج الذكية بلا حصة مجانية */
+      const isLite = n => /(flash|lite|mini|haiku|small|instant|sonar$|8b)/i.test(n);
+      dedup.filter(x => !isLite(x.n)).slice(0, Math.max(1, p.top - 2)).forEach(x => cand.push(mkM(pid, x.n, x.s + (p.grounded ? 30 : 0))));
+      dedup.filter(x => isLite(x.n)).slice(0, 3).forEach(x => cand.push(mkM(pid, x.n, x.s + (p.grounded ? 30 : 0))));
+    });
+    cand.sort((a, b) => b.score - a.score);
+    let order = cand;
+    if (prefs.mode === 'manual' && prefs.list.length) {
+      order = prefs.list.map(parseId).filter(x => x && P[x.provider] && sets[x.provider] && (!sets[x.provider].size || sets[x.provider].has(x.model))).map(x => mkM(x.provider, x.model, 0));
+    }
+    return order;
+  }
+  function pickList() {
+    const out = [];
+    Object.keys(P).forEach(pid => {
+      const names = new Set();
+      list.forEach(k => { if (k.provider === pid) ((mCache.get(k.key) || {}).list || []).forEach(n => names.add(n)); });
+      [...names].map(n => ({ n, s: P[pid].score(n) })).filter(x => x.s > 0).sort((a, b) => b.s - a.s).forEach(x => out.push(pid + ':' + x.n));
+    });
+    return out;
+  }
+  const labelOf = id => { const x = parseId(id); return x && P[x.provider] ? P[x.provider].short + ' · ' + x.model : id; };
+  const bestOf = k => {
+    const l = (mCache.get(k.key) || {}).list, p = P[k.provider];
+    if (!l || !p) return '';
+    const s = l.map(n => ({ n, s: p.score(n) })).filter(x => x.s > 0).sort((a, b) => (b.s - a.s) || (a.n.length - b.n.length));
+    return s[0] ? s[0].n : '—';
+  };
+
+  /* ── واجهة التبويب ── */
+  let cssDone = false;
+  function css() {
+    if (cssDone) return; cssDone = true;
+    const st = document.createElement('style'); st.id = 'ah-css';
+    st.textContent = `
+.kp-wrap{display:flex;flex-direction:column;gap:12px}
+.kp-ta,.kp-in{width:100%;border:1.5px solid var(--line);border-radius:12px;padding:10px 13px;font-weight:700;outline:none;font-family:inherit}
+.kp-ta{direction:ltr;resize:vertical}
+.kp-list{display:flex;flex-direction:column;gap:8px}
+.kp-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;border:1px solid var(--line);border-radius:14px;padding:9px 12px}
+.kp-row.cur{border-color:#14b8a6;box-shadow:0 0 0 3px rgba(20,184,166,.16)}
+.kp-name{font-weight:900}
+.kp-mask{direction:ltr;font-family:monospace;color:var(--muted);font-weight:700}
+.kp-chip{display:inline-block;padding:0 10px;border-radius:999px;font-size:12px;font-weight:900;line-height:1.9}
+.kp-chip.ok{background:#d9f7e6;color:#047857}.kp-chip.warn{background:#fff0c9;color:#a16207}.kp-chip.bad{background:#ffdcdc;color:#b91c1c}.kp-chip.na{background:#e6ecec;color:#52615f}.kp-chip.cur{background:#14b8a6;color:#fff}.kp-chip.prov{background:#e3e9ff;color:#3730a3}
+.kp-sp{flex:1}
+.kp-info{font-weight:800;font-size:13px;color:var(--muted);line-height:1.9}
+.kp-card{border:1px solid var(--line);border-radius:16px;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.kp-h{font-weight:900;font-size:15px}
+.kp-seg{display:flex;gap:8px;flex-wrap:wrap}
+.kp-seg button{border:1.5px solid var(--line);background:transparent;color:inherit;font:inherit;font-weight:800;border-radius:12px;padding:8px 16px;cursor:pointer}
+.kp-seg button.on{background:#14b8a6;border-color:#14b8a6;color:#fff}
+.kp-chk{display:flex;align-items:center;gap:8px;font-weight:800;cursor:pointer;line-height:1.8}
+.kp-ord{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.kp-m{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:12px;padding:5px 10px;font-weight:800;direction:ltr}
+.kp-m b{color:#14b8a6}
+.kp-m button{border:0;background:transparent;color:inherit;cursor:pointer;font-weight:900;padding:0 4px}
+.kp-sel{border:1.5px solid var(--line);border-radius:10px;padding:8px 10px;font:inherit;font-weight:700;background:transparent;color:inherit}
+`;
+    document.head.append(st);
+  }
+
+  function renderPanel(box) {
+    css();
+    let seen = false, order = [], busy = false;
+    const wrap = h('div', { class: 'kp-wrap', style: { maxWidth: '940px' } });
+    box.append(wrap);
+    const ta = h('textarea', { class: 'kp-ta', rows: 3, dir: 'ltr', placeholder: 'الصق مفتاحاً أو عدة مفاتيح — كل مفتاح في سطر' });
+    const sel = h('select', { class: 'kp-sel' }, h('option', { value: '' }, 'نوع المفتاح: تلقائي (اكتشاف من شكل المفتاح)'), Object.keys(P).map(id => h('option', { value: id }, P[id].label)));
+    const lbl = h('input', { class: 'kp-in', placeholder: 'اسم اختياري (يُستعمل عند إضافة مفتاح واحد)' });
+    const scanBtn = h('button', { class: 'btn b', onclick: () => scan() }, 'فحص كل المفاتيح والنماذج');
+    const sum = h('div', { class: 'kp-info' });
+    const stratBox = h('div', { class: 'kp-card' });
+    const rowsBox = h('div', { class: 'kp-list' });
+    const addBtn = h('button', { class: 'btn g', onclick: async () => {
+      if (!ta.value.trim()) return toast('الصق المفتاح أولاً', 'r');
+      const r = await addMany(ta.value, sel.value, lbl.value);
+      const parts = [];
+      if (r.added) parts.push(`أُضيف ${r.added}`);
+      if (r.dup) parts.push(`${r.dup} مكرر`);
+      if (r.unknown) parts.push(`${r.unknown} لم يُعرف نوعه — اختر نوع المفتاح من القائمة`);
+      if (r.bad) parts.push(`${r.bad} غير صالح (حروف إنجليزية وأرقام فقط وبلا مسافات)`);
+      toast(parts.join(' — ') || 'لم يُضَف شيء', r.added ? 'g' : 'r');
+      if (r.added) { ta.value = ''; lbl.value = ''; scan(); }
+    } }, h('span', { html: icon('plus') }), 'إضافة وحفظ في السحابة');
+    wrap.append(
+      h('div', { class: 'kp-card' }, h('div', { class: 'kp-h' }, 'إضافة مفاتيح ذكاء اصطناعي (أي عدد، ومن أي مزوّد)'), ta, sel, lbl,
+        h('div', { style: { display: 'flex', gap: '10px', flexWrap: 'wrap' } }, addBtn, scanBtn),
+        h('div', { class: 'kp-info' }, 'مفاتيح Gemini مجانية. مفاتيح Claude وChatGPT وPerplexity وGrok مدفوعة من رصيدك. النظام يرتّب كل النماذج المتاحة من كل المزوّدين ويبدأ بالأذكى والأقدر على البحث في الويب.'),
+        sum),
+      stratBox,
+      h('div', { class: 'kp-card' }, h('div', { class: 'kp-h' }, 'المفاتيح المحفوظة'), rowsBox));
+
+    const drawStrat = () => {
+      stratBox.innerHTML = '';
+      const chk = h('input', { type: 'checkbox', onchange: e => setPrefs({ verify: e.target.checked }) });
+      chk.checked = prefs.verify;
+      const modeBtn = (m, t) => h('button', { class: prefs.mode === m ? 'on' : '', onclick: () => {
+        if (m === 'manual' && !prefs.list.length) setPrefs({ mode: 'manual', list: order.map(x => x.id) }); else setPrefs({ mode: m });
+      } }, t);
+      const auto = prefs.mode === 'auto' || !prefs.list.length;
+      const orderBox = h('div', { class: 'kp-ord' });
+      if (auto) {
+        order.forEach((m, i) => orderBox.append(h('span', { class: 'kp-m' }, h('b', {}, String(i + 1)), m.label, m.grounded ? h('span', { class: 'kp-chip ok' }, 'بحث ويب') : null)));
+        if (!order.length) orderBox.append(h('span', { class: 'kp-info' }, 'لا توجد نماذج بعد — أضف مفتاحاً'));
+      } else {
+        const L = prefs.list;
+        L.forEach((id, i) => orderBox.append(h('span', { class: 'kp-m' }, h('b', {}, String(i + 1)), labelOf(id),
+          h('button', { title: 'أعلى', onclick: () => { if (i) { const c = L.slice(); [c[i - 1], c[i]] = [c[i], c[i - 1]]; setPrefs({ list: c }); } } }, '▲'),
+          h('button', { title: 'أسفل', onclick: () => { if (i < L.length - 1) { const c = L.slice(); [c[i + 1], c[i]] = [c[i], c[i + 1]]; setPrefs({ list: c }); } } }, '▼'),
+          h('button', { title: 'حذف', onclick: () => setPrefs({ list: L.filter((_, j) => j !== i) }) }, '✕'))));
+        const rest = pickList().filter(id => !L.includes(id));
+        if (rest.length) {
+          const s2 = h('select', { class: 'kp-sel' }, h('option', { value: '' }, '+ إضافة نموذج…'), rest.map(id => h('option', { value: id }, labelOf(id))));
+          s2.onchange = () => { if (s2.value) setPrefs({ list: [...L, s2.value] }); };
+          orderBox.append(s2);
+        }
+      }
+      stratBox.append(
+        h('div', { class: 'kp-h' }, 'استراتيجية اختيار النموذج'),
+        h('div', { class: 'kp-seg' }, modeBtn('auto', 'تلقائي — الأذكى أولاً'), modeBtn('manual', 'يدوي — أرتّب بنفسي')),
+        h('label', { class: 'kp-chk' }, chk, 'تدقيق مزدوج: كل نتيجة تُراجع مرة ثانية بنموذج من مزوّد مختلف (إن وُجد) ببحث مستقل قبل حفظها — يستهلك ضعف الحصة لكنه أدق'),
+        h('div', { class: 'kp-info' }, auto
+          ? 'يجرّب النظام النماذج بالترتيب: يبدأ بالأذكى، وعند استهلاك مفتاح يكمل بالتالي في نفس البحث، ولا ينزل لنموذج أضعف إلا بعد استهلاك الأقوى في كل المفاتيح. الترتيب الحالي:'
+          : 'يجرّب النظام النماذج بالترتيب الذي تحدده، ولكل نموذج يدور على كل مفاتيحه:'),
+        orderBox);
+    };
+
+    const drawRows = () => {
+      rowsBox.innerHTML = '';
+      const now = Date.now(), top = order[0];
+      const cur = top ? next(new Set(), top.id, k => canUse(k, top)) : null;
+      const rows = [...list].sort((a, b) => a.addedAt - b.addedAt);
+      const ready = rows.filter(k => !k.disabled && !k.bad).length;
+      sum.textContent = `${rows.length} مفتاح (${ready} فعّال). كلها محفوظة في السحابة ومشتركة بين كل الأجهزة، وأي مفتاح يعود متاحاً بعد استهلاكه تكون له الأولوية.`;
+      if (!rows.length) { rowsBox.append(h('div', { class: 'empty-note' }, 'لا توجد مفاتيح بعد — الصق مفاتيحك بالأعلى')); return; }
+      rows.forEach((k, i) => {
+        const ml = (mCache.get(k.key) || {}).list;
+        const kTop = order.find(m => m.provider === k.provider);
+        let stc;
+        if (k.bad) stc = h('span', { class: 'kp-chip bad' }, 'مرفوض: ' + k.bad);
+        else if (k.disabled) stc = h('span', { class: 'kp-chip na' }, 'معطّل');
+        else if (kTop && (k.ex[mkey(kTop.id)] || 0) > now) { const u = k.ex[mkey(kTop.id)]; stc = h('span', { class: 'kp-chip warn' }, `الأذكى مستهلك حتى ${fmtDate(u)} ${fmtTime(u)}`); }
+        else if (!ml && mErr.get(k.key)) stc = h('span', { class: 'kp-chip bad' }, 'فشل الفحص: ' + mErr.get(k.key));
+        else stc = h('span', { class: 'kp-chip ok' }, (kTop && (k.exAt[mkey(kTop.id)] || 0) > 0) ? 'عاد متاحاً — له الأولوية' : 'جاهز');
+        const others = Object.entries(k.ex).filter(([m, u]) => u > now && !(kTop && m === mkey(kTop.id))).map(([m, u]) => h('span', { class: 'kp-chip warn' }, `${unkey(m)} حتى ${fmtTime(u)}`));
+        rowsBox.append(h('div', { class: 'kp-row' + (cur && cur.id === k.id ? ' cur' : '') },
+          h('span', { class: 'kp-chip prov' }, P[k.provider] ? P[k.provider].short : k.provider),
+          h('span', { class: 'kp-name' }, k.label || `مفتاح ${i + 1}`),
+          h('span', { class: 'kp-mask' }, k.key.slice(0, 6) + '…' + k.key.slice(-4)),
+          stc,
+          cur && cur.id === k.id ? h('span', { class: 'kp-chip cur' }, 'يُستخدم الآن') : null,
+          ml ? h('span', { class: 'kp-chip na' }, `${ml.length} نموذج — الأفضل: ${bestOf(k)}`) : null,
+          others,
+          h('span', { class: 'kp-chip na' }, `استُخدم ${k.used} مرة`),
+          h('span', { class: 'kp-sp' }),
+          h('button', { class: 'mini-btn blue', onclick: async () => {
+            const l = await models(k, true);
+            toast(l ? `${l.length} نموذج متاح — الأفضل: ${bestOf(k)}` : 'فشل الفحص — ' + (mErr.get(k.key) || 'سبب غير معروف'), l ? 'g' : 'r');
+            refresh();
+          } }, 'فحص'),
+          (k.bad || Object.values(k.ex).some(u => u > now)) ? h('button', { class: 'mini-btn blue', onclick: () => resetState(k.id) }, 'تصفير الحالة') : null,
+          h('button', { class: 'mini-btn blue', onclick: () => toggle(k.id) }, k.disabled ? 'تفعيل' : 'تعطيل'),
+          h('button', { class: 'mini-btn red', onclick: async () => {
+            if (await confirmBox('حذف هذا المفتاح نهائياً من كل الأجهزة؟', { danger: true, okLabel: 'حذف' })) { await remove(k.id); toast('حُذف المفتاح', 'b'); }
+          } }, 'حذف')));
+      });
+    };
+
+    const refresh = async () => {
+      if (!seen && box.isConnected) seen = true;
+      if (seen && !box.isConnected) { subs.delete(refresh); return; }
+      order = await plan();
+      drawStrat(); drawRows();
+    };
+    const scan = async () => {
+      if (busy) return;
+      busy = true; scanBtn.disabled = true; scanBtn.textContent = 'جارٍ الفحص…';
+      try { await Promise.all(list.filter(k => !k.disabled).map(k => models(k, true))); } catch (_) {}
+      busy = false; scanBtn.disabled = false; scanBtn.textContent = 'فحص كل المفاتيح والنماذج';
+      refresh();
+    };
+    subs.add(refresh);
+    loadAll().then(() => scan());
+    refresh();
+  }
+
+  function openManager() {
+    const body = h('div', {});
+    renderPanel(body);
+    openModal({ title: 'مفاتيح الذكاء الاصطناعي', icon: 'lock', body, wide: true });
+  }
+
+  return { load: loadAll, plan, next, call, touch, markBad, exhaust, soonest, soonestAny, openManager, renderPanel, banPair, canUse, getPrefs: () => prefs, count: () => list.length };
+})();
+/* تحويل كل الأزرار القديمة لمركز الذكاء الاصطناعي الجديد */
+KeyPool.openManager = () => AIHub.openManager();
+KeyPool.renderPanel = box => AIHub.renderPanel(box);
 
 /* ───────────────────────── 20-أ) الموسوعة الدوائية الذكية: Gemini + بحث ويب موثّق + ذاكرة محلية وسحابية ───────────────────────── */
 const DrugInfo = (() => {
@@ -3007,8 +3834,8 @@ Return ONLY one JSON object, starting with { and ending with }, in exactly this 
     try {
       const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 32000 } };
       if (grounded) body.tools = [{ google_search: {} }];
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body), signal: ctl.signal,
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal,
       });
       if (!res.ok) {
         const e = await res.json().catch(() => ({}));
@@ -3084,6 +3911,138 @@ Return ONLY one JSON object, starting with { and ending with }, in exactly this 
     }
     const soon = KeyPool.soonest('pro');
     throw new Error((soon ? 'كل المفاتيح مستهلكة حالياً — أقربها يتوفر ' + fmtDate(soon) + ' ' + fmtTime(soon) + '. ' : '') + (errs.join(' ║ ') || 'لا يوجد مفتاح جاهز — راجع المفاتيح'));
+  }
+
+  function buildAudit(p, ps, obj) {
+    const clean = v => S(v).replace(/["\r\n]+/g, ' ');
+    return `You are an independent senior clinical pharmacist auditing a drug monograph written by a colleague. Re-verify EVERY statement with Google Search against authoritative sources only (FDA/DailyMed labels, EMA SmPC, MHRA/BNF, WHO, NHS, MedlinePlus, Mayo Clinic, Drugs.com professional monographs, LactMed, NICE). Correct every error, remove anything you cannot verify (write "غير مؤكد" instead), and fix any wrong or unsafe dose, contraindication, pregnancy, lactation, pediatric age limit or chronic-disease statement. Keep the SAME JSON shape, the same Arabic language, and the same length limits (every string at most 200 characters, every array at most 6 items). No markdown, links or citations inside strings. Return ONLY the corrected JSON object.
+Drug: "${clean(p.scientificName)}"${ps.length > 1 ? ' (fixed-dose combination of ' + ps.join(' + ') + ')' : ''}
+Draft JSON:
+${JSON.stringify(obj)}`;
+  }
+
+  /* يجرّب النماذج بالترتيب (الأذكى أولاً)، ولكل نموذج يدور على المفاتيح؛ عند استهلاك مفتاح أثناء البحث يكمل التالي فوراً */
+  async function ask(prompt, validate, say) {
+    const order = await KeyPool.plan();
+    const errs = [], waited = {};
+    for (const model of order) {
+      const mk = KeyPool.mk(model);
+      let again = true;
+      while (again) {
+        again = false;
+        const tried = new Set();
+        const can = k => KeyPool.canUse(k, model);
+        for (let ent = KeyPool.next(tried, mk, can); ent; ent = KeyPool.next(tried, mk, can)) {
+          tried.add(ent.id);
+          if (say) say('جارٍ البحث بالنموذج ' + model + '…');
+          for (let attempt = 0; attempt < 2; attempt++) {
+            let r = await callModel(model, ent.key, prompt, true);
+            if (!r.ok && r.status === 400 && /tool|search|ground/i.test(r.msg)) r = await callModel(model, ent.key, prompt, false);
+            if (r.ok) {
+              const v = validate(r.text);
+              if (v) { KeyPool.touch(ent.id); return { obj: v, sources: r.sources, model }; }
+              errs.push(`${model}: ردّ غير صالح`); break;
+            }
+            if (r.fatal && /api key|leaked|expired|invalid|disabled/i.test(r.msg + ' ' + (r.raw || ''))) { KeyPool.markBad(ent.id, r.msg); break; }
+            if (r.status === 429) { KeyPool.exhaust(ent.id, mk, quotaUntil(r)); break; }
+            errs.push(`${model} (${r.status || '—'}): ${r.msg || 'خطأ'}`);
+            if ([500, 503].includes(r.status) && attempt === 0) { await sleep(3000); continue; }
+            break;
+          }
+        }
+        const soon = KeyPool.soonest(mk);
+        if (soon && soon - Date.now() <= 75000 && !waited[model]) {
+          waited[model] = true; again = true;
+          if (say) say('الحد اللحظي للنموذج الأذكى — انتظار ثوانٍ ثم المتابعة به…');
+          await sleep(Math.max(1000, soon - Date.now() + 500));
+        }
+      }
+    }
+    const soon = KeyPool.soonestAny();
+    throw new Error((soon ? 'كل المفاتيح مستهلكة للنماذج المتاحة — أقربها يتوفر ' + fmtDate(soon) + ' ' + fmtTime(soon) + '. ' : '') + ([...new Set(errs)].slice(-6).join(' ║ ') || 'لا يوجد مفتاح جاهز — راجع تبويب مفاتيح الذكاء الاصطناعي في الإعدادات'));
+  }
+
+  async function generateSmart(p, ps, key, say) {
+    if (navigator.onLine === false) throw new Error('لا يوجد اتصال بالإنترنت — أول بحث عن أي دواء يحتاج الإنترنت');
+    await KeyPool.load();
+    if (!KeyPool.count()) throw new Error('لا توجد مفاتيح — أضفها من: الإعدادات ← مفاتيح الذكاء الاصطناعي');
+    const valid = t => { const o = parseJson(t); return o && (o.uses || o.doses) ? o : null; };
+    const first = await ask(buildPrompt(p, ps), valid, say);
+    let data = first.obj, sources = first.sources, model = first.model, verified = false;
+    if (KeyPool.getPrefs().verify) {
+      try {
+        if (say) say('جارٍ التدقيق المزدوج للمعلومات…');
+        const second = await ask(buildAudit(p, ps, first.obj), valid, say);
+        data = second.obj; model = second.model; verified = true;
+        sources = [...first.sources, ...second.sources];
+      } catch (e) { console.warn('verify:', e); }
+    }
+    const seen = new Set();
+    sources = sources.filter(s => { const k = s.t || s.u; if (!k || seen.has(k)) return false; seen.add(k); return true; });
+    return { key, sci: S(p.scientificName), parts: ps, data, sources, grounded: sources.length > 0, verified, model, createdAt: Date.now(), v: 1 };
+  }
+
+  const NO_SEARCH = 'IMPORTANT: you have NO web access in this session. Answer only from well-established, textbook-level pharmaceutical knowledge, and write "غير مؤكد" for every detail you are not completely certain about. Never invent brand names, doses or contraindications.\n\n';
+
+  /* يجرّب النماذج بالترتيب (الأذكى أولاً)، ولكل نموذج يدور على مفاتيحه؛ عند استهلاك مفتاح أثناء البحث يكمل التالي فوراً */
+  async function askHub(prompt, validate, say, avoid) {
+    let order = await AIHub.plan();
+    if (avoid) order = [...order.filter(m => m.provider !== avoid), ...order.filter(m => m.provider === avoid)];
+    const errs = [], waited = {};
+    for (const m of order) {
+      let again = true;
+      while (again) {
+        again = false;
+        const tried = new Set();
+        const can = k => k.provider === m.provider && AIHub.canUse ? AIHub.canUse(k, m) : k.provider === m.provider;
+        for (let ent = AIHub.next(tried, m.id, can); ent; ent = AIHub.next(tried, m.id, can)) {
+          tried.add(ent.id);
+          if (say) say('جارٍ البحث بـ ' + m.label + '…');
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const r = await AIHub.call(ent, m, m.grounded ? prompt : NO_SEARCH + prompt);
+            if (r.ok) {
+              const v = validate(r.text);
+              if (v) { AIHub.touch(ent.id); return { obj: v, sources: r.sources || [], model: m.id, provider: m.provider }; }
+              errs.push(`${m.model}: ردّ غير صالح`); break;
+            }
+            if (r.keyBad) { AIHub.markBad(ent.id, r.msg); break; }
+            if (r.noModel) { AIHub.banPair(ent.id, m.id); errs.push(`${m.model}: غير مشمول بحصة هذا المفتاح — تخطّاه`); break; }
+            if (r.until) { AIHub.exhaust(ent.id, m.id, r.until); errs.push(`${m.model} (${r.status}): ${r.msg || 'حد الاستخدام'}`); break; }
+            errs.push(`${m.model} (${r.status || '—'}): ${r.msg || 'خطأ'}`);
+            if (r.retry && attempt === 0) { await sleep(3000); continue; }
+            break;
+          }
+        }
+        const soon = AIHub.soonest(m.id);
+        if (soon && soon - Date.now() <= 130000 && (waited[m.id] || 0) < 2) {
+          waited[m.id] = (waited[m.id] || 0) + 1; again = true;
+          if (say) say('الحد اللحظي للنموذج — انتظار حتى يتصفّر ثم المتابعة تلقائياً…');
+          await sleep(Math.max(1000, soon - Date.now() + 500));
+        }
+      }
+    }
+    const soon = AIHub.soonestAny();
+    throw new Error((soon ? 'كل المفاتيح مستهلكة للنماذج المتاحة — أقربها يتوفر ' + fmtDate(soon) + ' ' + fmtTime(soon) + '. ' : '') + ([...new Set(errs)].slice(-6).join(' ║ ') || 'لا يوجد مفتاح جاهز — راجع تبويب مفاتيح الذكاء الاصطناعي في الإعدادات'));
+  }
+
+  async function generateHub(p, ps, key, say) {
+    if (navigator.onLine === false) throw new Error('لا يوجد اتصال بالإنترنت — أول بحث عن أي دواء يحتاج الإنترنت');
+    await AIHub.load();
+    if (!AIHub.count()) throw new Error('لا توجد مفاتيح — أضفها من: الإعدادات ← مفاتيح الذكاء الاصطناعي');
+    const valid = t => { const o = parseJson(t); return o && (o.uses || o.doses) ? o : null; };
+    const first = await askHub(buildPrompt(p, ps), valid, say, '');
+    let data = first.obj, sources = first.sources, model = first.model, verified = false;
+    if (AIHub.getPrefs().verify) {
+      try {
+        if (say) say('جارٍ التدقيق المزدوج للمعلومات…');
+        const second = await askHub(buildAudit(p, ps, first.obj), valid, say, first.provider);
+        data = second.obj; model = second.model; verified = true;
+        sources = [...first.sources, ...second.sources];
+      } catch (e) { console.warn('verify:', e); }
+    }
+    const seen = new Set();
+    sources = sources.filter(s => { const k = S(s.t) || S(s.u); if (!k || seen.has(k)) return false; seen.add(k); return true; });
+    return { key, sci: S(p.scientificName), parts: ps, data, sources, grounded: sources.length > 0, verified, model, createdAt: Date.now(), v: 1 };
   }
 
   /* ── الذاكرة: محلية (IndexedDB) ثم سحابية (Firebase) — يُستدعى الذكاء الاصطناعي لأول بحث فقط ── */
@@ -3316,6 +4275,8 @@ Return ONLY one JSON object, starting with { and ending with }, in exactly this 
     const srcs = [...new Set(A(rec.sources).map(hostOf).filter(Boolean))].slice(0, 6);
     const foot = h('div', { class: 'di-foot' },
       rec.grounded ? h('span', { class: 'di-chip ok' }, 'موثّق ببحث ويب') : h('span', { class: 'di-chip warn' }, 'بلا مصادر ويب — راجع النشرة الدوائية'),
+      rec.verified ? h('span', { class: 'di-chip ok' }, 'دُقّق مرتين') : null,
+      rec.model ? h('span', { class: 'di-src' }, rec.model) : null,
       srcs.length ? h('span', {}, 'المصادر:') : null,
       srcs.map(s => h('span', { class: 'di-src' }, s)),
       h('span', {}, 'حُفظ: ' + fmtDate(rec.createdAt)),
@@ -3372,7 +4333,7 @@ Return ONLY one JSON object, starting with { and ending with }, in exactly this 
           tm = setInterval(() => { const el = root.querySelector('#di-lmsg'); si = (si + 1) % steps.length; if (el) el.textContent = steps[si]; }, 7000);
           if (inflight.has(key)) rec = await inflight.get(key);
           else {
-            const pr = generate(p, ps, key);
+            const pr = generateHub(p, ps, key, t => { const el = root.querySelector('#di-lmsg'); if (el) el.textContent = t; });
             inflight.set(key, pr);
             try { rec = await pr; } finally { inflight.delete(key); }
             await store(rec);
@@ -3394,6 +4355,336 @@ Return ONLY one JSON object, starting with { and ending with }, in exactly this 
   }
 
   return { button, open };
+})();
+
+/* ───────────────────────── 20-ج) حاسبة جرعات الأطفال الذكية: قاعدة الجرعة تُجلب من السحابة أو الذكاء مرة واحدة فقط، والحساب محلي فوري بلا استهلاك ───────────────────────── */
+const DoseCalc = (() => {
+  const A = x => Array.isArray(x) ? x : (x && typeof x === 'object' ? Object.values(x) : (x ? [x] : []));
+  const S = x => String(x == null ? '' : x).trim();
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const inflight = new Map();
+  let cssDone = false;
+
+  /* الأشكال المستهدفة: شراب / معلق / نقط / حقن وأمبولات */
+  const LIQ = /syrup|susp|drop|amp|vial|infusion|sachet|emuls|solution|mixture|linctus|شراب|معلق|نقط|قطرة|حقن|امبول|أمبول|فيال/i;
+  const applicable = p => !!(p && (LIQ.test(S(p.form)) || LIQ.test(S(p.dose))));
+
+  /* نفس فلسفة الموسوعة: مفتاح من الاسم العلمي مرتّباً أبجدياً — كل المنتجات بنفس المادة تشترك بقاعدة جرعة واحدة */
+  const splitParts = sci => S(sci)
+    .replace(/\(.*?\)/g, ' ')
+    .split(/\s*(?:\+|\/|&|,|;|\band\b)\s*/i)
+    .map(x => x.replace(/\d+(?:[.,]\d+)?\s*(?:mg|mcg|µg|ug|gm|g|ml|iu|%|units?)(?![a-z])/ig, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  const keyOf = ps => ps.map(x => x.toLowerCase().replace(/[^a-z0-9\u0600-\u06FF]+/g, '_').replace(/^_+|_+$/g, '')).filter(Boolean).sort().join('__').slice(0, 200);
+
+  /* تركيز المنتج من خانة الجرعة: «250mg/5ml» ← 50 ملغ لكل مل */
+  function concOf(p) {
+    const m = /(\d+(?:\.\d+)?)\s*(mg|g|mcg)\s*\/\s*(\d+(?:\.\d+)?)\s*ml/i.exec(S(p && p.dose));
+    if (!m) return 0;
+    let mg = parseFloat(m[1]);
+    if (/^g$/i.test(m[2])) mg *= 1000;
+    if (/^mcg$/i.test(m[2])) mg /= 1000;
+    const ml = parseFloat(m[3]);
+    return ml > 0 ? Math.round((mg / ml) * 100) / 100 : 0;
+  }
+
+  /* أوزان وسيطة للأطفال حسب العمر والجنس (المرجعية المتبعة في الممارسة العراقية) — تُستعمل فقط عندما لا يُدخل الصيدلي وزناً فعلياً */
+  const AGE_M = [0, 3, 6, 9, 12, 18, 24, 36, 48, 60, 72, 84, 96, 108, 120, 132, 144, 156, 168];
+  const WT_B = [3.3, 6.4, 7.9, 8.9, 9.6, 10.9, 12.2, 14.3, 16.3, 18.3, 20.5, 22.9, 25.6, 28.6, 31.9, 35.7, 40, 45, 50];
+  const WT_G = [3.2, 5.8, 7.3, 8.2, 8.9, 10.2, 11.5, 13.9, 16.1, 18.2, 20.2, 22.4, 24.8, 27.5, 30.9, 34.9, 39.5, 44.5, 50];
+  function estWeight(months, sex) {
+    const t = sex === 'f' ? WT_G : WT_B;
+    if (months <= 0) return t[0];
+    const last = AGE_M.length - 1;
+    if (months >= AGE_M[last]) return t[last];
+    let i = 1;
+    while (i < last && AGE_M[i] < months) i++;
+    const m0 = AGE_M[i - 1], m1 = AGE_M[i], w0 = t[i - 1], w1 = t[i];
+    return Math.round((w0 + (w1 - w0) * (months - m0) / (m1 - m0)) * 10) / 10;
+  }
+
+  function parseJson(text) {
+    const t = String(text || '').replace(/```json|```/g, '').trim();
+    const s = t.indexOf('{'), e = t.lastIndexOf('}');
+    if (s < 0 || e < 0) return null;
+    try { return JSON.parse(t.slice(s, e + 1)); } catch (_) { return null; }
+  }
+
+  function buildPrompt(p, ps) {
+    const clean = v => S(v).replace(/["\r\n]+/g, ' ');
+    return `You are a pediatric clinical pharmacist. Verify EVERY number against BNF for Children, Medscape pediatric dosing and the official FDA/DailyMed label only. Never guess — if verified pediatric dosing is not established for this drug, return {"mode":"none"}.
+
+Drug (generic name): "${clean(p.scientificName)}"${ps.length > 1 ? ' — fixed-dose combination of: ' + ps.join(' + ') + '. Give the dosing of the combination as commonly prescribed.' : ''}
+Product context (for concentration only): form "${clean(p.form)}", strength "${clean(p.dose)}".
+
+Return ONLY one JSON object in exactly this shape:
+{"mode":"wt","mgPerKg":0,"timesPerDay":0,"maxDoseMg":0,"minMonths":0,"bands":[{"toYears":0,"doseMg":0,"timesPerDay":0}],"note":"","refs":[""]}
+
+Rules:
+- mode "wt" = verified pediatric dosing is weight-based: mgPerKg = milligrams per kilogram per SINGLE dose; timesPerDay = doses given per day; maxDoseMg = absolute single-dose ceiling (usually the adult single dose); minMonths = minimum allowed age in months (0 if usable from birth per the source).
+- mode "band" = verified dosing is fixed by age band: fill bands ascending by toYears, doseMg = fixed mg per single dose, timesPerDay per band.
+- mode "none" = no verified pediatric dosing — nothing else required.
+- Use the standard common-indication regimen (e.g. usual infection course); put clarifications in note.
+- note: one short Arabic safety note, max 120 characters (food relation, dilution, key caution).
+- refs: names of sources actually verified from (e.g. "BNF for Children", "Medscape", "FDA label").
+- No markdown, no text outside the JSON.`;
+  }
+
+  const NO_WEB = 'IMPORTANT: you have NO web access in this session. Answer only from dosing references you are completely certain about (BNF for Children / official label); if not certain, return {"mode":"none"}. Never invent numbers.\n\n';
+
+  /* التدوير: أذكى نموذج عبر كل المفاتيح، وعند استهلاك مفتاح يكمل التالي فوراً — نفس محرك الموسوعة */
+  async function askAI(prompt, validate, say) {
+    const order = await AIHub.plan();
+    const errs = [], waited = {};
+    for (const m of order) {
+      let again = true;
+      while (again) {
+        again = false;
+        const tried = new Set();
+        const can = k => k.provider === m.provider && AIHub.canUse(k, m);
+        for (let ent = AIHub.next(tried, m.id, can); ent; ent = AIHub.next(tried, m.id, can)) {
+          tried.add(ent.id);
+          if (say) say('جارٍ البحث بـ ' + m.label + '…');
+          const r = await AIHub.call(ent, m, (m.grounded ? '' : NO_WEB) + prompt);
+          if (r.ok) {
+            const v = validate(r.text);
+            if (v) { AIHub.touch(ent.id); return { obj: v, model: m.id }; }
+            errs.push(m.model + ': ردّ غير صالح'); break;
+          }
+          if (r.keyBad) { AIHub.markBad(ent.id, r.msg); break; }
+          if (r.noModel) { AIHub.banPair(ent.id, m.id); break; }
+          if (r.until) { AIHub.exhaust(ent.id, m.id, r.until); break; }
+          errs.push(m.model + ' (' + (r.status || '—') + '): ' + (r.msg || 'خطأ')); break;
+        }
+        const soon = AIHub.soonest(m.id);
+        if (soon && soon - Date.now() <= 130000 && (waited[m.id] || 0) < 2) {
+          waited[m.id] = (waited[m.id] || 0) + 1; again = true;
+          if (say) say('انتظار تصفّر الحد اللحظي ثم المتابعة تلقائياً…');
+          await sleep(Math.max(1000, soon - Date.now() + 500));
+        }
+      }
+    }
+    const soon = AIHub.soonestAny();
+    throw new Error((soon ? 'كل المفاتيح مستهلكة — أقربها يتوفر ' + fmtDate(soon) + ' ' + fmtTime(soon) + '. ' : '') + ([...new Set(errs)].slice(-4).join(' ║ ') || 'أضف مفاتيح من: الإعدادات ← مفاتيح الذكاء الاصطناعي'));
+  }
+
+  const cloudReady = () => typeof Sync !== 'undefined' && Sync.ready && Sync.db;
+  async function lookup(key) {
+    try {
+      const loc = await DB.get('meta', 'dose:' + key);
+      if (loc && loc.data) { if (loc.cloud === false) store(loc); return loc; }
+    } catch (_) {}
+    if (cloudReady()) {
+      try {
+        const snap = await Promise.race([Sync.db.ref('pos/doseInfo/' + key).once('value'), new Promise((_, rej) => setTimeout(() => rej(new Error('t')), 7000))]);
+        const v = snap.val();
+        if (v && v.data) {
+          const rec = { ...v, id: 'dose:' + key, cloud: true };
+          try { await DB.put('meta', rec); } catch (_) {}
+          return rec;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+  async function store(rec) {
+    let ok = false;
+    if (cloudReady()) {
+      try {
+        const doc = JSON.parse(JSON.stringify(rec)); delete doc.id; delete doc.cloud;
+        await Promise.race([Sync.db.ref('pos/doseInfo/' + rec.key).set(doc), new Promise((_, rej) => setTimeout(() => rej(new Error('t')), 8000))]);
+        ok = true;
+      } catch (e) { console.warn('doseInfo cloud:', e); }
+    }
+    rec.cloud = ok;
+    try { await DB.put('meta', { ...rec, id: 'dose:' + rec.key }); } catch (_) {}
+  }
+
+  /* الحساب المحلي الدقيق: ملغ للجرعة الواحدة مع سقف الجرعة، ثم التحويل إلى سم³ حسب تركيز المنتج */
+  function calcDose(rule, months, kg) {
+    const d = rule.data || {};
+    if (d.mode === 'none') return { none: true };
+    let doseMg = 0, perDay = 0, capped = false;
+    const minM = +d.minMonths || 0;
+    if (d.mode === 'wt') {
+      doseMg = (+d.mgPerKg || 0) * kg;
+      perDay = +d.timesPerDay || 0;
+      if (+d.maxDoseMg > 0 && doseMg > +d.maxDoseMg) { doseMg = +d.maxDoseMg; capped = true; }
+    } else {
+      const yrs = months / 12;
+      const band = A(d.bands).filter(b => +b.toYears > 0 && +b.doseMg > 0).sort((a, b) => +a.toYears - +b.toYears).find(b => yrs <= +b.toYears);
+      if (!band) return { none: true };
+      doseMg = +band.doseMg; perDay = +band.timesPerDay || 0;
+    }
+    doseMg = Math.round(doseMg * 10) / 10;
+    return { doseMg, perDay, capped, minM };
+  }
+
+  const dayTimes = n => n === 1 ? 'مرة واحدة يومياً' : n === 2 ? 'مرتين يومياً' : n > 0 ? n + ' مرات يومياً' : '';
+
+  /* أيقونة الطفل */
+  function baby() {
+    return `<svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="dzg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffd9e8"/><stop offset="1" stop-color="#9fd8ff"/></linearGradient></defs><circle cx="32" cy="34" r="22" fill="url(#dzg)" stroke="#0b2f2c" stroke-opacity=".15"/><path d="M32 12c3.5 0 5.5 2.5 5.5 5 0 1.8-1 3.2-2.5 3.9" fill="none" stroke="#8a5a00" stroke-width="2.6" stroke-linecap="round"/><circle cx="24" cy="33" r="2.6" fill="#14302d"/><circle cx="40" cy="33" r="2.6" fill="#14302d"/><path d="M24 43c2.8 3 5.5 4.2 8 4.2s5.2-1.2 8-4.2" fill="none" stroke="#14302d" stroke-width="2.6" stroke-linecap="round"/><circle cx="18" cy="40" r="3" fill="#ffb3c7" opacity=".8"/><circle cx="46" cy="40" r="3" fill="#ffb3c7" opacity=".8"/></svg>`;
+  }
+
+  function css() {
+    if (cssDone) return; cssDone = true;
+    const st = document.createElement('style'); st.id = 'dz-css';
+    st.textContent = `
+.dz-fab{width:40px;height:40px;border:0;border-radius:50%;padding:5px;cursor:pointer;display:grid;place-items:center;background:linear-gradient(145deg,#fff,#ffe3ee);box-shadow:0 4px 0 #e6b8cc,0 9px 14px rgba(11,47,44,.22),inset 0 2px 0 #fff;transition:transform .18s ease,box-shadow .18s ease;animation:dzFloat 3.2s ease-in-out infinite;flex:none}
+.dz-fab svg{width:100%;height:100%;filter:drop-shadow(0 2px 2px rgba(0,0,0,.2))}
+.dz-fab:hover{transform:translateY(-3px) scale(1.06);box-shadow:0 7px 0 #e6b8cc,0 14px 18px rgba(11,47,44,.26),inset 0 2px 0 #fff;animation:none}
+.dz-fab:active{transform:translateY(3px);box-shadow:0 1px 0 #e6b8cc,0 3px 6px rgba(11,47,44,.2),inset 0 2px 0 #fff}
+@keyframes dzFloat{0%,100%{translate:0 0}50%{translate:0 -3px}}
+@keyframes dzSpin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.dz-fab{animation:none}.dz-spin{animation:none}}
+.dz-wrap{display:flex;flex-direction:column;gap:12px}
+.dz-prod{display:flex;align-items:center;gap:12px;background:#f4faf9;border:1px solid #d3e5e2;border-radius:14px;padding:10px 14px}
+.dz-prod .dz-ic{width:42px;height:42px;flex:none}
+.dz-form{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.dz-field{display:flex;flex-direction:column;gap:5px}
+.dz-field label{font-weight:900;font-size:12.5px;color:var(--muted)}
+.dz-field input{border:1.5px solid var(--line);border-radius:11px;padding:9px 12px;font:inherit;font-weight:800;outline:none}
+.dz-field input:focus{border-color:#14b8a6}
+.dz-seg{display:flex;gap:8px}
+.dz-sex{flex:1;border:1.5px solid var(--line);background:transparent;color:inherit;font:inherit;font-weight:900;border-radius:11px;padding:9px 0;cursor:pointer}
+.dz-sex.on{background:#14b8a6;border-color:#14b8a6;color:#fff}
+.dz-res{display:flex;flex-direction:column;gap:10px}
+.dz-big{background:linear-gradient(120deg,#0f766e,#14b8a6);color:#fff;border-radius:16px;padding:16px;text-align:center}
+.dz-big b{font-size:30px;font-weight:900;direction:ltr;display:block}
+.dz-big small{font-weight:800;opacity:.92}
+.dz-line{background:#fff;border:1px solid #dcebe8;border-radius:12px;padding:9px 13px;font-weight:800;line-height:1.9}
+.dz-warn{background:#fff0c9;color:#7a4b00;border:1px solid #f0d48a;border-radius:12px;padding:9px 13px;font-weight:800;line-height:1.9}
+.dz-stop{background:#ffdcdc;color:#b91c1c;border:1px solid #f3b4b4;border-radius:12px;padding:9px 13px;font-weight:900;line-height:1.9}
+.dz-note{font-size:11.8px;font-weight:700;color:var(--muted);line-height:1.9}
+.dz-src{direction:ltr;display:inline-block;background:#e3f1ee;border-radius:8px;padding:0 8px;font-size:11.5px;font-weight:800;margin:0 2px}
+.dz-load{display:flex;flex-direction:column;align-items:center;gap:10px;padding:18px;text-align:center}
+.dz-spin{width:40px;height:40px;border-radius:50%;border:4px solid #cfe5e1;border-top-color:#14b8a6;animation:dzSpin 1s linear infinite}
+`;
+    document.head.append(st);
+  }
+
+  function open(p) {
+    if (!applicable(p)) return;
+    css();
+    const sci = S(p.scientificName);
+    const conc = concOf(p);
+    let sex = 'm';
+
+    const yInp = h('input', { type: 'number', min: 0, max: 14, step: 'any', placeholder: '0' });
+    const mInp = h('input', { type: 'number', min: 0, max: 11, step: 'any', placeholder: '0' });
+    const wInp = h('input', { type: 'number', min: 0, step: 'any', placeholder: 'اختياري', dir: 'ltr' });
+    const res = h('div', { class: 'dz-res' });
+    const bBtn = h('button', { class: 'dz-sex on' }, 'ذكر');
+    const gBtn = h('button', { class: 'dz-sex' }, 'أنثى');
+    bBtn.onclick = () => { sex = 'm'; bBtn.classList.add('on'); gBtn.classList.remove('on'); };
+    gBtn.onclick = () => { sex = 'f'; gBtn.classList.add('on'); bBtn.classList.remove('on'); };
+
+    openModal({ title: 'حاسبة جرعات الأطفال الذكية', icon: 'pill', body: h('div', { class: 'dz-wrap' },
+      h('div', { class: 'dz-prod' },
+        h('span', { class: 'dz-ic', html: baby() }),
+        h('div', { style: { minWidth: 0 } },
+          h('b', { style: { fontSize: '15px' } }, p.brandName),
+          h('div', { class: 'dz-note' }, `${S(p.form)} ${S(p.dose)}` + (conc ? ` — التركيز: ${conc} ملغ/مل` : ' — التركيز غير مقروء: سيُعرض الناتج بالملغ فقط (اكتب الجرعة بصيغة 250mg/5ml في صفحة الصنف لعرض السم³)')),
+          h('div', { class: 'dz-note' }, 'المادة: ' + (sci || 'لا يوجد اسم علمي — أدخله من «تعديل الصنف»')))),
+      h('div', { class: 'dz-form' },
+        h('div', { class: 'dz-field' }, h('label', {}, 'الجنس'), h('div', { class: 'dz-seg' }, bBtn, gBtn)),
+        h('div', { class: 'dz-field' }, h('label', {}, 'العمر (سنوات)'), yInp),
+        h('div', { class: 'dz-field' }, h('label', {}, 'العمر (أشهر)'), mInp)),
+      h('div', { class: 'dz-field' }, h('label', {}, 'الوزن بالكغم — اختياري: عند تركه فارغاً يُقدَّر من العمر والجنس'), wInp),
+      h('button', { class: 'btn g big', onclick: () => run() }, h('span', { html: icon('check') }), 'احسب الجرعة'),
+      res) });
+    setTimeout(() => yInp.focus(), 60);
+
+    const say = t => { const el = res.querySelector('.dz-lmsg'); if (el) el.textContent = t; };
+
+    function validRule(t) {
+      const o = parseJson(t);
+      if (!o || typeof o !== 'object') return null;
+      if (o.mode === 'none') return o;
+      if (o.mode === 'wt' && +o.mgPerKg > 0 && +o.timesPerDay > 0) return o;
+      if (o.mode === 'band' && A(o.bands).some(b => +b.toYears > 0 && +b.doseMg > 0)) return o;
+      return null;
+    }
+
+    async function ensureRule(force) {
+      if (!sci) throw new Error('لا يمكن البحث بلا اسم علمي — أدخل الاسم العلمي من «تعديل الصنف» أولاً');
+      const ps = splitParts(sci), key = keyOf(ps);
+      if (!key) throw new Error('الاسم العلمي غير صالح للبحث');
+      let rec = force ? null : await lookup(key);
+      if (!rec) {
+        if (inflight.has(key)) rec = await inflight.get(key);
+        else {
+          const pr = (async () => {
+            const r = await askAI(buildPrompt(p, ps), validRule, say);
+            return { key, sci, parts: ps, data: r.obj, model: r.model, createdAt: Date.now(), v: 1 };
+          })();
+          inflight.set(key, pr);
+          try { rec = await pr; } finally { inflight.delete(key); }
+          await store(rec);
+        }
+      }
+      return rec;
+    }
+
+    async function run(force) {
+      const months = Math.max(0, (+yInp.value || 0) * 12 + (+mInp.value || 0));
+      if (!months && !+wInp.value) { toast('أدخل العمر (سنوات أو أشهر) أو الوزن', 'r'); return; }
+      if (months > 168) { toast('الحاسبة مخصصة للأطفال حتى 14 سنة', 'r'); return; }
+      res.innerHTML = '';
+      res.append(h('div', { class: 'dz-load' }, h('div', { class: 'dz-spin' }), h('div', { class: 'dz-lmsg', style: { fontWeight: 900 } }, 'جارٍ تجهيز قاعدة الجرعة…')));
+      try {
+        const rule = await ensureRule(!!force);
+        renderRes(rule, months);
+      } catch (e) {
+        res.innerHTML = '';
+        res.append(h('div', { class: 'dz-load' },
+          h('div', { class: 'dz-stop' }, (e && e.message) || 'تعذّر جلب قاعدة الجرعة'),
+          h('button', { class: 'btn b', onclick: () => run() }, 'إعادة المحاولة')));
+      }
+    }
+
+    function renderRes(rule, months) {
+      const kgReal = +wInp.value || 0;
+      const kg = kgReal || estWeight(months, sex);
+      const out = calcDose(rule, months, kg);
+      res.innerHTML = '';
+      const d = rule.data || {};
+      if (out.none) {
+        res.append(h('div', { class: 'dz-stop' }, 'لا توجد جرعة أطفال موثقة لهذه المادة في المصادر المعتمدة — راجع النشرة الرسمية أو الطبيب.'));
+        return;
+      }
+      if (out.minM && months && months < out.minM) {
+        res.append(h('div', { class: 'dz-stop' }, `تنبيه: المصادر تشترط عمراً لا يقل عن ${out.minM} شهراً لهذا الدواء — الصرف تحت هذا العمر بأمر طبيب فقط.`));
+      }
+      const ml = conc ? Math.round((out.doseMg / conc) * 2) / 2 : 0;
+      res.append(
+        h('div', { class: 'dz-big' },
+          h('div', {},
+            h('b', {}, ml ? `${ml}` : `${out.doseMg}`),
+            h('div', {}, h('small', {}, ml ? `سم³ (cc) للجرعة الواحدة ≈ ${out.doseMg} ملغ` : 'ملغ للجرعة الواحدة')),
+            out.perDay ? h('div', { style: { marginTop: '4px', fontWeight: 900 } }, dayTimes(out.perDay)) : null)),
+        kgReal ? null : h('div', { class: 'dz-warn' }, `استُخدم وزن تقديري ${kg} كغم (حسب العمر والجنس) — إدخال الوزن الفعلي يعطي دقة أعلى.`),
+        out.capped ? h('div', { class: 'dz-warn' }, 'طُبّق سقف الجرعة القصوى (جرعة البالغ) — الحساب بالوزن أعطى أكثر من المسموح.') : null,
+        h('div', { class: 'dz-line' },
+          d.mode === 'wt'
+            ? `القاعدة المعتمدة: ${d.mgPerKg} ملغ/كغم للجرعة الواحدة${d.maxDoseMg ? ` — بسقف ${d.maxDoseMg} ملغ` : ''}`
+            : 'القاعدة المعتمدة: جرعة ثابتة حسب الفئة العمرية',
+          d.note ? h('div', { class: 'dz-note' }, d.note) : null),
+        h('div', { class: 'dz-note' },
+          'المصادر: ', A(d.refs).length ? A(d.refs).map(r => h('span', { class: 'dz-src' }, S(r))) : '—',
+          ' — هذه النتيجة استرشادية ولا تغني عن مراجعة الصيدلي/الطبيب والنشرة الرسمية. ',
+          h('button', { class: 'mini-btn blue', onclick: async () => { if (await confirmBox('إعادة جلب قاعدة الجرعة بالذكاء الاصطناعي؟ تُستهلك حصة وتُستبدل القاعدة المخزنة لكل الأجهزة.', { okLabel: 'تحديث' })) run(true); } }, 'تحديث القاعدة')));
+    }
+  }
+
+  function button(p) {
+    if (!applicable(p)) return null;
+    css();
+    return h('button', { class: 'dz-fab', title: 'حاسبة جرعات الأطفال', 'aria-label': 'حاسبة جرعات الأطفال', html: baby(), onclick: () => open(p) });
+  }
+
+  return { button, open, applicable };
 })();
 
 /* ───────────────────────── 21) تفاصيل الصنف + حركة المادة ───────────────────────── */
@@ -3759,7 +5050,7 @@ function renderSettings(tab) {
   const acc = me();
   const page = h('div', { class: 'page', style: { overflowY: 'auto' } });
   page.append(h('div', { class: 'page-head' }, h('div', { class: 'page-title' }, h('span', { html: icon('settings') }), 'الإعدادات')));
-    const SECTIONS = [['profile','حسابي'],['pharmacy','الصيدلية والنظام'],['printer','الطابعة والملصقات'],['studio','استوديو التصميم'],['accounts','إدارة الحسابات'],['companies','الشركات'],['scanner','الماسح الذكي'],['backup','النسخ الاحتياطي']];
+    const SECTIONS = [['profile','حسابي'],['pharmacy','الصيدلية والنظام'],['printer','الطابعة والملصقات'],['studio','استوديو التصميم'],['accounts','إدارة الحسابات'],['companies','الشركات'],['ai','مفاتيح الذكاء الاصطناعي'],['scanner','الماسح الذكي'],['backup','النسخ الاحتياطي']];
     const nav = h('div', { class: 'settings-nav' }, SECTIONS // الصلاحيات مفتوحة: كل الحسابات ترى كل الأقسام حالياً (بطلبك)
     .map(([k, l]) => h('div', { class: 'set-chip' + (st.section === k ? ' active' : ''), onclick: () => { st.section = k; renderTabContent(tab); } }, l)));
   page.append(nav);
@@ -3947,6 +5238,7 @@ function renderSettings(tab) {
         h('button', { class: 'btn b', onclick: () => openTab('scanner') }, h('span', { html: icon('camera') }), 'فتح الماسح الذكي'),
         h('button', { class: 'btn g', onclick: () => KeyPool.openManager() }, h('span', { html: icon('lock') }), 'مفاتيح الموسوعة الدوائية'))));
   }
+  else if (st.section === 'ai') { KeyPool.renderPanel(box); }
   else if (st.section === 'studio') { renderDesignStudio(box); }
   else if (st.section === 'backup') {
     const fileInp = h('input', { type: 'file', accept: '.json', style: { display: 'none' } });
