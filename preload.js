@@ -16,4 +16,7 @@ contextBridge.exposeInMainWorld('desktop', Object.freeze({
     list:   ()     => ipcRenderer.invoke('print:list'),
     silent: (opts) => ipcRenderer.invoke('print:silent', opts),
   }),
+  pdf: Object.freeze({
+    export: (opts) => ipcRenderer.invoke('pdf:export', opts),
+  }),
 }));

@@ -164,6 +164,8 @@ const ICONS = {
   history:  IC('<path d="M3 3v5h5"/><path d="M3.05 13a9 9 0 1 0 .5-5L3 8"/><path d="M12 7v5l3.5 2"/>'),
   receipt:  IC('<path d="M5 2h14v20l-2.3-1.5L14.4 22l-2.4-1.5L9.6 22l-2.3-1.5L5 22z"/><path d="M9 7h6M9 11h6M9 15h4"/>'),
   users:    IC('<circle cx="9" cy="8" r="3.4"/><path d="M2.5 20c.7-3.6 3.4-5.5 6.5-5.5s5.8 1.9 6.5 5.5"/><circle cx="17.5" cy="9.5" r="2.6"/><path d="M16 14.6c2.9.3 5 2.1 5.5 5.4"/>'),
+  gift:     IC('<path d="M20 12v7.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 19.5V12"/><rect x="2" y="7.5" width="20" height="4.5" rx="1.2"/><path d="M12 7.5V21"/><path d="M12 7.5H7.6a2.05 2.05 0 1 1 0-4.1C10.4 3.4 12 7.5 12 7.5z"/><path d="M12 7.5h4.4a2.05 2.05 0 1 0 0-4.1C13.6 3.4 12 7.5 12 7.5z"/>'),
+  paper:    IC('<path d="M14 2.5H6.5A1.5 1.5 0 0 0 5 4v16a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 20V7.5z"/><path d="M14 2.5V8h5"/><path d="M8.5 13h7M8.5 16.5h7M8.5 9.5h3"/>'),
 };
 const icon = n => ICONS[n] || ICONS.box;
 
@@ -171,8 +173,8 @@ const icon = n => ICONS[n] || ICONS.box;
    صخرة صلبة: كل عملية تُحفظ محلياً فوراً قبل أي شيء، والمزامنة لاحقاً.
    معرفات فريدة عالمياً تمنع أي تعارض حتى مع بيع متزامن من جهازين.      */
 const DB = (() => {
-  const NAME = 'darb_alshifa_db', VER = 3; // v3: + جدول outbox (طابور الرفع المؤجل)
-  const STORES = ['accounts','products','sales','purchases','suppliers','payments','customers','settings','meta','outbox'];
+  const NAME = 'darb_alshifa_db', VER = 5; // v5: + جدول scans (النسخة الورقية لقوائم الشراء) — الإصدار يحدّ نفسه تلقائياً
+  const STORES = ['accounts','products','sales','purchases','suppliers','payments','customers','bonuses','scans','settings','meta','outbox'];
   let db = null;
   const wrap = req => new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); });
   function open() {
@@ -202,6 +204,7 @@ const DB = (() => {
 const state = {
   accounts: [], products: [], sales: [], purchases: [],
   suppliers: [], payments: [], customers: [],
+  bonuses: [],
   settings: {}, session: null, customerId: null,
 };
 
@@ -308,7 +311,7 @@ const me = () => findAcc(state.session);
 async function save(storeName, obj) {
   obj.updatedAt = Date.now();
   await DB.put(storeName, obj);
-  const coll = state[{accounts:'accounts',products:'products',sales:'sales',purchases:'purchases',suppliers:'suppliers',payments:'payments',customers:'customers'}[storeName] || 'settings'];
+  const coll = state[{accounts:'accounts',products:'products',sales:'sales',purchases:'purchases',suppliers:'suppliers',payments:'payments',customers:'customers',bonuses:'bonuses'}[storeName] || 'settings'];
   if (Array.isArray(coll)) {
     const i = coll.findIndex(x => x.id === obj.id);
     if (i >= 0) coll[i] = obj; else coll.push(obj);
@@ -326,7 +329,7 @@ async function save(storeName, obj) {
    نفس نمط نظام التقارير/الأطباء: db.ref(path).set() للحفظ + db.ref(path).on() للمزامنة الحية.
    الطبقة المحلية: كل حفظ يُكتب أولاً في outbox (IndexedDB) ولا يُحذف منه إلا بعد تأكيد السحابة. */
 const Sync = {
-  COLLECTIONS: ['accounts','products','sales','purchases','suppliers','payments','customers'],
+  COLLECTIONS: ['accounts','products','sales','purchases','suppliers','payments','customers','bonuses'],
   _n: 0,
   _chain: Promise.resolve(),
   _timeout(label, ms) { return new Promise((_, rej) => setTimeout(() => rej(new Error('timeout:' + label)), ms)); },
@@ -347,7 +350,7 @@ const Sync = {
   /* RTDB لا يحفظ المصفوفات الفارغة ويحوّل بعضها لكائنات → إعادتها لشكلها الأصلي */
   hydrate(store, d) {
     if (!d || typeof d !== 'object') return d;
-      const keys = { products: ['barcodes', 'units', 'stockLog'], sales: ['items'], purchases: ['items'], settings: ['unitNames', 'companies', 'drHidden'] }[store] || [];
+      const keys = { products: ['barcodes', 'units', 'stockLog'], sales: ['items'], purchases: ['items', 'papers'], bonuses: ['meltedLog'], settings: ['unitNames', 'companies', 'drHidden'] }[store] || [];
     keys.forEach(k => {
       if (d[k] == null) d[k] = [];
       else if (!Array.isArray(d[k])) d[k] = Object.values(d[k]);
@@ -684,6 +687,7 @@ const NAV = [
   { type: 'returnsale',  label: 'إرجاع بيع',       icon: 'refresh' },
   { type: 'sales',       label: 'تقرير المبيعات',   icon: 'report' },
   { type: 'inventory',   label: 'المخزن',           icon: 'store' },
+  { type: 'bonus',       label: 'البونص',           icon: 'gift' },
   { type: 'purchase',    label: 'قائمة شراء',       icon: 'purchase' },
   { type: 'returnpurch', label: 'إرجاع شراء',       icon: 'refresh' },
   { type: 'preport',     label: 'تقرير المشتريات',  icon: 'history' },
@@ -718,13 +722,15 @@ function renderSideNav() {
   nav.innerHTML = '';
   const lowCount = state.products.filter(p => !p.deleted && (p.stockBase || 0) <= (state.settings.lowStock ?? 10)).length;
   const debtCount = state.customers.filter(c => !c.deleted && (c.debt || 0) > 0).length;
+  const bonusCount = (state.bonuses || []).filter(b => !b.deleted && !b.closedAt).length;
   NAV.forEach(n => {
         const item = h('div', { class: 'nav-item', dataset: { nav: n.type }, onclick: () => {
       if (n.type === 'pos') { const first = tabs.find(t => t.type === 'pos'); if (first) { activateTab(first.id); return; } } // تنقّل لأول نقطة بيع مفتوحة — التبويب الجديد حصرياً من زر +
       openTab(n.type);
     } },
       h('span', { html: icon(n.icon) }), n.label,
-      n.type === 'debts' && debtCount ? h('span', { class: 'nav-count' }, debtCount) : null);
+      n.type === 'debts' && debtCount ? h('span', { class: 'nav-count' }, debtCount) : null,
+      n.type === 'bonus' && bonusCount ? h('span', { class: 'nav-count g' }, bonusCount) : null);
     nav.append(item);
   });
   markActiveNav();
@@ -732,16 +738,17 @@ function renderSideNav() {
 function markActiveNav() {
   const act = tabs.find(t => t.id === activeTabId);
   $$('#side-nav .nav-item').forEach(el =>
-        el.classList.toggle('active', !!act && el.dataset.nav === act.type && ['pos','returnsale','sales','inventory','purchase','returnpurch','preport','suppliers','statement','settings','debts'].includes(act.type)));
+        el.classList.toggle('active', !!act && el.dataset.nav === act.type && ['pos','returnsale','sales','inventory','bonus','purchase','returnpurch','preport','suppliers','statement','settings','debts'].includes(act.type)));
 }
 
 /* ───────────────────────── 10) مدير التبويبات (نمط المتصفح) ───────────────────────── */
 let tabs = [], activeTabId = null, posCounter = 1;
-const LIVE_TABS = ['sales','inventory','preport','suppliers','statement','debts']; // تبويبات تقريرية تُحدَّث تلقائياً عند فتحها
+const LIVE_TABS = ['sales','inventory','bonus','preport','suppliers','statement','debts']; // تبويبات تقريرية تُحدَّث تلقائياً عند فتحها
 const TAB_META = {
   pos:       { title: () => `نقطة بيع ${'' + ''}`.trim() || 'نقطة بيع', icon: 'pos' },
   sales:     { title: () => 'تقرير المبيعات',  icon: 'report' },
   inventory: { title: () => 'المخزن',          icon: 'store' },
+  bonus:     { title: () => 'البونص',          icon: 'gift' },
   purchase:  { title: () => 'قائمة شراء',      icon: 'purchase' },
   preport:   { title: () => 'تقرير المشتريات', icon: 'history' },
   suppliers: { title: () => 'حسابات مجهزين',   icon: 'suppliers' },
@@ -758,7 +765,7 @@ const TAB_META = {
 };
 function openTab(type, props = {}) {
   // التبويبات الفريدة: واحد من كل نوع (عدا نقطة البيع والتعديلات والتفاصيل)
-    const singleton = ['sales','inventory','preport','suppliers','settings','purchase','scanner','returnsale','returnpurch','statement','debts'];
+    const singleton = ['sales','inventory','bonus','preport','suppliers','settings','purchase','scanner','returnsale','returnpurch','statement','debts'];
   if (singleton.includes(type)) {
     const ex = tabs.find(t => t.type === type);
     if (ex) { activateTab(ex.id); return ex; }
@@ -809,6 +816,7 @@ function renderTabContent(tab) {
     settings: renderSettings, product: renderProductForm, editsale: renderEditSale,
         editpurch: renderEditPurchase, details: renderProductDetails, scanner: renderScannerTab,
     returnsale: renderReturnSale, returnpurch: renderReturnPurchase, statement: renderStatement, debts: renderDebts,
+    bonus: renderBonus,
   };
   tab.el.innerHTML = '';
   (R[tab.type] || renderPOS)(tab);
@@ -1131,6 +1139,7 @@ function addToCart(tab, p) {
     st.cart.push(it); st.lastAdded = it;
   }
   st.renderCart(); st.renderTotals();
+  stockWarn(tab, p);
 }
 
 /* تنفيذ البيع */
@@ -1503,6 +1512,134 @@ function drawShift(body) {
 const QTY_KEYS = new Set(['Space']);
 let _lastAlt = 0;
 
+/* ═══ ① مسح الباركود تلقائياً: رقم خالص ٦ أرقام فأكثر بلا حروف، يختفي بعد ثانيتين من التوقف ═══ */
+function bcAutoClear(inp) {
+  if (!inp || inp.dataset.bcAuto === '1') return;
+  inp.dataset.bcAuto = '1';
+  let tm = 0;
+  const pure = () => /^[\d\u0660-\u0669]{6,}$/.test(String(inp.value || '').trim());
+  const kill = () => {
+    tm = 0;
+    if (!pure()) return;
+    inp.value = '';
+    const eng = inp.closest('.search-engine');
+    const sug = eng ? eng.querySelector('.suggestions') : null;
+    if (sug) { sug.classList.remove('show'); sug.innerHTML = ''; }
+  };
+  inp.addEventListener('input', () => {
+    clearTimeout(tm); tm = 0;
+    if (inp.getAttribute('inputmode') === 'decimal') return;          // وضع تعديل الكمية: لا يُمسّ
+    if (pure()) tm = setTimeout(kill, 2000);
+  });
+  inp.addEventListener('blur', () => { clearTimeout(tm); tm = 0; });
+}
+function armBarcodeEverywhere() {
+  [...document.querySelectorAll('.search-engine input')].forEach(bcAutoClear);
+}
+armBarcodeEverywhere();
+try { new MutationObserver(armBarcodeEverywhere).observe($('#content'), { childList: true, subtree: true }); } catch (e0) {}
+
+/* ═══ ② تنبيه قفزة سعر الشراء (٢٠٠٠ د.ع فأكثر فوق السعر المسجّل) ═══ */
+const PRICE_JUMP_WARN = 2000;
+function warnPriceJump(p, unitIdx, newPrice) {
+  if (!p || !(newPrice > 0)) return;
+  const old = Math.round(costPerUnit(p, unitIdx) * 100) / 100;
+  if (!(old > 0)) return;
+  const gap = Math.round((newPrice - old) * 100) / 100;
+  if (gap < PRICE_JUMP_WARN) return;
+  toast(`تنبيه: «${p.brandName}» سعر شرائه الجديد أعلى من سعره المسجّل بـ ${fmt(gap)} ${cur()} — راجِع السعر قبل الحفظ`, 'r');
+}
+
+/* ═══ ③ تنبيه المخزون لحظة الإدخال للسلة: آخر قطعة / نافذ / تجاوز بالسالب ═══ */
+function stockWarn(tab, p) {
+  const st = tab.state;
+  st._sw = st._sw || {};
+  const prod = findProd(p.id);
+  if (!prod) return;
+  const base = Math.round((prod.stockBase || 0) * 100) / 100;
+  let used = 0;
+  (st.cart || []).forEach(it => { if (it.productId === prod.id) used += it.qty * unitFactor(prod, it.unitIdx); });
+  used = Math.round(used * 100) / 100;
+  const lvl = base <= 0 ? 'zero' : (used > base ? 'over' : (used === base ? 'last' : 'ok'));
+  if (st._sw[prod.id] === lvl) return;
+  st._sw[prod.id] = lvl;
+  if (lvl === 'zero') toast(`تنبيه: «${prod.brandName}» نافذ من المخزن — إدخاله للسلة يجعل العدد بالسالب`, 'r');
+  else if (lvl === 'last') toast(`تنبيه: «${prod.brandName}» — هذه آخر قطعة في المخزن (${fmt(base)} ${smallUnitName(prod)})`, 'b');
+  else if (lvl === 'over') toast(`تنبيه: تجاوزت المتوفر في «${prod.brandName}» — العدد أصبح بالسالب`, 'r');
+}
+
+/* ═══ ④ الأسهم = تصفّح الصفحة أو التنقّل بين خلايا الجدول — لا تُغيّر رقماً ولا اختياراً ═══ */
+function dsScope() {
+  const mr = $('#modal-root');
+  if (mr && mr.children.length) return mr.lastElementChild || mr;
+  return $('.tab-pane.active') || $('#content') || document.body;
+}
+function dsScrollHost(el) {
+  let n = el || null;
+  while (n && n !== document.documentElement) {
+    const ov = getComputedStyle(n).overflowY;
+    if ((ov === 'auto' || ov === 'scroll') && n.scrollHeight > n.clientHeight + 2) return n;
+    n = n.parentElement;
+  }
+  return null;
+}
+function dsScroll(dir) {
+  const host = dsScrollHost(document.activeElement) || dsScrollHost(dsScope());
+  if (host) { host.scrollTop += dir * 110; return; }
+  const cand = [...dsScope().querySelectorAll('.tbl-scroll,.pos-center,.cart-wrap,.side-body,.page-body,.page,.modal-body')]
+    .find(x => x.scrollHeight > x.clientHeight + 2);
+  if (cand) { cand.scrollTop += dir * 110; return; }
+  window.scrollBy(0, dir * 110);
+}
+function dsTableRows(scope) {
+  const boxes = [...scope.querySelectorAll('.tbl-scroll')];
+  const pick = boxes.find(b => b.scrollHeight > b.clientHeight + 2 && b.querySelectorAll('tbody tr').length)
+    || boxes.find(b => b.querySelectorAll('tbody tr').length);
+  return pick ? [...pick.querySelectorAll('tbody tr')] : [];
+}
+function dsArrowNav(e) {
+  if (!state.session || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+  const ae = document.activeElement;
+  if (ae && ae.closest && (ae.closest('#calc-win') || ae.closest('.ds-stage'))) return;
+  if (ae && (ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
+  if (ae && ae.tagName === 'INPUT' && /month|date|time|week/.test(ae.type || '')) return;   // الإكسباير: يبقى يدوّر الأشهر
+  const scope = dsScope();
+  if ([...document.querySelectorAll('.suggestions.show')].some(s => s.contains(ae) || scope.contains(s))) return;   // المقترحات مفتوحة: الأسهم لها
+  const dir = e.key === 'ArrowDown' ? 1 : -1;
+  const cell = ae && ae.closest ? ae.closest('td') : null;
+  if (cell) {
+    const tr = cell.closest('tr');
+    const body = tr && tr.closest('table') && tr.closest('table').tBodies.length ? tr.closest('table').tBodies[0] : null;
+    if (body) {
+      e.preventDefault();
+      const rows = [...body.rows], col = [...tr.children].indexOf(cell);
+      const nxt = rows[rows.indexOf(tr) + dir];
+      const tc = nxt ? nxt.children[col] : null;
+      if (tc) {
+        const f = tc.matches('input,select,textarea,button') ? tc : tc.querySelector('input,select,textarea,button');
+        if (f) { f.focus(); if (f.tagName === 'INPUT' && f.select) f.select(); }
+        else tc.scrollIntoView({ block: 'nearest' });
+      } else dsScroll(dir);
+      return;
+    }
+  }
+  const rows = dsTableRows(scope);
+  if (rows.length) {
+    e.preventDefault();
+    let i = -1;
+    rows.forEach((r, k) => { if (r.classList.contains('ds-cur')) i = k; });
+    const j = i < 0 ? (dir === 1 ? 0 : rows.length - 1) : Math.max(0, Math.min(rows.length - 1, i + dir));
+    rows.forEach(r => r.classList.remove('ds-cur'));
+    rows[j].classList.add('ds-cur');
+    rows[j].scrollIntoView({ block: 'nearest' });
+    return;
+  }
+  e.preventDefault();
+  dsScroll(dir);
+}
+document.addEventListener('keydown', dsArrowNav, true);
+
 document.addEventListener('keydown', e => {
   if (!e.repeat && !e.ctrlKey && !e.metaKey && !$('#modal-root').children.length) {
     const pt = tabs.find(x => x.id === activeTabId);
@@ -1520,27 +1657,35 @@ document.addEventListener('keydown', e => {
       }
     }
   }
-  if (e.ctrlKey && (e.key === 's' || e.key === 'S')) {
+  if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 's' || e.key === 'S' || e.code === 'KeyS')) {
     e.preventDefault();
+    if ($('#modal-root').children.length) return;   // مودال مفتوح: لا حفظ تحته
     const t = tabs.find(x => x.id === activeTabId);
-    if (t && t.type === 'pos') checkout(t, 'cash');
+    if (!t) return;
+    if (t.type === 'pos') checkout(t, 'cash');
+    else if (t.type === 'purchase') savePurchaseModal(t);
+    else if (t.type === 'returnsale') finalizeReturnSale(t);
+    else if (t.type === 'returnpurch') saveReturnPurchaseModal(t);
+    else if (t.state && typeof t.state.runSave === 'function') t.state.runSave();
     return;
   }
   if (e.ctrlKey || e.altKey || e.metaKey) return;
   if ($('#modal-root').children.length) return; // مودال مفتوح
   if (e.key === '+') return; // زر الزائد مخصص للحاسبة — لا يُسرَّب إلى بحث نقطة البيع
   const t = tabs.find(x => x.id === activeTabId);
-    if (!t || !['pos','returnsale'].includes(t.type) || !t.state.searchInput) return;
+  if (!t) return;
+  const target = (t.state && t.state.searchInput) || (t.el ? t.el.querySelector('.search-engine input') : null);
+  if (!target) return;
   const ae = document.activeElement;
   if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT' || ae.isContentEditable)) return;
   if (e.key.length === 1) {
-    t.state.searchInput.focus();
-    t.state.searchInput.value += e.key;
-    t.state.searchInput.dispatchEvent(new Event('input'));
+    target.focus();
+    target.value += e.key;
+    target.dispatchEvent(new Event('input'));
     e.preventDefault();
-  } else if (e.key === 'Enter' && t.state.searchInput.value.trim()) {
-    t.state.searchInput.focus();
-    t.state.searchInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  } else if (e.key === 'Enter' && target.value.trim()) {
+    target.focus();
+    target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     e.preventDefault();
   }
 });
@@ -1911,7 +2056,13 @@ function renderProductForm(tab) {
     h('div', { class: 'f-field full' }, h('label', {}, 'التعبئة والوحدات ', h('span', { class: 'req' }, '*')), packBox),
     h('div', { class: 'f-field full' },
       h('label', {}, 'الأسعار ', h('span', { class: 'req' }, '*'), h('span', { class: 'f-hint' }, ' — صف لكل وحدة تعبئة: تُدخِل شراء الكبرى وبيع الصغرى فقط والباقي تلقائي')),
-      rowsBox),
+      rowsBox,
+      existing && existing.bonusPriceNote && num(existing.purchasePriceTop) === Math.round(num(existing.bonusPriceNote.meltedTop) * 100) / 100
+        ? h('div', { class: 'bnp-note', style: { marginTop: '9px' } },
+            `ملاحظة بونص: السعر الأصلي كان ${fmt(existing.bonusPriceNote.originalTop)} ${cur()} لكل ${existing.bonusPriceNote.topUnit || 'وحدة كبرى'} — وهذا السعر الحالي بعد إذابة ${fmt(existing.bonusPriceNote.meltedQtyBase)} ${existing.bonusPriceNote.smallUnit || 'وحدة صغرى'} من البونص في سعر الشراء (${fmtDate(existing.bonusPriceNote.at)}). العدد لم يتغيّر، والفرق ربح محفوظ في كل بيع قادم.`,
+            h('button', { class: 'mini-btn blue', style: { flex: 'none', marginTop: '8px', padding: '6px 13px' },
+              onclick: () => Bonus.openFor(existing.id) }, h('span', { html: icon('gift') }), 'دفتر البونص'))
+        : null),
   );
 
   page.append(grid, h('div', { style: { display: 'flex', gap: '10px', marginTop: '6px', paddingBottom: '14px' } },
@@ -2001,6 +2152,7 @@ function renderProductForm(tab) {
   }
   tab.el.append(page);
     drawPack(); drawStockUnit(); prefillStock(); drawBarcodes(); drawPricePreview();
+  tab.state.runSave = saveIt;
   setTimeout(() => nameInp.focus(), 80);
 }
 
@@ -2015,7 +2167,7 @@ function renderPurchase(tab) {
   /* رأس القائمة: المذخر + رقم القائمة */
   const supSel = h('select', {}, h('option', { value: '' }, '— اختر المذخر —'),
     state.suppliers.filter(s => !s.deleted).map(s => h('option', { value: s.id, selected: st.supplierId === s.id }, s.name)));
-  supSel.addEventListener('change', () => st.supplierId = supSel.value || null);
+  supSel.addEventListener('change', () => { st.supplierId = supSel.value || null; drawBalances(); });
   const listNum = h('input', { value: st.listNum || (state.purchases.length + 1), type: 'number', min: 1, style: { width: '110px' } });
   listNum.addEventListener('change', () => st.listNum = num(listNum.value));
   center.append(h('div', { class: 'filter-bar' },
@@ -2096,7 +2248,8 @@ function renderPurchase(tab) {
         h('td', {}, (() => {
           const pr = h('input', { type: 'number', value: it.buyPrice, min: 0, step: 'any', style: { ...boxCss, width: '90px' } });
           const apply = () => { it.buyPrice = num(pr.value); live(); };
-          pr.addEventListener('input', apply); pr.addEventListener('change', apply);
+          pr.addEventListener('input', apply);
+          pr.addEventListener('change', () => { apply(); if (p) warnPriceJump(p, it.unitIdx, it.buyPrice); });
           return pr;
         })()),
         h('td', {}, (() => {
@@ -2125,19 +2278,33 @@ function renderPurchase(tab) {
 
   /* التذييل */
   const totalEl = h('div', { class: 'tval' }, h('span', {}, '0'), ' ', h('small', {}, cur()));
+  const prevBalEl = h('div', { class: 'tval' }, h('span', {}, '0'), ' ', h('small', {}, cur()));
+  const grandBalEl = h('div', { class: 'tval' }, h('span', {}, '0'), ' ', h('small', {}, cur()));
+  const prevBalCard = h('div', { class: 'total-card', hidden: true }, h('label', {}, 'الرصيد السابق للمذخر'), prevBalEl);
+  const grandBalCard = h('div', { class: 'total-card grand red-grand', hidden: true }, h('label', {}, 'الرصيد الكلي (السابق + القائمة)'), grandBalEl);
   const discInp = h('input', { type: 'number', min: 0, placeholder: '0', value: st.discount || '' });
   discInp.addEventListener('input', () => { st.discount = num(discInp.value); drawTotals(); });
   st.drawTotals = drawTotals;
+  function listNet() { return Math.max(0, st.items.reduce((s, it) => s + it.buyPrice * it.qty, 0) - st.discount); }
+  function drawBalances() {
+    const sup = st.supplierId ? findSup(st.supplierId) : null;
+    if (!sup) { prevBalCard.hidden = true; grandBalCard.hidden = true; return; }
+    prevBalCard.hidden = false; grandBalCard.hidden = false;
+    animNum(prevBalEl.firstChild, sup.debt || 0);
+    animNum(grandBalEl.firstChild, (sup.debt || 0) + listNet());
+  }
   function drawTotals() {
-    const t = st.items.reduce((s, it) => s + it.buyPrice * it.qty, 0);
-    animNum(totalEl.firstChild, Math.max(0, t - st.discount));
+    animNum(totalEl.firstChild, listNet());
+    drawBalances();
   }
   const footer = h('div', { class: 'pos-footer' },
     h('div', { class: 'totals-row' },
       h('div', { class: 'total-card' }, h('label', {}, 'خصم القائمة'), h('div', { class: 'discount-wrap' }, discInp)),
-      h('div', { class: 'total-card grand' }, h('label', {}, 'إجمالي قائمة الشراء'), totalEl)),
+      prevBalCard,
+      h('div', { class: 'total-card grand' }, h('label', {}, 'إجمالي قائمة الشراء'), totalEl),
+      grandBalCard),
     h('div', { class: 'pay-row' },
-      h('button', { class: 'pay-btn cash', onclick: () => savePurchaseModal(tab) }, h('span', { html: icon('check') }), 'حفظ قائمة الشراء')));
+      h('button', { class: 'pay-btn cash', onclick: () => savePurchaseModal(tab) }, h('span', { html: icon('check') }), 'حفظ قائمة الشراء ', h('kbd', {}, 'Ctrl+S'))));
 
   center.append(cartWrap);
   /* الجانب: قوائم الشراء السابقة */
@@ -2167,10 +2334,22 @@ function addPurchaseItem(tab, p, qty = 1, opts = {}) {
   qty = num(qty) > 0 ? num(qty) : 1;
   const price = parsePrice(opts.price);
   const ex = st.items.find(it => it.productId === p.id && it.unitIdx === 0);
-  if (ex) { ex.qty += qty; if (price) ex.buyPrice = price; if (opts.expiry) ex.expiry = opts.expiry; }
-  else st.items.push({ productId: p.id, name: p.brandName, unitIdx: 0, qty,
-    buyPrice: price || costPerUnit(p, 0) || 0,
-    expiry: opts.expiry || p.expiry || '' });
+  if (ex) {
+    /* ★ متوسط مرجّح داخل نفس القائمة: لكل عددٍ وزنُه — السعر القديم لا يُمحى بكتابة جديدة */
+    const q1 = Math.max(0, num(ex.qty) || 0), p1 = Math.max(0, num(ex.buyPrice) || 0);
+    ex.qty = q1 + qty;
+    if (price > 0) {
+      ex.buyPrice = p1 > 0 ? Math.round((p1 * q1 + price * qty) / Math.max(1e-6, q1 + qty) * 100) / 100 : price;
+      warnPriceJump(p, ex.unitIdx, price);
+    }
+    if (opts.expiry) ex.expiry = opts.expiry;
+  }
+  else {
+    st.items.push({ productId: p.id, name: p.brandName, unitIdx: 0, qty,
+      buyPrice: price || costPerUnit(p, 0) || 0,
+      expiry: opts.expiry || p.expiry || '' });
+    if (price > 0) warnPriceJump(p, 0, price);
+  }
   if (st.renderItems) st.renderItems();
   if (st.drawTotals) st.drawTotals();
   if (!opts.silent) toast(`أُضيف «${p.brandName}» للقائمة`, 'b');
@@ -2208,7 +2387,7 @@ async function finalizePurchase(tab, pay, discount) {
   if (pay === 'credit') sup.debt = (sup.debt || 0) + total;
   sup.lastPurchase = { amount: total, ts };
   const pu = {
-    id: uid(), type: 'purchase', version: 1, versions: [],
+    id: uid(), type: 'purchase', version: 1, versions: [], papers: [],
     supplierId: sup.id, supplierName: sup.name, listNum: st.listNum || (state.purchases.length + 1),
     items, discount, total, pay, debtAfter: sup.debt || 0,
     employeeId: acc.id, employeeName: acc.name,
@@ -2216,16 +2395,29 @@ async function finalizePurchase(tab, pay, discount) {
   };
   await save('purchases', pu);
   await save('suppliers', sup);
-  for (const it of items) {  // رفع المخزون + تحديث سعر الشراء والإكسباير
+  for (const it of items) {  // ★ زيادة العدد + متوسط التكلفة المرجَّح فقط — لا لمس لاسم الصنف ولا جرعته ولا شكله
     const p = findProd(it.productId);
-    if (p) {
-      p.stockBase = (p.stockBase || 0) + it.qtyBase;
-      if (it.unitIdx === 0 && it.buyPrice) p.purchasePriceTop = it.buyPrice;
-      if (it.expiry) p.expiry = it.expiry;
-      await save('products', p);
-    }
+    if (!p) continue;
+    const bf = baseFactor(p) || 1;
+    const oldBase = Math.max(0, +p.stockBase || 0), oldTop = +p.purchasePriceTop || 0;
+    const inBase = Math.max(0, +it.qtyBase || 0);
+    const inTop = it.buyPrice > 0 ? Math.round(it.buyPrice * bf / (unitFactor(p, it.unitIdx) || bf) * 100) / 100 : 0;
+    p.stockBase = Math.round((oldBase + inBase) * 100) / 100;
+    if (inTop > 0) p.purchasePriceTop = (oldBase > 0 && oldTop > 0)
+      ? Math.round((oldBase * oldTop + inBase * inTop) / Math.max(1e-6, oldBase + inBase) * 100) / 100
+      : inTop;
+    if (it.expiry) p.expiry = it.expiry;
+    await save('products', p);
   }
-  st.items = []; st.discount = 0; st.listNum = null; st.supplierId = null;
+  /* ★ النسخة الورقية: صورة القائمة المصوَّرة تُلصق بالنسخة الإلكترونية وتُرفع للسحابة */
+  for (const pp of (Array.isArray(st.papers) ? st.papers : [])) {
+    const doc = await Paper.attach(pu, pp.dataUrl, 'scanner');
+    if (doc) pu.papers.push(doc.id);
+  }
+  if (pu.papers.length) await save('purchases', pu);
+  /* ★ بونصات الورقة: أُضيفت بقرار المستخدم لحظة الاستيراد — تُنشأ الآن بعد أن صار للقائمة رقم ومعرّف */
+  if (Array.isArray(st.bonusLots) && st.bonusLots.length) await Bonus.createFromPurchase(pu, st.bonusLots);
+  st.items = []; st.discount = 0; st.listNum = null; st.supplierId = null; st.papers = []; st.bonusLots = [];
   renderTabContent(tab);
   renderSideNav();
   toast(`حُفظت قائمة الشراء — ${fmt(total)} ${cur()} ${pay === 'credit' ? '(دين متراكم)' : '(كاش)'}`);
@@ -2260,13 +2452,19 @@ function renderSalesReport(tab) {
 
   const searchBtn = h('button', { class: 'btn g', style: { flex: 'none' }, onclick: () => draw() },
     h('span', { html: icon('search') }), 'بحث / تحديث');
+  const detailBtn = h('button', { class: 'mini-btn blue', style: { flex: 'none' }, onclick: () => {
+    st.detail = !st.detail;
+    detailBtn.textContent = st.detail ? 'رجوع إلى القوائم' : 'مفصل';
+    draw();
+  } });
+  detailBtn.textContent = st.detail ? 'رجوع إلى القوائم' : 'مفصل';
   const quick = (label, from, to) => h('button', { class: 'mini-btn blue', style: { flex: 'none' },
     onclick: () => { st.f.from = from; st.f.to = to; fromI.value = from; toI.value = to; draw(); } }, label);
 
   page.append(h('div', { class: 'page-head' },
     h('div', { class: 'page-title' }, h('span', { html: icon('report') }), 'تقرير المبيعات'),
     h('div', { class: 'spacer' }),
-    applied, searchBtn,
+    applied, searchBtn, detailBtn,
     quick('اليوم', dateStr(), dateStr()),
     quick('آخر 30 يوم', dateStr(Date.now() - 30 * 864e5), dateStr()),
         h('button', { class: 'mini-btn blue', style: { flex: 'none' }, onclick: () => { [st.f.from, st.f.to] = monthRange(); fromI.value = st.f.from; toI.value = st.f.to; draw(); } }, 'الشهر الحالي'),
@@ -2306,26 +2504,62 @@ function renderSalesReport(tab) {
   function draw() {
     const rows = filtered();
     bodyBox.innerHTML = '';
-    const thead = h('tr', {}, COLS.map(([k, label]) =>
+    const headRow = cols => h('tr', {}, cols.map(([k, label]) =>
       h('th', { class: k ? 'sortable' : '', onclick: k ? () => { if (st.f.sortKey === k) st.f.sortDir *= -1; else { st.f.sortKey = k; st.f.sortDir = -1; } draw(); } : null },
         label, st.f.sortKey === k ? h('span', { class: 'sort-arw' }, st.f.sortDir === -1 ? ' ▼' : ' ▲') : null)));
-    const tbody = h('tbody');
-    rows.forEach(s => tbody.append(h('tr', {},
-      h('td', {}, h('span', { class: 'badge ' + (s.type === 'sale' ? 'g' : 'r') }, s.type === 'sale' ? 'بيع' : 'استرجاع'),
-        s.version > 1 ? h('span', { class: 'badge n', title: 'عدد التعديلات' }, `ع${s.version}`) : null),
-      h('td', {}, s.employeeName), h('td', {}, s.customerName || 'زبون نقدي'),
-      h('td', { class: 'mono' }, fmtDate(s.ts)), h('td', { class: 'mono' }, fmtTime(s.ts)),
-      h('td', {}, h('span', { class: 'badge ' + (s.pay === 'cash' ? 'g' : s.pay === 'electronic' ? 'b' : 'r') },
-        s.pay === 'cash' ? 'كاش' : s.pay === 'electronic' ? 'إلكتروني' : 'آجل')),
-      h('td', { class: 'td-num td-cost' }, fmt(s.cost)),
-      h('td', { class: 'td-num td-sale' }, fmt(s.subtotal)),
-      h('td', { class: 'td-num', style: { color: s.profit >= 0 ? 'var(--green)' : 'var(--red)' } }, fmt(s.profit)),
-      h('td', { class: 'td-num', style: { color: 'var(--red)' } }, fmt(s.discount)),
-      h('td', { class: 'td-num td-total', style: { fontSize: '16px' } }, fmt(s.net)),
-      h('td', {}, h('button', { class: 'icon-btn edit', title: 'تعديل القائمة', html: icon('edit'), onclick: () => openTab('editsale', { saleId: s.id }) })),
-    )));
-    bodyBox.append(h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl' }, h('thead', {}, thead), tbody)));
-    if (!rows.length) bodyBox.append(h('div', { class: 'empty-note' }, 'لا نتائج ضمن الفلاتر المحددة'));
+    if (st.detail) {
+      /* ★ مفصل: كل منتج صفٌّ خاص به، وأصناف نفس القائمة بتعبئة متناوبة تُميّز القائمة فوراً */
+      const DCOLS = [[null, 'التاريخ'], [null, 'الوقت'], [null, 'الزبون'], [null, 'الموظف'], [null, 'نوع العملية'],
+        [null, 'الصنف'], [null, 'الوحدة'], [null, 'العدد'], [null, 'سعر الوحدة'], [null, 'المجموع'], [null, 'التكلفة'], [null, 'الربح']];
+      const db = h('tbody');
+      let gi = -1, lastId = null;
+      rows.forEach(s => {
+        if (s.id !== lastId) { lastId = s.id; gi += 1; }
+        const cls = 'sr-' + ['a', 'b', 'c', 'd'][gi % 4];
+        const sign = s.type === 'sale' ? 1 : -1;
+        const q = num(it0 => 0, 0);
+        (s.items || []).forEach(it => {
+          const qty = Math.abs(num(it.qty) || 0) * sign;
+          const sale = num(it.sale) || 0, cost = num(it.cost) || 0;
+          const tot = it.total != null ? num(it.total) : sale * (num(it.qty) || 0);
+          db.append(h('tr', { class: cls },
+            h('td', { class: 'mono' }, fmtDate(s.ts)),
+            h('td', { class: 'mono' }, fmtTime(s.ts)),
+            h('td', {}, s.customerName || 'زبون نقدي'),
+            h('td', {}, s.employeeName),
+            h('td', {}, h('span', { class: 'badge ' + (s.type === 'sale' ? 'g' : 'r') }, s.type === 'sale' ? 'بيع' : 'استرجاع')),
+            h('td', { class: 'td-name' }, it.name),
+            h('td', {}, it.unitName || ''),
+            h('td', { class: 'td-num' }, fmt(qty)),
+            h('td', { class: 'td-num' }, fmt(sale)),
+            h('td', { class: 'td-num td-total' }, fmt(sign * Math.abs(tot))),
+            h('td', { class: 'td-num td-cost' }, fmt(sign * Math.abs(cost) * Math.abs(num(it.qty) || 0))),
+            h('td', { class: 'td-num', style: { color: (tot - cost * (num(it.qty) || 0)) >= 0 ? 'var(--green)' : 'var(--red)' } },
+              fmt(sign * (Math.abs(tot) - Math.abs(cost) * Math.abs(num(it.qty) || 0))))));
+        });
+      });
+      bodyBox.append(h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl det-tbl' }, h('thead', {}, headRow(DCOLS)), db)));
+      if (!db.children.length) bodyBox.append(h('div', { class: 'empty-note' }, 'لا أصناف ضمن الفلاتر المحددة'));
+    } else {
+      const thead = headRow(COLS);
+      const tbody = h('tbody');
+      rows.forEach(s => tbody.append(h('tr', {},
+        h('td', {}, h('span', { class: 'badge ' + (s.type === 'sale' ? 'g' : 'r') }, s.type === 'sale' ? 'بيع' : 'استرجاع'),
+          s.version > 1 ? h('span', { class: 'badge n', title: 'عدد التعديلات' }, `ع${s.version}`) : null),
+        h('td', {}, s.employeeName), h('td', {}, s.customerName || 'زبون نقدي'),
+        h('td', { class: 'mono' }, fmtDate(s.ts)), h('td', { class: 'mono' }, fmtTime(s.ts)),
+        h('td', {}, h('span', { class: 'badge ' + (s.pay === 'cash' ? 'g' : s.pay === 'electronic' ? 'b' : 'r') },
+          s.pay === 'cash' ? 'كاش' : s.pay === 'electronic' ? 'إلكتروني' : 'آجل')),
+        h('td', { class: 'td-num td-cost' }, fmt(s.cost)),
+        h('td', { class: 'td-num td-sale' }, fmt(s.subtotal)),
+        h('td', { class: 'td-num', style: { color: s.profit >= 0 ? 'var(--green)' : 'var(--red)' } }, fmt(s.profit)),
+        h('td', { class: 'td-num', style: { color: 'var(--red)' } }, fmt(s.discount)),
+        h('td', { class: 'td-num td-total', style: { fontSize: '16px' } }, fmt(s.net)),
+        h('td', {}, h('button', { class: 'icon-btn edit', title: 'تعديل القائمة', html: icon('edit'), onclick: () => openTab('editsale', { saleId: s.id }) })),
+      )));
+      bodyBox.append(h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl' }, h('thead', {}, thead), tbody)));
+      if (!rows.length) bodyBox.append(h('div', { class: 'empty-note' }, 'لا نتائج ضمن الفلاتر المحددة'));
+    }
 
     applied.className = 'badge g';
     applied.textContent = `مطبَّق — ${rows.length} سجل`;
@@ -2451,11 +2685,12 @@ function renderEditSale(tab) {
       h('div', { class: 'f-group' }, h('label', {}, 'الصافي بعد التعديل'), netEl)));
   if (isLatest) {
     center.append(h('div', { style: { display: 'flex', gap: '10px', marginTop: '12px' } },
-      h('button', { class: 'btn g big', onclick: saveEdit }, h('span', { html: icon('check') }), 'حفظ التعديل (نسخة جديدة)'),
+      h('button', { class: 'btn g big', onclick: saveEdit }, h('span', { html: icon('check') }), 'حفظ التعديل (نسخة جديدة) '),
       sale.type === 'sale' ? h('button', { class: 'btn r', onclick: makeReturn }, h('span', { html: icon('refresh') }), 'استرجاع القائمة كاملة') : null));
   }
   page.append(center);
   tab.el.append(page);
+  st.runSave = saveEdit;
   drawItems(); drawTotals();
 
   async function saveEdit() {
@@ -2600,6 +2835,9 @@ function renderEditPurchase(tab) {
   page.append(h('div', { class: 'page-head' },
     h('div', { class: 'page-title' }, h('span', { html: icon(readonly ? 'eye' : 'edit') }), `${readonly ? 'عرض' : 'تعديل'} قائمة شراء رقم ${pu.listNum} — ${pu.supplierName}`),
     h('div', { class: 'spacer' }),
+    h('button', { class: 'mini-btn blue', style: { flex: 'none', padding: '8px 15px' }, title: 'صورة القائمة الورقية الأصلية',
+      onclick: () => Paper.viewer(pu) }, h('span', { html: icon('paper') }), 'النسخة الورقية',
+      (pu.papers && pu.papers.length) ? h('b', {}, ` (${pu.papers.length})`) : null),
     h('div', { class: 'ver-pills' }, h('span', { class: 'ver-note' }, 'النسخة:'),
       ...Array.from({ length: pu.version }, (_, i) => i + 1).map(v =>
         h('button', { class: 'ver-pill' + (v === st.viewVer ? ' cur' : ''), onclick: () => { st.viewVer = v; st.savedFor = null; renderTabContent(tab); } }, v)))));
@@ -2649,6 +2887,7 @@ function renderEditPurchase(tab) {
       pu.type === 'purchase' ? h('button', { class: 'btn r', onclick: makeReturn }, h('span', { html: icon('refresh') }), 'استرجاع للمذخر') : null));
   }
   tab.el.append(page);
+  st.runSave = saveEdit;
   drawItems(); drawT();
   async function saveEdit() {
     if (!st.editItems.length) return toast('لا يمكن حفظ قائمة فارغة', 'r');
@@ -2778,6 +3017,585 @@ function renderInventory(tab) {
   tab.el.append(page);
 }
 
+/* ───────────────────────── 20-د) البونص: هدايا المجهزين وإذابتها في سعر الشراء ─────────────────────────
+   دفتر واحد = عرض واحد (مادة + عدد شراء + عدد مجاني). كل الأرقام تُشتق لحظة العرض من حركة المخزون الحقيقية:
+   التذويب يغيّر سعر الشراء فقط ولا يلمس العدد، والعدد لا يُزاد إلا مرة واحدة عند إنشاء الدفتر. */
+const BONUS_KINDS = { opening: 'رصيد افتتاحي', adjust: 'تعديل عدد', rename: 'تغيير اسم',
+  bonus: 'بونص (هدية)', bonus_buy: 'عدد شراء البونص', bonus_melt: 'إذابة بونص في السعر', bonus_cancel: 'حذف بونص' };
+const Bonus = (() => {
+  const r2 = v => Math.round((+v || 0) * 100) / 100;
+  const gcd = (a, b) => (b ? gcd(Math.abs(b), Math.abs(a) % Math.abs(b)) : Math.abs(a) || 1);
+  const MAXQ = 1e7;
+  const idxOf = (p, i) => Math.max(0, Math.min((p.units || []).length - 1, +i || 0));
+  const prod0 = id => state.products.find(p => p.id === id) || null;
+  const prod = b => prod0(b.productId);
+
+  /* كل ما نزل من المخزون منذ إنشاء البونص: المبيعات صافيةً من المرتجعات + تخفيضات العدد اليدوية */
+  function outBase(productId, sinceTs) {
+    let out = 0;
+    state.sales.forEach(s => {
+      if (s.deleted || !(s.ts >= sinceTs)) return;
+      (s.items || []).forEach(it => {
+        if (it.productId !== productId) return;
+        const q = +it.qtyBase || 0;
+        out += s.type === 'sale' ? q : -q;
+      });
+    });
+    const p = prod0(productId);
+    ((p && p.stockLog) || []).forEach(g => {
+      const d = +g.delta || 0;
+      if ((g.ts || 0) >= sinceTs && d < 0 && !/^bonus/.test(String(g.kind || ''))) out -= d;
+    });
+    return Math.max(0, out);
+  }
+
+  function stats(b) {
+    const p = prod(b);
+    const bf = p ? (baseFactor(p) || 1) : (b.factor || 1);
+    const bonusBase = r2(+b.bonusQtyBase || 0);
+    const stockBase = p ? r2(+p.stockBase || 0) : 0;
+    const costNow = p ? r2((+p.purchasePriceTop || 0) / bf) : r2(+b.buyPriceBase || 0);
+    const saleNow = p ? r2(+p.salePriceBase || 0) : 0;
+    const used = r2(Math.max(0, Math.min(bonusBase, outBase(b.productId, b.createdAt || 0) - r2(b.stockAtCreation || 0))));
+    const remaining = r2(Math.max(0, Math.min(bonusBase - used, stockBase)));
+    const melted = r2(Math.min(+b.meltedQtyBase || 0, bonusBase));
+    const pureUsed = r2(Math.max(0, Math.min(used, bonusBase - melted)));
+    const realized = r2(pureUsed * saleNow);
+    const pending = r2(Math.max(0, Math.min(bonusBase - melted - pureUsed, remaining)));
+    const expected = r2(pending * Math.max(0, saleNow));
+    return { p, bf, bonusBase, stockBase, costNow, saleNow, used, remaining, melted, pureUsed, pending,
+      realized, expected, net: r2(realized + expected), savedCost: r2(bonusBase * r2(+b.buyPriceBase || 0)),
+      freeCost: r2(remaining * r2(+b.buyPriceBase || 0)), meltValue: r2(melted * r2(+b.buyPriceBase || 0)),
+      empty: bonusBase > 0 && remaining <= 0 };
+  }
+
+  /* المذاب لا يتجاوز الحرّ غير المذاب، ولا ما هو موجود فعلاً على الرف */
+  function meltCap(b) { const s = stats(b); return r2(Math.max(0, Math.min(s.bonusBase - s.melted, s.stockBase))); }
+
+  /* سعر القطعة = (عدد الشراء × سعره) ÷ (عدد الشراء + المذاب) */
+  function costAfter(b, meltBase) {
+    const bb = r2(+b.buyQtyBase || 0), price = r2(+b.buyPriceBase || 0);
+    if (!bb || !price) return price;
+    return Math.round(bb * price / Math.max(1e-4, bb + Math.max(0, +meltBase || 0)) * 100) / 100;
+  }
+
+  function ratioText(o) {
+    const g = gcd(Math.round(+o.buyQty || 0), Math.round(+o.bonusQty || 0)) || 1;
+    return `اشتري ${r2((+o.buyQty || 0) / g)} واحصل على ${r2((+o.bonusQty || 0) / g)}`;
+  }
+  const pctText = o => (+o.buyQty ? Math.round((+o.bonusQty || 0) / (+o.buyQty || 0) * 1000) / 10 : 0);
+
+  /* النفاد الكامل ينقل الدفتر إلى «السابقة» مؤرَّخاً، وعودة المخزون (مرتجع) تعيده إلى «الجارية» */
+  async function settle() {
+    for (const b of state.bonuses.filter(x => !x.deleted)) {
+      const empty = stats(b).empty;
+      if (empty && !b.closedAt) { b.closedAt = Date.now(); await save('bonuses', b); }
+      else if (!empty && b.closedAt) { delete b.closedAt; await save('bonuses', b); }
+    }
+  }
+
+  async function applyMelt(b, qtyBase, note) {
+    const p = prod(b);
+    if (!p) { toast('المادة غير موجودة في المخزن', 'r'); return false; }
+    const cap = meltCap(b);
+    const q = r2(Math.min(+qtyBase || 0, cap));
+    if (q <= 0) { toast('لا توجد كمية بونص صالحة للتذويب', 'r'); return false; }
+    const bf = baseFactor(p) || 1;
+    const totalMelt = r2((+b.meltedQtyBase || 0) + q);
+    b.meltedQtyBase = totalMelt;
+    const baseBefore = r2((+p.purchasePriceTop || 0) / bf);
+    const baseAfter = costAfter(b, totalMelt);
+    const topBefore = r2(+p.purchasePriceTop || 0);
+    const topAfter = Math.max(0, r2(baseAfter * bf));
+    const first = !(Array.isArray(b.meltedLog) && b.meltedLog.length);
+    const origTop = first ? topBefore : r2((p.bonusPriceNote && p.bonusPriceNote.originalTop) || topBefore);
+    const acc = me() || { id: null, name: '—' };
+    p.purchasePriceTop = topAfter;
+    p.bonusPriceNote = { bonusId: b.id, originalTop: origTop, originalBase: r2(origTop / bf), meltedTop: topAfter,
+      meltedBase: baseAfter, meltedQtyBase: totalMelt, at: Date.now(), topUnit: bigUnitName(p), smallUnit: smallUnitName(p) };
+    b.meltedLog = Array.isArray(b.meltedLog) ? b.meltedLog : [];
+    b.meltedLog.push({ ts: Date.now(), qtyBase: q, baseBefore, baseAfter, topBefore, topAfter,
+      empId: acc.id, empName: acc.name, note: String(note || '').slice(0, 300) });
+    p.stockLog = Array.isArray(p.stockLog) ? p.stockLog : [];
+    p.stockLog.push({ ts: Date.now(), kind: 'bonus_melt', delta: 0,
+      note: `إذابة ${fmt(q)} ${smallUnitName(p)} من البونص في سعر الشراء — ${fmt(baseBefore)} ← ${fmt(baseAfter)}`,
+      empId: acc.id, empName: acc.name });
+    await save('bonuses', b);
+    await save('products', p);
+    toast(`أُذابت ${fmt(q)} ${smallUnitName(p)} — صار شراء القطعة ${fmt(baseAfter)} ${cur()}`);
+    return true;
+  }
+
+  /* ★ بونصات مكتشفة في قائمة شراء مصوَّرة: تُنشأ تلقائياً بعد حفظ القائمة بلا أي إدخال يدوي.
+     عدد الشراء لا يُزاد (القائمة زوّدتة) — يُزاد عدد البونص فقط، ويكون stockAtCreation بعد الشراء مباشرةً. */
+  async function createFromPurchase(pu, lots) {
+    const acc = me() || { id: null, name: '—' };
+    const made = [];
+    for (const L of (Array.isArray(lots) ? lots : [])) {
+      const p = prod0(L && L.productId);
+      if (!p) continue;
+      const ui = idxOf(p, L.unitIdx);
+      const f = unitFactor(p, ui) || 1;
+      const buyQty = r2(+L.buyQty || 0), bonusQty = r2(+L.bonusQty || 0), price = r2(+L.buyPrice || 0);
+      if (!(buyQty > 0) || !(bonusQty > 0) || buyQty > MAXQ || bonusQty > MAXQ) continue;
+      const line = (pu.items || []).find(it => it.productId === p.id) || {};
+      const b = { id: uid(), productId: p.id, productName: p.brandName, company: p.company || '',
+        form: p.form || '', dose: p.dose || '', unitIdx: ui, unitName: p.units[ui].name, factor: f,
+        buyQty, bonusQty, buyPrice: price, buyPriceBase: r2(price / f),
+        buyQtyBase: r2(buyQty * f), bonusQtyBase: r2(bonusQty * f), meltedQtyBase: 0, meltedLog: [],
+        stockAtCreation: r2(+p.stockBase || 0), supplierId: pu.supplierId || null,
+        supplierName: pu.supplierName || '', purchaseId: pu.id, listNum: pu.listNum || '',
+        addBuyToStock: false, expiry: line.expiry || p.expiry || '',
+        note: String(L.note || `بونص مقروء من قائمة ورقية`).slice(0, 300),
+        createdAt: Date.now(), createdBy: acc.id, createdByName: acc.name, deviceId: DEVICE_ID };
+      p.stockLog = Array.isArray(p.stockLog) ? p.stockLog : [];
+      p.stockBase = r2((+p.stockBase || 0) + b.bonusQtyBase);
+      p.stockLog.push({ ts: Date.now(), kind: 'bonus', delta: b.bonusQtyBase,
+        note: `بونص ${fmt(b.bonusQty)} ${b.unitName} على شراء ${fmt(b.buyQty)} — قائمة ${b.listNum || '—'} (${b.supplierName || 'مذخر غير محدد'})`,
+        empId: acc.id, empName: acc.name });
+      await save('bonuses', b);
+      await save('products', p);
+      made.push(b);
+    }
+    if (made.length) toast(`أُضيفت ${made.length} بونصات إلى دفتر البونص تلقائياً`, 'g');
+    return made;
+  }
+
+  function openMelt(b) {
+    const p = prod(b);
+    if (!p) return toast('المادة غير موجودة في المخزن', 'r');
+    const cap = meltCap(b);
+    if (cap <= 0) return toast('لا كمية بونص غير مذابة — أُذيب كامل البونص أو نفد من الرف', 'r');
+    const s = stats(b);
+    const unitSel = h('select', {}, p.units.map((u, i) => h('option', { value: i }, u.name)));
+    const qtyI = h('input', { type: 'number', min: 0, step: 'any', placeholder: `الحد الأقصى ${fmt(r2(cap / (unitFactor(p, 0) || 1)))} ${p.units[0].name}` });
+    const noteI = h('input', { placeholder: 'سبب التذويب (اختياري)' });
+    const prev = h('div', { class: 'stat-cards', style: { marginTop: '4px' } });
+    const hint = h('div', { class: 'bn-tip' }, 'العدد في المخزون لا يتغيّر بالتذويب — يتغيّر سعر الشراء فقط، فيرتفع الربح في كل عملية بيع قادم.');
+    const eff = () => {
+      const ui = idxOf(p, unitSel.value);
+      const f = unitFactor(p, ui) || 1;
+      return { ui, f, q: r2(Math.min((num(qtyI.value) || 0) * f, cap)) };
+    };
+    const drawPrev = () => {
+      const e = eff(), bf = baseFactor(p) || 1;
+      const totalMelt = r2((+b.meltedQtyBase || 0) + e.q);
+      const after = costAfter(b, totalMelt);
+      prev.innerHTML = '';
+      prev.append(
+        h('div', { class: 'sum-card n' }, h('label', {}, 'شراء القطعة الآن'), h('b', {}, `${fmt(r2((+p.purchasePriceTop || 0) / bf))} ${cur()}`)),
+        h('div', { class: 'sum-card b' }, h('label', {}, `المذاب (${p.units[e.ui].name})`), h('b', {}, fmt(r2(e.q / e.f)))),
+        h('div', { class: 'sum-card g' }, h('label', {}, 'شراء القطعة بعد التذويب'), h('b', {}, `${fmt(after)} ${cur()}`)),
+        h('div', { class: 'sum-card a' }, h('label', {}, 'إجمالي المذاب من البونص'), h('b', {}, `${fmt(totalMelt)} ${smallUnitName(p)}`)));
+    };
+    unitSel.addEventListener('change', drawPrev);
+    qtyI.addEventListener('input', drawPrev);
+    drawPrev();
+    openModal({
+      title: `إذابة بونص — ${p.brandName}`, icon: 'gift', wide: true,
+      body: h('div', { class: 'form-grid' },
+        h('div', { class: 'f-field full' }, h('div', { class: 'bn-sum' },
+          h('span', {}, ratioText(b)), h('span', {}, `${pctText(b)}% مجاناً`),
+          h('span', {}, `المتبقي الحر ${fmt(s.remaining)} ${smallUnitName(p)}`),
+          h('span', {}, `قيمة البونص ${fmt(s.savedCost)} ${cur()}`))),
+        h('div', { class: 'f-field' }, h('label', {}, 'وحدة الإدخال'), unitSel),
+        h('div', { class: 'f-field' }, h('label', {}, 'عدد القطع المذابة ', h('span', { class: 'req' }, '*')), qtyI),
+        h('div', { class: 'f-field full' }, h('label', {}, 'ملاحظة'), noteI),
+        prev, hint),
+      actions: [
+        { label: 'إلغاء', cls: 'n', onClick: c => c() },
+        { label: 'تذويب واحفظ', cls: 'g', icon: 'check', big: true, onClick: async c => {
+            const e = eff();
+            if (e.q <= 0) return toast('أدخل عدد القطع المذابة', 'r');
+            const yes = await confirmBox(`تذويب ${fmt(r2(e.q / e.f))} ${p.units[e.ui].name} من بونص «${p.brandName}» في سعر الشراء؟`);
+            if (!yes) return;
+            if (await applyMelt(b, e.q, noteI.value.trim())) c();
+          } },
+      ],
+    });
+    setTimeout(() => qtyI.focus(), 60);
+  }
+
+  function pickProduct(cb) {
+    const inp = h('input', { placeholder: 'ابحث بالاسم أو الباركود…', autocomplete: 'off' });
+    const box = h('div', { class: 'suggestions show' });
+    const draw = () => {
+      const q = inp.value.trim();
+      const res = q ? searchProducts(q) : state.products.filter(p => !p.deleted).slice(0, 25);
+      box.innerHTML = '';
+      if (!res.length) { box.append(h('div', { class: 'sug-empty' }, 'لا نتيجة — جرّب اسماً آخر أو باركود صحيح')); return; }
+      res.forEach(p => box.append(h('div', { class: 'sug-item', onclick: () => { m.close(); cb(p); } },
+        h('span', { class: 'sug-ic', html: icon('pill') }),
+        h('div', { class: 'sug-name' }, p.brandName, coTag(p),
+          h('small', {}, `رفّه ${fmt(p.stockBase || 0)} ${smallUnitName(p)} • شراء القطعة ${fmt(r2((+p.purchasePriceTop || 0) / (baseFactor(p) || 1)))} ${cur()}`)),
+        h('span', { class: 'sug-price' }, `بيع ${fmt(p.salePriceBase)}`))));
+    };
+    inp.addEventListener('input', draw);
+    const m = openModal({ title: 'اختر المادة التي أخذت بونصها', icon: 'gift', wide: true,
+      body: h('div', { class: 'bn-pick' }, h('div', { class: 'search-box' }, h('span', { html: icon('search') }), inp), box),
+      actions: [{ label: 'إلغاء', cls: 'n', onClick: c => c() }] });
+    setTimeout(() => { inp.focus(); draw(); }, 60);
+  }
+
+  function openAdd(preId) {
+    if (!state.products.some(p => !p.deleted)) return toast('لا أصناف في المخزن بعد — أضف الأصناف أولاً', 'r');
+    if (preId) { const p = findProd(preId); return p ? form(p) : toast('المادة غير موجودة في المخزن', 'r'); }
+    pickProduct(p => { const fresh = findProd(p.id); fresh ? form(fresh) : toast('المادة حُذفت من المخزن', 'r'); });
+  }
+
+  function form(p) {
+    const sups = state.suppliers.filter(s => !s.deleted);
+    const links = [];
+    state.purchases.forEach(pu => {
+      if (pu.deleted || pu.type !== 'purchase') return;
+      (pu.items || []).forEach(it => { if (it.productId === p.id) links.push({ pu, it }); });
+    });
+    links.sort((a, b) => (b.pu.ts || 0) - (a.pu.ts || 0));
+
+    const unitSel = h('select', {}, p.units.map((u, i) => h('option', { value: i }, u.name)));
+    const buyI = h('input', { type: 'number', min: 0, step: 'any', placeholder: '0' });
+    const bonI = h('input', { type: 'number', min: 0, step: 'any', placeholder: '0' });
+    const priceI = h('input', { type: 'number', min: 0, step: 'any', placeholder: '0' });
+    const expI = h('input', { type: 'month', value: p.expiry || '' });
+    const noteI = h('input', { placeholder: 'مثال: عرض المذخر — فاتورة 45' });
+    const supSel = h('select', {}, h('option', { value: '' }, '— غير محدد —'), sups.map(s => h('option', { value: s.id }, s.name)));
+    const meltI = h('input', { type: 'number', min: 0, step: 'any', placeholder: '0', disabled: true });
+    let meltOn = false, addBuyOn = false;
+    let linkSel = null;
+    priceI.value = String(r2(costPerUnit(p, 0)));
+
+    const meltSw = h('div', { class: 'lux-switch' }, h('span', { class: 'sw' }),
+      h('div', {}, h('b', {}, 'إذابة جزء من البونص فوراً'), h('small', {}, 'يخفض سعر الشراء المحفوظ — والتذويب متاح لاحقاً في أي وقت')));
+    meltSw.addEventListener('click', () => {
+      meltOn = !meltOn; meltSw.classList.toggle('on', meltOn);
+      meltI.disabled = !meltOn; if (!meltOn) meltI.value = ''; drawPrev();
+    });
+    const addBuySw = h('div', { class: 'lux-switch' }, h('span', { class: 'sw' }),
+      h('div', {}, h('b', {}, 'عدد الشراء غير مسجّل في قائمة شراء'), h('small', {}, 'ارفعه فقط إن لم يكن عدد الشراء أُدخل سابقاً — وإلا يُضاف فوقه مرتين')));
+    addBuySw.addEventListener('click', () => { addBuyOn = !addBuyOn; addBuySw.classList.toggle('on', addBuyOn); });
+
+    if (links.length) {
+      linkSel = h('select', {}, h('option', { value: '' }, '— بدون ربط بقائمة شراء —'),
+        links.slice(0, 60).map((l, i) => h('option', { value: i },
+          `قائمة ${l.pu.listNum || '—'} • ${l.pu.supplierName || '—'} • ${fmt(l.it.qty)} ${l.it.unitName || ''} • ${fmtDate(l.pu.ts)}`)));
+      linkSel.addEventListener('change', () => {
+        const l = links[+linkSel.value];
+        if (!l) return;
+        unitSel.value = String(idxOf(p, l.it.unitIdx));
+        buyI.value = String(r2(+l.it.qty || 0));
+        priceI.value = String(r2(+l.it.buyPrice || 0));
+        if (l.pu.supplierId) supSel.value = l.pu.supplierId;
+        if (l.it.expiry) expI.value = l.it.expiry;
+        drawPrev();
+      });
+    }
+
+    const prev = h('div', { class: 'stat-cards', style: { marginTop: '6px' } });
+    const warn = h('div', { class: 'bn-tip' });
+    function vals() {
+      const ui = idxOf(p, unitSel.value);
+      const f = unitFactor(p, ui) || 1;
+      const buyQty = r2(num(buyI.value)), bonusQty = r2(num(bonI.value)), price = r2(num(priceI.value));
+      const meltQty = meltOn ? r2(num(meltI.value)) : 0;
+      return { ui, f, buyQty, bonusQty, price, meltQty,
+        buyBase: r2(buyQty * f), bonBase: r2(bonusQty * f), priceBase: r2(price / f),
+        meltBase: r2(Math.min(meltQty * f, bonusQty * f)) };
+    }
+    function drawPrev() {
+      const v = vals(), bf = baseFactor(p) || 1;
+      const afterAll = costAfter({ buyQtyBase: v.buyBase, buyPriceBase: v.priceBase }, v.bonBase);
+      const afterMelt = costAfter({ buyQtyBase: v.buyBase, buyPriceBase: v.priceBase }, v.meltBase);
+      prev.innerHTML = '';
+      prev.append(
+        h('div', { class: 'sum-card n' }, h('label', {}, 'شراء الوحدة الصغرى'), h('b', {}, `${fmt(v.priceBase)} ${cur()}`)),
+        h('div', { class: 'sum-card b' }, h('label', {}, 'نسبة البونص'), h('b', {}, `${pctText(v)}%`)),
+        h('div', { class: 'sum-card a' }, h('label', {}, 'قيمة البونص (تكلفة)'), h('b', {}, `${fmt(r2(v.bonBase * v.priceBase))} ${cur()}`)),
+        h('div', { class: 'sum-card big' }, h('label', {}, 'ربح البونص المتوقع (غير المذاب × سعر البيع)'),
+          h('b', {}, `${fmt(r2(Math.max(0, v.bonBase - v.meltBase) * Math.max(0, +p.salePriceBase || 0)))} ${cur()}`)));
+      const msgs = [];
+      if (v.buyQty && v.bonusQty) msgs.push(`قاعدة العرض: ${ratioText(v)} (${p.units[v.ui].name}) — أي ${pctText(v)}% مجاناً.`);
+      if (v.bonusQty) msgs.push(`لو أُذيب كامل البونص يصير شراء القطعة ${fmt(afterAll)} ${cur()} بدل ${fmt(v.priceBase)} — والوفر المحفوظ ${fmt(r2(v.bonBase * v.priceBase))} ${cur()}.`);
+      if (meltOn) msgs.push(`المذاب الآن ${fmt(r2(v.meltBase / v.f))} ${p.units[v.ui].name} ← شراء القطعة ${fmt(afterMelt)} ${cur()}.`);
+      if (v.buyBase + v.bonBase > 0 && (v.bonBase / (v.buyBase + v.bonBase)) > 0.5) msgs.push('تنبيه: البونص أكثر من نصف الدفعة — راجع الأرقام مع المذخر قبل الحفظ.');
+      warn.innerHTML = '';
+      msgs.forEach(t => warn.append(h('div', {}, t)));
+      warn.style.display = msgs.length ? 'block' : 'none';
+    }
+    [buyI, bonI, priceI, meltI].forEach(i => i.addEventListener('input', drawPrev));
+    unitSel.addEventListener('change', drawPrev);
+    drawPrev();
+
+    async function saveIt(close) {
+      const cur0 = findProd(p.id);
+      if (!cur0) return toast('المادة حُذفت من المخزن — أعد المحاولة', 'r');
+      const v = vals();
+      if (!(v.buyQty > 0) || v.buyQty > MAXQ) return toast('أدخل عدد الشراء (رقماً منطقياً)', 'r');
+      if (!(v.bonusQty > 0) || v.bonusQty > MAXQ) return toast('أدخل عدد البونص (رقماً منطقياً)', 'r');
+      if (!(v.price > 0) || v.price > MAXQ) return toast('أدخل سعر الشراء', 'r');
+      if (meltOn && !(v.meltQty > 0)) return toast('أدخل كمية التذويب أو ألغِ «إذابة فوراً»', 'r');
+      const dup = state.bonuses.find(x => !x.deleted && x.productId === cur0.id && r2(x.buyQty) === v.buyQty &&
+        r2(x.bonusQty) === v.bonusQty && r2(x.buyPrice) === v.price && Date.now() - (x.createdAt || 0) < 60000);
+      if (dup) { const ok2 = await confirmBox('بونص مطابق لنفس المادة بنفس الأرقام أُضيف خلال آخر دقيقة — تريد إضافته مرة ثانية؟', { danger: true, okLabel: 'نعم، أضفه' }); if (!ok2) return; }
+      const acc = me() || { id: null, name: '—' };
+      const lk = linkSel ? links[+linkSel.value] : null;
+      const b = { id: uid(), productId: cur0.id, productName: cur0.brandName, company: cur0.company || '',
+        form: cur0.form || '', dose: cur0.dose || '', unitIdx: v.ui, unitName: cur0.units[v.ui].name, factor: v.f,
+        buyQty: v.buyQty, bonusQty: v.bonusQty, buyPrice: v.price, buyPriceBase: v.priceBase,
+        buyQtyBase: v.buyBase, bonusQtyBase: v.bonBase, meltedQtyBase: 0, meltedLog: [],
+        stockAtCreation: r2(+cur0.stockBase || 0), supplierId: supSel.value || null,
+        supplierName: (findSup(supSel.value) || {}).name || '', purchaseId: lk ? lk.pu.id : '',
+        listNum: lk ? (lk.pu.listNum || '') : '', addBuyToStock: !!addBuyOn,
+        expiry: expI.value || '', note: String(noteI.value || '').trim().slice(0, 300),
+        createdAt: Date.now(), createdBy: acc.id, createdByName: acc.name, deviceId: DEVICE_ID };
+      cur0.stockLog = Array.isArray(cur0.stockLog) ? cur0.stockLog : [];
+      cur0.stockBase = r2((+cur0.stockBase || 0) + v.bonBase + (addBuyOn ? v.buyBase : 0));
+      cur0.stockLog.push({ ts: Date.now(), kind: 'bonus', delta: v.bonBase,
+        note: `بونص ${fmt(v.bonusQty)} ${b.unitName} على شراء ${fmt(v.buyQty)} — ${b.supplierName || 'مذخر غير محدد'}`,
+        empId: acc.id, empName: acc.name });
+      if (addBuyOn) cur0.stockLog.push({ ts: Date.now(), kind: 'bonus_buy', delta: v.buyBase,
+        note: `عدد شراء البونص (${fmt(v.buyQty)} ${b.unitName}) لم يكن مسجلاً في قائمة شراء`, empId: acc.id, empName: acc.name });
+      if (b.expiry && (!cur0.expiry || b.expiry > cur0.expiry)) cur0.expiry = b.expiry;
+      await save('bonuses', b);
+      await save('products', cur0);
+      toast(`حُفظ بونص «${cur0.brandName}» — ${fmt(v.bonusQty)} ${b.unitName} مجاناً`);
+      if (v.meltBase > 0) await applyMelt(b, v.meltBase, 'تذويب فوري عند الإضافة');
+      close();
+    }
+
+    const grid = h('div', {},
+      h('div', { class: 'bn-sum' }, h('b', {}, p.brandName), coTag(p),
+        h('span', {}, `رفّه الآن ${fmt(p.stockBase || 0)} ${smallUnitName(p)}`),
+        h('span', {}, `يُباع بـ ${fmt(p.salePriceBase)} ${cur()}`),
+        h('span', {}, `شراء القطعة الحالي ${fmt(r2((+p.purchasePriceTop || 0) / (baseFactor(p) || 1)))} ${cur()}`)),
+      h('div', { class: 'form-grid', style: { marginTop: '12px' } },
+        linkSel ? h('div', { class: 'f-field full' }, h('label', {}, 'اربط بقائمة شراء (يملأ العدد والسعر والمذخر تلقائياً)'), linkSel) : null,
+        h('div', { class: 'f-field' }, h('label', {}, 'وحدة العدد'), unitSel),
+        h('div', { class: 'f-field' }, h('label', {}, 'المذخر'), supSel),
+        h('div', { class: 'f-field' }, h('label', {}, 'عدد الشراء للحصول على البونص ', h('span', { class: 'req' }, '*')), buyI),
+        h('div', { class: 'f-field' }, h('label', {}, 'عدد البونص (مجاني) ', h('span', { class: 'req' }, '*')), bonI),
+        h('div', { class: 'f-field' }, h('label', {}, `سعر شراء الـ«${p.units[0].name}»`), priceI),
+        h('div', { class: 'f-field' }, h('label', {}, 'إكسباير البونص'), expI),
+        h('div', { class: 'f-field full' }, meltSw),
+        h('div', { class: 'f-field' }, h('label', {}, 'كمية تُذاب فوراً (نفس الوحدة)'), meltI),
+        h('div', { class: 'f-field full' }, addBuySw),
+        h('div', { class: 'f-field full' }, h('label', {}, 'ملاحظة'), noteI)),
+      warn, prev);
+
+    openModal({ title: `إضافة بونص — ${p.brandName}`, icon: 'gift', xwide: true, body: grid,
+      actions: [
+        { label: 'إلغاء', cls: 'n', onClick: c => c() },
+        { label: 'حفظ البونص', cls: 'g', icon: 'check', big: true, onClick: c => saveIt(c) },
+      ] });
+    setTimeout(() => buyI.focus(), 70);
+  }
+
+  async function remove(b) {
+    const yes = await confirmBox(`حذف بونص «${b.productName}» (${fmt(b.bonusQty)} ${b.unitName})؟ يُنقص العدد الذي أضيف للمخزون ويعيد سعر الشراء إن لم يكن قد تغيّر.`, { danger: true, okLabel: 'حذف البونص' });
+    if (!yes) return;
+    const acc = me() || { id: null, name: '—' };
+    const p = prod(b);
+    b.deleted = true; b.deletedAt = Date.now(); b.deletedBy = acc.id; b.deletedByName = acc.name;
+    if (p) {
+      const back = r2((+b.bonusQtyBase || 0) + (b.addBuyToStock ? (+b.buyQtyBase || 0) : 0));
+      const before = r2(+p.stockBase || 0);
+      p.stockBase = Math.max(0, r2(before - back));
+      p.stockLog = Array.isArray(p.stockLog) ? p.stockLog : [];
+      p.stockLog.push({ ts: Date.now(), kind: 'bonus_cancel', delta: r2(p.stockBase - before),
+        note: `حذف بونص ${fmt(b.bonusQty)} ${b.unitName}`, empId: acc.id, empName: acc.name });
+      const logs = Array.isArray(b.meltedLog) ? b.meltedLog : [];
+      const last = logs[logs.length - 1];
+      if (last && r2(+p.purchasePriceTop || 0) === r2(last.topAfter)) {
+        p.purchasePriceTop = r2(logs[0].topBefore);
+        delete p.bonusPriceNote;
+        p.stockLog.push({ ts: Date.now(), kind: 'bonus_melt', delta: 0,
+          note: `تراجع إذابة — رجع سعر الشراء إلى ${fmt(p.purchasePriceTop)}`, empId: acc.id, empName: acc.name });
+      } else if (last) toast('سعر الشراء تغيّر بعد التذويب (شراء جديد أو بونص آخر) — لم يُرجَّع تلقائياً', 'r');
+      await save('products', p);
+    }
+    await save('bonuses', b);
+    toast('حُذف البونص وأُلغي أثره على المخزون والسعر');
+  }
+
+  function guide() {
+    openModal({ title: 'كيف يعمل البونص؟', icon: 'gift', wide: true,
+      body: h('div', { class: 'bn-guide' },
+        h('div', {}, h('b', {}, '١ • الدفتر '), 'كل عرض بونص دفتر واحد: مادة + عدد شراء + عدد مجاني. عدد البونص يُزاد في المخزون فوراً ويُسجَّل في «حركة المادة».'),
+        h('div', {}, h('b', {}, '٢ • النسبة '), 'تُحسب تلقائياً من عدد الشراء والعدد المجاني — مثال: اشتري ١٠ واحصل على ١ = ١٠٪ مجاناً.'),
+        h('div', {}, h('b', {}, '٣ • الإذابة '), 'تُدخل عدد القطع التي تُدمج قيمتها في سعر الشراء: سعر القطعة = (عدد الشراء × سعره) ÷ (عدد الشراء + المذاب). العدد لا يتغيّر، سعر الشراء ينخفض فيرتفع ربح كل بيع قادم.'),
+        h('div', {}, h('b', {}, '٤ • الربح '), 'القطع الحرة غير المذابة ربحها كامل سعر البيع لأنها بلا تكلفة، والمذاب لا يُحسب مرّتين لأن قيمته دخلت سعر الشراء وظهرت في تقارير المبيعات.'),
+        h('div', {}, h('b', {}, '٥ • السابقة '), 'عندما ينفد المتبقي الحر ينتقل الدفتر تلقائياً إلى «البونصات السابقة» بختام مؤرَّخ، ويعود إلى «الجارية» إن رجع للمخزون مرتجع.'),
+        h('div', {}, h('b', {}, '٦ • الأوفلاين '), 'كل حركة تُحفظ محلياً أولاً ثم تُرفع للسحابة عبر طابور outbox عند عودة الإنترنت.'),
+        h('div', {}, h('b', {}, '٧ • الأمان '), 'الحذف المنطقي يبقي الدفتر للتدقيق مع أثر معكوس محسوب واسم الموظف والتاريخ.')),
+      actions: [{ label: 'إغلاق', cls: 'g', onClick: c => c() }] });
+  }
+
+  /* التبويب فريد (singleton): إعادة التنشيط وحدها لا تُعيد الرسم — لذلك نفرض القفز ونُعيد الرسم يدوياً */
+  function openFor(productId) {
+    const t = openTab('bonus', { productId });
+    if (t) { t.props = { productId }; t.state.jumpedFrom = null; renderTabContent(t); }
+  }
+
+  return { stats, settle, meltCap, costAfter, ratioText, pctText, openAdd, openFor, openMelt, remove, guide, applyMelt, outBase, createFromPurchase,
+    list: () => state.bonuses.filter(b => !b.deleted).slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)) };
+})();
+
+function renderBonus(tab) {
+  const st = tab.state;
+  const r2 = v => Math.round((+v || 0) * 100) / 100;
+  st.f = st.f || { q: '', status: 'active' };
+  const page = h('div', { class: 'page det-page' });
+  const kpi = h('div', { class: 'stat-cards' });
+  const qI = h('input', { type: 'text', placeholder: 'بحث باسم المادة أو الشركة…', value: st.f.q });
+  const stSel = h('select', {},
+    h('option', { value: 'active' }, 'البونصات الجارية'),
+    h('option', { value: 'closed' }, 'البونصات السابقة'),
+    h('option', { value: 'all' }, 'كل البونصات'));
+  const bodyBox = h('div', { class: 'page-body bn-body' });
+  const footBox = h('div', { class: 'page-footer' });
+  const chip = (label, val, cls) => h('div', { class: 'bn-chip ' + cls }, h('label', {}, label), h('b', {}, val));
+  const sumCard = (label, val, cls) => h('div', { class: 'sum-card ' + cls }, h('label', {}, label), h('b', {}, val));
+  const buyBase0 = b => r2((+b.buyPrice || 0) / (b.factor || 1));
+  stSel.value = st.f.status;
+  qI.addEventListener('input', () => { st.f.q = qI.value; draw(); });
+  stSel.addEventListener('change', () => { st.f.status = stSel.value; draw(); });
+  if (tab.props.productId && st.jumpedFrom !== tab.props.productId) {   // القفز من دفتر إلى إعدادات الصنف والعكس
+    st.jumpedFrom = tab.props.productId;
+    st.f.q = ''; st.f.status = 'all'; qI.value = ''; stSel.value = 'all';
+    const jump = Bonus.list().find(b => b.productId === tab.props.productId);
+    st.open = jump ? jump.id : null;
+  }
+  page.append(h('div', { class: 'page-head' },
+    h('div', { class: 'page-title' }, h('span', { html: icon('gift') }), 'البونص'),
+    h('div', { class: 'spacer' }),
+    h('button', { class: 'btn n', onclick: () => Bonus.guide() }, h('span', { html: icon('star') }), 'كيف يعمل؟'),
+    h('button', { class: 'btn g', onclick: () => Bonus.openAdd() }, h('span', { html: icon('plus') }), 'إضافة بونص')),
+    kpi,
+    h('div', { class: 'filter-bar' },
+      h('div', { class: 'f-group', style: { flex: 1 } }, h('span', { html: icon('search') }), qI),
+      h('div', { class: 'f-group' }, h('label', {}, 'الحالة'), stSel)),
+    bodyBox, footBox);
+  tab.el.append(page);
+  draw();
+  if (!renderBonus._settling) {
+    renderBonus._settling = true;
+    Bonus.settle().catch(() => {}).then(() => { renderBonus._settling = false; });
+  }
+
+  function detail(b, s) {
+    const p = s.p;
+    const small = p ? smallUnitName(p) : 'وحدة صغرى';
+    const box = h('div', { class: 'bn-det' },
+      sumCard('عدد الشراء (صغرى)', `${fmt(b.buyQtyBase || 0)} ${small}`, 'n'),
+      sumCard('عدد البونص (صغرى)', `${fmt(s.bonusBase)} ${small}`, 'g'),
+      sumCard('سعر الشراء الأصلي / قطعة', `${fmt(buyBase0(b))} ${cur()}`, 'n'),
+      sumCard('سعر الشراء الحالي / قطعة', `${fmt(s.costNow)} ${cur()}`, s.costNow < buyBase0(b) ? 'g' : 'n'),
+      sumCard('المباع من البونص', `${fmt(s.used)} ${small}`, 'b'),
+      sumCard('المتبقي الحر على الرف', `${fmt(s.remaining)} ${small}`, s.remaining > 0 ? 'a' : 'r'),
+      sumCard('المذاب في السعر', `${fmt(s.melted)} ${small}`, 'b'),
+      sumCard('المتاح للتذويب', `${fmt(Bonus.meltCap(b))} ${small}`, 'n'),
+      sumCard('قيمة البونص (تكلفة)', `${fmt(s.savedCost)} ${cur()}`, 'n'),
+      sumCard('ربح محقق (بونص مباع)', `${fmt(s.realized)} ${cur()}`, 'g'),
+      sumCard('ربح متوقع (المتبقي)', `${fmt(s.expected)} ${cur()}`, 'r'),
+      sumCard('الربح الصافي الكلي', `${fmt(s.net)} ${cur()}`, 'big'));
+    box.append(h('div', { class: 'bn-tip' },
+      `المعادنة المحفوظة: (عدد الشراء ${fmt(b.buyQtyBase || 0)} × ${fmt(buyBase0(b))}) ÷ (عدد الشراء + المذاب ${fmt(s.melted)}) = ${fmt(s.costNow)} ${cur()} للقطعة. العدد لا يتغيّر بالإذابة، والسعر الجديد يدخل تلقائياً في تقارير ربح المبيعات القادمة.`),
+      h('div', { class: 'bn-tip' },
+        `الربح المحقق = القطع المبياعة من البونص وغير المذابة × سعر البيع الحالي (${fmt(s.pureUsed)} × ${fmt(s.saleNow)}). المذاب لا يُعدّ ربحاً مرّتين لأن قيمته دخلت سعر الشراء وصارت في تقارير المبيعات.`,
+        'الفرض: أول القطع التي تخرج من الرف بعد إنشاء الدفتر تُحسب على البونص (FIFO)، ويضاف إليها ما يُنقص العدد يدوياً.',
+        b.expiry ? ` إكسباير البونص: ${b.expiry}.` : '',
+        b.addBuyToStock ? ' عدد الشراء أُضيف للمخزون مع البونص لأنه لم يكن في قائمة شراء.' : ' عدد الشراء مفترض أنه مسجّل في قائمة شراء — لا يُضاف مرتين.',
+        b.note ? ` ملاحظة: ${b.note}.` : ''));
+    const logs = Array.isArray(b.meltedLog) ? b.meltedLog : [];
+    const rows = h('tbody');
+    logs.slice().reverse().forEach((g, i) => rows.append(h('tr', {},
+      h('td', { class: 'td-seq' }, logs.length - i),
+      h('td', {}, `${fmtDate(g.ts)} • ${fmtTime(g.ts)}`),
+      h('td', { class: 'td-num' }, `${fmt(g.qtyBase)} ${small}`),
+      h('td', { class: 'td-num' }, fmt(g.baseBefore)),
+      h('td', { class: 'td-num' }, fmt(g.baseAfter)),
+      h('td', { class: 'td-num' }, `${fmt(g.topBefore)} ← ${fmt(g.topAfter)}`),
+      h('td', {}, g.empName || '—'),
+      h('td', {}, g.note || '—'))));
+    box.append(h('div', { class: 'bn-rows' }, h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'ت'), h('th', {}, 'التاريخ والوقت'), h('th', {}, 'المذاب'),
+        h('th', {}, 'قطعة قبل'), h('th', {}, 'قطعة بعد'), h('th', {}, 'الكبرى قبل ← بعد'),
+        h('th', {}, 'الموظف'), h('th', {}, 'ملاحظة'))), rows))));
+    if (!logs.length) box.append(h('div', { class: 'empty-note' }, 'لم تُذاب أي قطعة من هذا البونص بعد'));
+    box.append(h('div', { class: 'bn-act' },
+      h('button', { class: 'btn g', onclick: () => Bonus.openMelt(b) }, h('span', { html: icon('refresh') }), 'إذابة بونص'),
+      p ? h('button', { class: 'btn b', onclick: () => openTab('details', { productId: p.id }) }, h('span', { html: icon('eye') }), 'حركة المادة') : null,
+      p ? h('button', { class: 'btn n', onclick: () => openTab('product', { productId: p.id }) }, h('span', { html: icon('edit') }), 'إعدادات الصنف') : null,
+      h('button', { class: 'btn r', onclick: () => Bonus.remove(b) }, h('span', { html: icon('trash') }), 'حذف البونص')));
+    return box;
+  }
+
+  function card(b, s) {
+    const p = s.p;
+    const unit = b.unitName || (p ? p.units[0].name : 'وحدة');
+    const small = p ? smallUnitName(p) : 'وحدة صغرى';
+    const open = st.open === b.id;
+    const tot = Math.max(1, +b.bonusQtyBase || 0);
+    const usedPct = Math.min(100, Math.round((s.used / tot) * 100));
+    const remPct = Math.min(100 - usedPct, Math.round((s.remaining / tot) * 100));
+    const c = h('div', { class: 'bn-card' + (open ? ' open' : '') + (s.empty ? ' done' : '') });
+    c.append(h('div', { class: 'bn-top' },
+      h('div', { class: 'bn-name' }, p ? p.brandName : `${b.productName} (صنف محذوف)`, p ? coTag(p) : null,
+        h('small', {}, `${b.supplierName || 'مذخر غير محدد'}${b.listNum ? ` • قائمة ${b.listNum}` : ''} • ${fmtDate(b.createdAt)} • ${b.createdByName || '—'}`)),
+      h('span', { class: 'badge ' + (s.empty ? 'n' : 'g') }, s.empty ? 'سابقة' : 'جارية')));
+    c.append(h('div', { class: 'bn-ratio' }, Bonus.ratioText(b), h('b', {}, `${Bonus.pctText(b)}% مجاناً`)));
+    c.append(h('div', { class: 'bn-mid' },
+      chip('شراء', `${fmt(b.buyQty)} ${unit}`, 'n'),
+      chip('بونص', `${fmt(b.bonusQty)} ${unit}`, 'g'),
+      chip('متبقٍ حر', `${fmt(s.remaining)} ${small}`, s.remaining > 0 ? 'a' : 'r'),
+      chip('مذابة', `${fmt(s.melted)} ${small}`, 'b'),
+      chip('ربح صافٍ', `${fmt(s.net)} ${cur()}`, 'g')));
+    c.append(h('div', { class: 'bn-bar' }, h('i', { style: { width: usedPct + '%' } }), h('u', { style: { width: remPct + '%' } })));
+    c.append(h('div', { class: 'bn-price' },
+      h('span', {}, 'شراء القطعة:'), h('s', {}, fmt(buyBase0(b))), h('em', {}, `${fmt(s.costNow)} ${cur()}`),
+      s.saleNow ? h('span', { class: 'bn-sep' }, `وبيعه ${fmt(s.saleNow)}`) : null));
+    c.append(h('div', { class: 'bn-foot' },
+      h('span', {}, s.empty ? `اكتمل ${b.closedAt ? fmtDate(b.closedAt) : '—'}` : `المباع من البونص ${fmt(s.used)} ${small}`),
+      h('span', { class: 'bn-more' }, open ? 'إغلاق ▲' : 'التفاصيل ▼')));
+    c.addEventListener('click', e => {
+      if (e.target.closest('.bn-act')) return;
+      st.open = open ? null : b.id;
+      draw();
+    });
+    if (open) c.append(detail(b, s));
+    return c;
+  }
+
+  function draw() {
+    const q = st.f.q.trim();
+    let rows = Bonus.list().map(b => ({ b, s: Bonus.stats(b) }));
+    if (q) rows = rows.filter(x => prodMatches(x.s.p || { brandName: x.b.productName, company: x.b.company }, q));
+    rows = rows.filter(x => st.f.status === 'all' || (st.f.status === 'closed' ? x.s.empty : !x.s.empty));
+    const cards = h('div', { class: 'bn-list' });
+    rows.forEach(x => cards.append(card(x.b, x.s)));
+    bodyBox.innerHTML = '';
+    bodyBox.append(cards);
+    if (!cards.children.length) bodyBox.append(h('div', { class: 'empty-note' },
+      q ? 'لا بونص مطابق للبحث' : (st.f.status === 'closed'
+        ? 'لا بونصات سابقة بعد — ما ينفد عدده يُخزَّن هنا تلقائياً'
+        : 'لا بونصات مسجّلة — اضغط «إضافة بونص» لتسجيل أول عرض من المذخر')));
+    kpi.innerHTML = '';
+    kpi.append(
+      sumCard('بونصات جارية', String(rows.filter(x => !x.s.empty).length), 'b'),
+      sumCard('بونصات منتهية', String(rows.filter(x => x.s.empty).length), 'n'),
+      sumCard('قيمة البونص (تكلفة)', `${fmt(Math.round(rows.reduce((a, x) => a + x.s.savedCost, 0) * 100) / 100)} ${cur()}`, 'a'),
+      sumCard('ربح محقق', `${fmt(Math.round(rows.reduce((a, x) => a + x.s.realized, 0) * 100) / 100)} ${cur()}`, 'g'),
+      sumCard('ربح متوقع', `${fmt(Math.round(rows.reduce((a, x) => a + x.s.expected, 0) * 100) / 100)} ${cur()}`, 'r'),
+      h('div', { class: 'sum-card big' }, h('label', {}, 'الربح الصافي الكلي'),
+        h('b', {}, `${fmt(Math.round(rows.reduce((a, x) => a + x.s.net, 0) * 100) / 100)} ${cur()}`)));
+    footBox.innerHTML = '';
+    footBox.append(
+      sumCard('دفاتر معروضة', String(rows.length), 'b'),
+      sumCard('قيمة الحر المتبقي (تكلفة)', `${fmt(Math.round(rows.reduce((a, x) => a + x.s.freeCost, 0) * 100) / 100)} ${cur()}`, 'a'),
+      sumCard('القيمة المذابة في الأسعار', `${fmt(Math.round(rows.reduce((a, x) => a + x.s.meltValue, 0) * 100) / 100)} ${cur()}`, 'n'),
+      h('div', { class: 'sum-card big' }, h('label', {}, 'حرّ غير مذاب قابل للتذويب'),
+        h('b', {}, `${fmt(Math.round(rows.reduce((a, x) => a + Math.max(0, x.s.bonusBase - x.s.melted - x.s.used), 0) * 100) / 100)} قطعة`)));
+  }
+}
 /* ───────────────────────── 20-ب) مخزن مفاتيح الذكاء الاصطناعي: عدد غير محدود، يُرفع للسحابة، ويدور تلقائياً ───────────────────────── */
 const KeyPool = (() => {
   let list = [], loaded = null, polling = false, listening = false, cssDone = false;
@@ -4700,6 +5518,7 @@ function renderProductDetails(tab) {
     p.featured ? h('span', { class: 'badge g' }, 'مميز') : null,
     DrugInfo.button(p),
     h('div', { class: 'spacer' }),
+    h('button', { class: 'btn n', onclick: () => Paper.openInvoices(p) }, h('span', { html: icon('paper') }), 'الفواتير الورقية'),
     h('button', { class: 'btn b', onclick: () => openTab('product', { productId: p.id }) }, h('span', { html: icon('edit') }), 'تعديل الصنف')));
   page.append(h('div', { class: 'stat-cards' },
     h('div', { class: 'sum-card n' }, h('label', {}, 'الاسم العلمي'), h('b', { style: { fontSize: '15px' } }, p.scientificName || '—')),
@@ -4707,7 +5526,11 @@ function renderProductDetails(tab) {
     h('div', { class: 'sum-card b' }, h('label', {}, 'شراء الوحدة الصغرى'), h('b', {}, fmt(cBase))),
     h('div', { class: 'sum-card g' }, h('label', {}, 'بيع الوحدة الصغرى'), h('b', {}, fmt(p.salePriceBase))),
     h('div', { class: 'sum-card ' + ((p.stockBase || 0) <= (state.settings.lowStock ?? 10) ? 'r' : 'g') }, h('label', {}, 'المخزون الحالي'), h('b', {}, `${fmt(p.stockBase || 0)} ${smallUnitName(p)}`)),
-    h('div', { class: 'sum-card n' }, h('label', {}, 'الإكسباير'), h('b', {}, p.expiry || '—'))));
+    h('div', { class: 'sum-card n' }, h('label', {}, 'الإكسباير'), h('b', {}, p.expiry || '—')),
+    (p.bonusPriceNote && num(p.purchasePriceTop) === Math.round(num(p.bonusPriceNote.meltedTop) * 100) / 100
+      ? h('div', { class: 'sum-card a' }, h('label', {}, 'شراء الصغرى قبل إذابة البونص'),
+          h('b', {}, `${fmt(Math.round(num(p.bonusPriceNote.originalTop) / (baseFactor(p) || 1) * 100) / 100)} ${cur()}`))
+      : null)));
   page.append(h('div', { class: 'det-meta' },
     h('div', { class: 'det-cell' }, h('label', {}, 'الباركودات'),
       h('div', { class: 'barcode-list' }, (p.barcodes || []).map(b =>
@@ -4732,19 +5555,21 @@ function renderProductDetails(tab) {
     state.sales.forEach(s => (s.items || []).forEach(it => {
       if (it.productId !== p.id) return;
       all.push({ ts: s.ts, date: s.date, kind: s.type === 'sale' ? 'بيع' : 'استرجاع بيع', emp: s.employeeName,
+        party: s.customerName || 'زبون نقدي',
         qty: s.type === 'sale' ? -it.qty : it.qty, qtyBase: s.type === 'sale' ? -it.qtyBase : it.qtyBase,
         price: it.sale, docType: 'sale', docId: s.id });
     }));
     state.purchases.forEach(pu => (pu.items || []).forEach(it => {
       if (pu.deleted || it.productId !== p.id) return;
       all.push({ ts: pu.ts, date: pu.date, kind: pu.type === 'purchase' ? 'شراء' : 'استرجاع شراء', emp: pu.employeeName,
+        party: pu.supplierName || '—',
         qty: pu.type === 'purchase' ? it.qty : -it.qty, qtyBase: pu.type === 'purchase' ? it.qtyBase : -it.qtyBase,
         price: it.buyPrice, docType: 'purchase', docId: pu.id });
     }));
     /* سجل التعديلات اليدوية على العدد (جرد افتتاحي + تعديل العدد) — يُسجَّل مع كل حفظ للصنف */
     (p.stockLog || []).forEach(g => all.push({ ts: g.ts, date: dateStr(g.ts),
-    kind: g.kind === 'opening' ? 'رصيد افتتاحي' : g.kind === 'rename' ? 'تغيير اسم' : 'تعديل عدد', note: g.note || '', emp: g.empName || '—',
-      qty: g.delta, qtyBase: g.delta, price: 0, docType: null, docId: null }));
+    kind: BONUS_KINDS[g.kind] || 'تعديل عدد', note: g.note || '', emp: g.empName || '—',
+      party: '', qty: g.delta, qtyBase: g.delta, price: 0, docType: null, docId: null }));
     all.sort((a, b) => a.ts - b.ts);
 
     /* ★ الرصيد الافتتاحي الصحيح = المخزون الحالي ناقص مجموع كل الحركات (بلا أي ترشيح بالتاريخ) */
@@ -4755,28 +5580,47 @@ function renderProductDetails(tab) {
     const shown = [];
     all.forEach(m => { cum += m.qtyBase; if ((!st.f.from || m.date >= st.f.from) && (!st.f.to || m.date <= st.f.to)) shown.push({ ...m, cum }); });
 
+    /* الوحدة الأساسية للعرض = الباكيت (الوحدة الكبرى)؛ الشريط يظهر ككسر عشري منه */
+    const bf = baseFactor(p) || 1;
+    const topName = p.units[0].name;
+    const pk = v => (Math.round(v / bf * 1000) / 1000 || 0).toLocaleString('en-US', { maximumFractionDigits: 3 });
+    const signed = v => (v > 0 ? '+' : '') + pk(v);
+    const kindCls = k => k === 'بيع' ? 'g' : k === 'شراء' ? 'b' : k === 'تعديل عدد' ? 'amber' : (k === 'رصيد افتتاحي' || k === 'تغيير اسم') ? 'n' : 'r';
+    const dash = () => h('span', { class: 'mv-dash' }, '—');
+
     movBox.innerHTML = '';
     const tbody = h('tbody');
-    if (initial) tbody.append(h('tr', {},
-      h('td', {}, h('span', { class: 'badge n' }, 'رصيد افتتاحي')),
-      h('td', {}, '—'), h('td', { class: 'mono' }, '—'), h('td', { class: 'mono' }, '—'),
-      h('td', { class: 'td-num' }, fmt(initial)),
-      h('td', { class: 'td-num', style: { fontWeight: 900 } }, fmt(initial)),
-      h('td', { class: 'td-num' }, '—'), h('td', {}, '')));
-        shown.forEach(m => {
+    if (initial) tbody.append(h('tr', { class: 'mv-open' },
+      h('td', {}, dash()),
+      h('td', {}, dash()),
+      h('td', {}, h('span', { class: 'badge n mv-kind' }, 'رصيد افتتاحي')),
+      h('td', {}, dash()),
+      h('td', { class: 'mv-qty', title: `${fmt(initial)} ${smallUnitName(p)}` }, pk(initial)),
+      h('td', { class: 'mv-cum' }, pk(initial)),
+      h('td', {}, '')));
+    shown.forEach(m => {
       const isName = m.kind === 'تغيير اسم';
+      const empName = m.emp || '—';
       tbody.append(h('tr', {},
-        h('td', {}, h('span', { class: 'badge ' + (m.kind === 'بيع' ? 'g' : m.kind === 'شراء' ? 'b' : m.kind === 'تعديل عدد' ? 'amber' : (m.kind === 'رصيد افتتاحي' || isName) ? 'n' : 'r') }, m.kind)),
-        h('td', {}, m.emp), h('td', { class: 'mono' }, fmtDate(m.ts)), h('td', { class: 'mono' }, fmtTime(m.ts)),
-        h('td', { class: 'td-num', style: { color: m.qty >= 0 ? 'var(--green)' : 'var(--red)' } }, isName ? '—' : (m.qty >= 0 ? '+' : '') + fmt(m.qty)),
-        h('td', { class: 'td-num', style: { fontWeight: 900 } }, fmt(m.cum)),
-        isName ? h('td', { style: { fontSize: '12px', fontWeight: 800 } }, m.note) : h('td', { class: 'td-num td-sale' }, m.docType ? fmt(m.price) : '—'),
-        h('td', {}, m.docId ? h('button', { class: 'icon-btn edit', html: icon('edit'), title: 'فتح القائمة للتعديل',
-          onclick: () => openTab(m.docType === 'sale' ? 'editsale' : 'editpurch', m.docType === 'sale' ? { saleId: m.docId } : { purchaseId: m.docId }) }) : '')));
+        h('td', { class: 'mv-emp' }, h('span', { class: 'mv-avatar' }, empName.charAt(0)), h('span', {}, empName)),
+        h('td', { class: 'mv-when' }, h('b', {}, `${DAYS[new Date(m.ts).getDay()]} ${fmtDate(m.ts)}`), h('small', {}, fmtTime(m.ts))),
+        h('td', {}, h('span', { class: 'badge mv-kind ' + kindCls(m.kind) }, m.kind)),
+        h('td', {}, m.docType ? m.party : (m.note ? h('small', { class: 'mv-note' }, m.note) : dash())),
+        h('td', { class: 'mv-qty ' + (isName ? '' : m.qtyBase >= 0 ? 'up' : 'down'), title: isName ? null : `${fmt(m.qtyBase)} ${smallUnitName(p)}` }, isName ? '—' : signed(m.qtyBase)),
+        h('td', { class: 'mv-cum' }, pk(m.cum)),
+        h('td', {}, m.docId ? h('div', { class: 'mv-act' },
+          h('button', { class: 'icon-btn view', html: icon('eye'), title: 'عرض القائمة',
+            onclick: () => {
+              if (m.docType === 'purchase') return openTab('editpurch', { purchaseId: m.docId, readonly: true });
+              const doc = state.sales.find(s => s.id === m.docId);
+              if (doc) viewSaleModal(doc); else toast('القائمة غير موجودة', 'r');
+            } }),
+          h('button', { class: 'icon-btn edit', html: icon('edit'), title: 'فتح القائمة للتعديل',
+            onclick: () => openTab(m.docType === 'sale' ? 'editsale' : 'editpurch', m.docType === 'sale' ? { saleId: m.docId } : { purchaseId: m.docId }) })) : '')));
     });
-    movBox.append(h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl' },
-      h('thead', {}, h('tr', {}, h('th', {}, 'نوع العملية'), h('th', {}, 'الموظف'), h('th', {}, 'التاريخ'), h('th', {}, 'الوقت'),
-        h('th', {}, `العدد (${smallUnitName(p)})`), h('th', {}, 'العدد التراكمي'), h('th', {}, 'سعر البيع / الشراء'), h('th', {}, 'تعديل'))), tbody)));
+    movBox.append(h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl mov-tbl' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'الحساب / الموظف'), h('th', {}, 'التاريخ والوقت'), h('th', {}, 'نوع الحركة'), h('th', {}, 'الزبون / المذخر'),
+        h('th', {}, `العدد (${topName})`), h('th', {}, `العدد المتراكم (${topName})`), h('th', {}, 'الإجراء'))), tbody)));
     if (!shown.length) movBox.append(h('div', { class: 'empty-note' }, 'لا حركات لهذا الصنف في الفترة المحددة'));
   }
   drawMov();
@@ -5248,7 +6092,7 @@ function renderSettings(tab) {
       r.onload = async () => {
         try {
           const data = JSON.parse(r.result);
-          for (const k of ['accounts','products','sales','purchases','suppliers','payments','customers']) if (data[k]) await DB.bulk(k, data[k]);
+          for (const k of ['accounts','products','sales','purchases','suppliers','payments','customers','bonuses']) if (data[k]) await DB.bulk(k, data[k]);
           if (data.settings) await DB.put('settings', data.settings);
           toast('تمت الاستعادة — سيُعاد تشغيل النظام', 'b');
           setTimeout(() => location.reload(), 1200);
@@ -5262,7 +6106,7 @@ function renderSettings(tab) {
         h('b', { style: { fontSize: '15px' } }, `${state.products.filter(p=>!p.deleted).length} صنف • ${state.sales.length} قائمة بيع • ${state.purchases.length} قائمة شراء • ${state.suppliers.filter(s=>!s.deleted).length} مذخر`))),
       h('div', { class: 'f-field full' }, h('button', { class: 'btn b big', onclick: async () => {
         const data = {};
-        for (const k of ['accounts','products','sales','purchases','suppliers','payments','customers']) data[k] = await DB.all(k);
+        for (const k of ['accounts','products','sales','purchases','suppliers','payments','customers','bonuses']) data[k] = await DB.all(k);
         data.settings = state.settings;
         const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
         const a = h('a', { href: URL.createObjectURL(blob), download: `نسخة-احتياطية-درب-الشفاء-${dateStr()}.json` });
@@ -5750,6 +6594,167 @@ function renderDesignStudio(host) {
   drawAll();
 }
 
+/* ───────────────────────── 23-د) النسخة الورقية: صورة قائمة الشراء تلزم نسختها الإلكترونية ─────────────────────────
+   الصور تُحفظ في جدول scans محلياً وتُرفع للسحابة عبر طابور outbox نفسه (pos/scans/{id}).
+   لا تُسحب من السحابة عند التشغيل — تُطلب لحظة الضغط على «النسخة الورقية» فقط، فتبقى ذاكرة الجهاز خفيفة. */
+const Paper = (() => {
+  const MAX_B64 = 6000000;                                   // سقف صورة واحدة بعد الضغط (≈ 4.5MB)
+  const okType = d => /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]{120,}$/i.test(String(d || ''));
+  const bad64  = d => { const s = String(d || ''); const i = s.indexOf(','); return i >= 0 ? s.slice(i + 1) : s; };
+  const mimeOf = d => { const m = /^data:image\/([a-z+.-]+);base64,/i.exec(String(d || '')); return m ? 'image/' + m[1].toLowerCase().replace('+', '') : 'image/jpeg'; };
+  const kb = chars => Math.max(1, Math.round((+chars || 0) * 0.75 / 1024));
+
+  async function attach(pu, dataUrl, source) {
+    if (!okType(dataUrl)) { toast('الصورة المصوَّرة غير صالحة — أعد التصوير', 'r'); return null; }
+    const b = bad64(dataUrl);
+    if (b.length > MAX_B64) { toast(`الصورة كبيرة (${kb(b.length)}KB) — الحد ${kb(MAX_B64)}KB`, 'r'); return null; }
+    const acc = me() || { id: null, name: '—' };
+    const doc = { id: uid(), purchaseId: pu.id, listNum: pu.listNum || '', supplierName: pu.supplierName || '',
+      listDate: pu.date || dateStr(), dataUrl: String(dataUrl).slice(0, String(dataUrl).indexOf(',') + 1) + b,
+      bytesKB: kb(b.length), source: source || 'manual', createdAt: Date.now(),
+      createdBy: acc.name, createdById: acc.id, deviceId: DEVICE_ID };
+    await DB.put('scans', doc);
+    Sync.push('scans', doc);                                 // pos/scans/{id} — يُعاد إرساله تلقائياً عند عودة الإنترنت
+    return doc;
+  }
+
+  async function get(id) {
+    const safe = String(id || '').replace(/[^0-9a-zA-Z_-]/g, '');
+    if (!safe) return null;
+    const local = await DB.get('scans', safe);
+    if (local && local.dataUrl) return local;
+    if (!Sync.ready) return null;
+    try {
+      const snap = await Sync._race(Sync.db.ref('pos/scans/' + safe).once('value'), 'paper', 45000);
+      const v = snap && snap.val();
+      if (v && v.dataUrl) { await DB.put('scans', v); return v; }
+    } catch (e) { console.warn('paper pull:', e); }
+    return null;
+  }
+
+  function viewer(pu) {
+    const ids = Array.isArray(pu.papers) ? pu.papers : [];
+    const body = h('div', { class: 'pm-body' });
+    if (!ids.length) {
+      body.append(h('div', { class: 'pm-empty' }, h('span', { html: icon('paper') }),
+        h('b', {}, 'لا توجد نسخة ورقية لهذه القائمة'),
+        h('div', {}, 'النسخة الورقية تُلتقط من «قائمة شراء» ← «قراءة فاتورة ورقية بالصورة»: صورة الماسح تُحفظ تلقائياً مع القائمة عند الحفظ وتُرفع للسحابة.')));
+    } else {
+      ids.forEach((id, i) => {
+        const card = h('div', { class: 'pm-card' },
+          h('div', { class: 'pm-load' }, h('span', { class: 'spinner' }), `جارٍ تحميل الصورة ${i + 1} من ${ids.length}…`));
+        body.append(card);
+        get(id).then(d => {
+          card.innerHTML = '';
+          if (!d || !d.dataUrl) {
+            card.append(h('div', { class: 'pm-empty' }, h('b', {}, 'تعذّر تحميل هذه النسخة'),
+              h('div', {}, Sync.ready ? 'غير موجودة في السحابة ولا على هذا الجهاز — أعد تصوير القائمة وأرفقها.' : 'المزامنة متوقفة — افحص الاتصال بالسحابة ثم أعد المحاولة.')));
+            return;
+          }
+          card.append(
+            h('div', { class: 'pm-head' },
+              h('b', {}, `نسخة ${i + 1} — قائمة رقم ${d.listNum || pu.listNum || '—'} • ${d.supplierName || pu.supplierName || '—'} • ${fmtDate(d.createdAt || pu.ts)}`),
+              h('span', {}, `${d.bytesKB || kb(bad64(d.dataUrl).length)}KB • ${d.createdBy || '—'}`),
+              h('a', { class: 'mini-btn blue', style: { flex: 'none' }, href: d.dataUrl, download: `قائمة-${d.listNum || pu.listNum || 'شراء'}-${d.listDate || dateStr()}.jpg` },
+                h('span', { html: icon('download') }), 'تنزيل الصورة')),
+            h('img', { class: 'pm-img', src: d.dataUrl, alt: 'النسخة الورقية للقائمة' }));
+        });
+      });
+    }
+    openModal({ title: `النسخة الورقية — قائمة ${pu.listNum || ''} ${pu.supplierName || ''}`.trim(), icon: 'paper', xwide: true, body,
+      actions: [{ label: 'إغلاق', cls: 'g', onClick: c => c() }] });
+  }
+
+  /* كل قوائم الشراء التي تحتوي المادة ضمن المدة — بحث دقيق بالمعرّف لا بالاسم */
+  function listsFor(p, from, to) {
+    return state.purchases
+      .filter(pu => !pu.deleted && pu.type === 'purchase' && Array.isArray(pu.items) && pu.items.some(it => it.productId === p.id))
+      .filter(pu => (!from || pu.date >= from) && (!to || pu.date <= to))
+      .sort((a, b) => a.ts - b.ts);
+  }
+
+  function openInvoices(p) {
+    const fromI = h('input', { type: 'date', value: dateStr(Date.now() - 180 * 864e5) });
+    const toI = h('input', { type: 'date', value: dateStr() });
+    const info = h('div', { class: 'f-hint' });
+    const draw = () => {
+      const ls = listsFor(p, fromI.value, toI.value);
+      const withPaper = ls.filter(pu => Array.isArray(pu.papers) && pu.papers.length);
+      info.textContent = ls.length
+        ? `ضمن المدة: ${ls.length} قائمة شراء تحتوي المادة — ${withPaper.length} منها بنسخة ورقية، و${ls.length - withPaper.length} بلا نسخة (تُطبع ببياناتها مع ملاحظة ذلك).`
+        : 'لا قوائم شراء لهذه المادة ضمن المدة — وسّع المدة أو اضغط «منذ بداية النظام».';
+      return ls;
+    };
+    fromI.addEventListener('change', draw); toI.addEventListener('change', draw);
+    draw();
+    openModal({ title: `الفواتير الورقية — ${p.brandName}`, icon: 'paper', wide: true,
+      body: h('div', { class: 'form-grid' },
+        h('div', { class: 'f-field' }, h('label', {}, 'من'), fromI),
+        h('div', { class: 'f-field' }, h('label', {}, 'إلى'), toI),
+        h('div', { class: 'f-field full' },
+          h('div', { class: 'pm-tools' },
+            h('button', { class: 'mini-btn blue', style: { flex: 'none' }, onclick: () => { fromI.value = ''; toI.value = ''; draw(); } }, 'منذ بداية النظام'),
+            h('button', { class: 'mini-btn blue', style: { flex: 'none' }, onclick: () => { fromI.value = dateStr(Date.now() - 30 * 864e5); toI.value = dateStr(); draw(); } }, 'آخر 30 يوماً'),
+            h('button', { class: 'mini-btn blue', style: { flex: 'none' }, onclick: () => { fromI.value = dateStr(Date.now() - 365 * 864e5); toI.value = dateStr(); draw(); } }, 'آخر سنة'))),
+        h('div', { class: 'f-field full' }, info),
+        h('div', { class: 'f-field full' }, h('div', { class: 'bn-tip' },
+          'يبحث النظام في كل قوائم الشراء التي وردت فيها هذه المادة ضمن المدة، ثم يجمع نسخها الورقية في ملف PDF واحد باسم المادة والتاريخ.'))),
+      actions: [
+        { label: 'إلغاء', cls: 'n', onClick: c => c() },
+        { label: 'تصدير pdf', cls: 'g', icon: 'download', big: true, onClick: c => {
+            const ls = draw();
+            exportPdf(p, fromI.value, toI.value, ls).then(ok => { if (ok) c(); });
+          } },
+      ] });
+    setTimeout(() => fromI.focus(), 60);
+  }
+
+  async function exportPdf(p, from, to, ls) {
+    if (!ls.length) { toast('لا قوائم ضمن المدة المحددة', 'r'); return false; }
+    if (!(window.desktop && window.desktop.pdf && window.desktop.pdf.export)) {
+      toast('تصدير PDF يعمل داخل تطبيق سطح المكتب فقط', 'r'); return false;
+    }
+    toast('جارٍ جمع النسخ الورقية وتجهيز الـ PDF…', 'b');
+    const pages = [];
+    for (const pu of ls) {
+      if (pages.length >= 80) break;
+      const it = (pu.items || []).find(x => x.productId === p.id) || {};
+      const images = [];
+      for (const id of (Array.isArray(pu.papers) ? pu.papers : [])) {
+        const d = await get(id);
+        if (d && okType(d.dataUrl)) images.push({ mime: mimeOf(d.dataUrl), data: bad64(d.dataUrl) });
+      }
+      pages.push({
+        heading: `قائمة شراء رقم ${pu.listNum || '—'} — ${pu.supplierName || '—'} — ${fmtDate(pu.ts)} ${fmtTime(pu.ts)}`,
+        lines: [
+          `الصنف: ${p.brandName}${p.company ? ' — ' + p.company : ''}${p.dose ? ' — ' + p.dose : ''}${p.form ? ' ' + p.form : ''}`,
+          `العدد من هذه المادة: ${fmt(it.qty || 0)} ${it.unitName || ''} (= ${fmt(it.qtyBase || 0)} ${smallUnitName(p)})`,
+          `سعر الشراء: ${fmt(it.buyPrice || 0)} ${cur()} للـ${it.unitName || bigUnitName(p)} • المجموع: ${fmt(it.total || 0)} ${cur()}`,
+          `إجمالي القائمة: ${fmt(pu.total || 0)} ${cur()} (${pu.pay === 'cash' ? 'كاش' : 'آجل'}) • الخصم: ${fmt(pu.discount || 0)} ${cur()}`,
+          `الموظف: ${pu.employeeName || '—'} • النسخ الورقية: ${images.length ? images.length : 'لا توجد نسخة ورقية لهذه القائمة'}`,
+        ],
+        images,
+      });
+    }
+    const fileName = `${p.brandName}-${from || 'بداية'}_${to || dateStr()}`;
+    let res;
+    try {
+      res = await window.desktop.pdf.export({ fileName,
+        title: `الفواتير الورقية — ${p.brandName}`,
+        sub: `${state.settings.pharmacyName || 'صيدلية درب الشفاء'} • المدة: ${from || 'بداية النظام'} إلى ${to || dateStr()} • ${pages.length} قائمة • صُدِّر في ${fmtDate(Date.now())} ${fmtTime(Date.now())}`,
+        pages });
+    } catch (e) { res = { ok: false, reason: String((e && e.message) || e) }; }
+    if (!res || !res.ok) {
+      if (String((res && res.reason) || '') !== 'canceled') toast('تعذّر إنشاء ملف PDF: ' + ((res && res.reason) || 'خطأ غير معروف'), 'r');
+      return false;
+    }
+    toast(`نزل الملف «${fileName}.pdf» — ${pages.length} قائمة`);
+    return true;
+  }
+
+  return { attach, get, viewer, listsFor, openInvoices };
+})();
+
 /* ───────────────────────── 24) تبويب الماسح الذكي ───────────────────────── */
 function renderScannerTab(tab) {
   const page = h('div', { class: 'page', style: { overflowY: 'auto' } });
@@ -5759,23 +6764,66 @@ function renderScannerTab(tab) {
   tab.el.append(page);
   InvoiceScanner.mount(mount, {
     getKey: () => state.settings.geminiKey,
-    onImport: items => {
+    /* ★ لحظة «استيراد إلى قائمة الشراء»: الماسح يُغلق، والمذخر ورقم القائمة يملآن مكانهما في قائمة الشراء كما هو مطبوع على الورقة */
+    onImport: (items, meta) => {
+      const info = meta || {};
       const rt = tab.props.returnTab && tabs.find(t => t.id === tab.props.returnTab);
       const target = (rt && rt.type === 'purchase') ? rt : openTab('purchase');
-      let added = 0, missed = 0;
+      const st = target.state;
+      let added = 0, missed = 0, noQty = 0;
       items.forEach(it => {
         const p = (it.productId && findProd(it.productId)) ||
           state.products.find(x => !x.deleted && x.brandName.trim().toLowerCase() === String(it.name || '').trim().toLowerCase());
         if (!p) { missed++; return; }
-        addPurchaseItem(target, p, +it.qty || 1, {
+        if (!(+it.qty > 0)) { noQty++; return; }   /* سطر بونص بلا عدد شراء: لا يُضاف للقائمة */
+        addPurchaseItem(target, p, +it.qty, {
           price: it.price ?? it.unitPrice ?? it.buyPrice ?? it.cost,
           expiry: (InvoiceScanner.normExpiry && InvoiceScanner.normExpiry(it.expiry)) || '',
           silent: true,
         });
         added++;
       });
+      /* ★ المذخر من رأس الورقة: مقارنة عربية مجرّدة (تشكيل/همزات/«ال»/ألقاب مثل مذخر وتجهيز أدوية) */
+      const TIT = ['مذاكر', 'مذاكي', 'مذخر', 'مخزن', 'مجهز', 'مجهزين', 'تجهيز', 'شركه', 'ادويه', 'ادوات', 'صيدليه', 'مؤسسه', 'وكيل'];
+      const strip = s => String(s || '').split(' ').filter(w => w && !TIT.some(t => w.includes(t))).join(' ').trim();
+      const arNum = s => String(s == null ? '' : s)
+        .replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 0x06F0))
+        .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660))
+        .replace(/[^0-9]+/g, ' ').trim().split(' ')[0] || '';
+      const live = state.suppliers.filter(s => !s.deleted);
+      let supMsg = '';
+      const q = arNorm(info.supplier);
+      if (q) {
+        const hit = live.find(s => arNorm(s.name) === q)
+          || live.find(s => { const n = arNorm(s.name); return n.length >= 3 && (n.includes(q) || q.includes(n)); })
+          || live.find(s => { const a = strip(arNorm(s.name)), b = strip(q); return a && b && (a === b || a.includes(b) || b.includes(a)); })
+          || live.find(s => { const a = strip(arNorm(s.name)).split(' ')[0] || '', b = strip(q).split(' ')[0] || '';
+            return a.length >= 3 && b.length >= 3 && _tokScore(b, a, true) >= 45; });
+        if (hit) { st.supplierId = hit.id; supMsg = `المذخر «${hit.name}»`; }
+        else supMsg = `لم يُطابق المذخر «${String(info.supplier).trim()}» — اختره`;
+      }
+      /* ★ رقم القائمة من رأس الورقة: رقم صحيح كما هو مطبوع، لا يسبقه تخمين */
+      let numMsg = '';
+      const dn = arNum(info.listNum);
+      if (num(dn) > 0) { st.listNum = num(dn); numMsg = `رقم قائمة ${st.listNum}`; }
+      else if (dn) numMsg = `رقم «${dn}» غير مقبول`;
+      /* ★ النسخة الورقية: صورة القائمة تُلحق بالقائمة وتُلصق بها رسمياً عند «حفظ القائمة» */
+      if (info.image) {
+        st.papers = Array.isArray(st.papers) ? st.papers : [];
+        if (!st.papers.some(x => x && x.dataUrl === info.image)) st.papers.push({ dataUrl: info.image });
+      }
+      const lots = Array.isArray(info.bonusLots) ? info.bonusLots : [];
+      if (lots.length) st.bonusLots = (Array.isArray(st.bonusLots) ? st.bonusLots : []).concat(lots);
+      renderTabContent(target);            /* الرأس يُحدَّث فوراً: المذخر مختار ورقم القائمة ظاهر */
       activateTab(target.id);
-      toast(`استُوردت ${added} مادة إلى قائمة الشراء` + (missed ? ` — ${missed} غير موجودة في المخزن` : ''), missed ? 'r' : 'g');
+      closeTab(tab.id);
+      toast(`استُوردت ${added} مادة إلى قائمة الشراء`
+        + (supMsg ? ` — ${supMsg}` : '')
+        + (numMsg ? ` — ${numMsg}` : '')
+        + (lots.length ? ` — ${lots.length} بونص يُحفظ مع القائمة` : '')
+        + (missed ? ` — ${missed} لم تُطابق مخزنك` : '')
+        + (noQty ? ` — ${noQty} سطر بلا عدد شراء` : ''),
+        (missed || noQty || supMsg.startsWith('لم') || numMsg.startsWith('رقم «')) ? 'r' : 'g');
     },
   });
 }
@@ -5881,7 +6929,7 @@ function renderReturnSale(tab) {
       h('div', { class: 'total-card grand red-grand' }, h('label', {}, 'المبلغ المسترجع للزبون'), grandEl)),
     h('div', { class: 'pay-row' },
       h('button', { class: 'pay-btn credit', onclick: () => finalizeReturnSale(tab) },
-        h('span', { html: icon('refresh') }), 'إرجاع البيع')));
+        h('span', { html: icon('refresh') }), 'إرجاع البيع ', h('kbd', {}, 'Ctrl+S'))));
 
   /* اللوح الذكي (25%): آخر 5 فواتير بيع لآخر صنف أُدخل — ويتبدل تلقائياً مع كل صنف جديد */
   const side = h('div', { class: 'pos-side' });
@@ -6039,7 +7087,7 @@ function renderReturnPurchase(tab) {
     h('div', { class: 'totals-row' },
       h('div', { class: 'total-card grand red-grand' }, h('label', {}, 'إجمالي المُرجَع للمذخر'), totalEl)),
     h('div', { class: 'pay-row' },
-      h('button', { class: 'pay-btn credit', onclick: () => saveReturnPurchaseModal(tab) }, h('span', { html: icon('refresh') }), 'حفظ إرجاع الشراء')));
+      h('button', { class: 'pay-btn credit', onclick: () => saveReturnPurchaseModal(tab) }, h('span', { html: icon('refresh') }), 'حفظ إرجاع الشراء ', h('kbd', {}, 'Ctrl+S'))));
 
   center.append(cartWrap);
   const side = h('div', { class: 'pos-side' });
@@ -6249,10 +7297,10 @@ async function init() {
   $('#tab-add').onclick = () => openTab('pos');
   try {
     await DB.open();
-    const [accounts, products, sales, purchases, suppliers, payments, customers, settingsArr] = await Promise.all(
-      ['accounts','products','sales','purchases','suppliers','payments','customers','settings'].map(s => DB.all(s)));
+    const [accounts, products, sales, purchases, suppliers, payments, customers, bonuses, settingsArr] = await Promise.all(
+      ['accounts','products','sales','purchases','suppliers','payments','customers','bonuses','settings'].map(s => DB.all(s)));
     state.accounts = accounts; state.products = products; state.sales = sales; state.purchases = purchases;
-    state.suppliers = suppliers; state.payments = payments; state.customers = customers;
+    state.suppliers = suppliers; state.payments = payments; state.customers = customers; state.bonuses = bonuses;
         /* ★ زبون دائم: دكتورة نادية — يُنشأ مرة واحدة فقط إن لم يكن موجوداً */
     if (!state.customers.some(c => c.id === DR_NADIA_ID)) {
       await save('customers', { id: DR_NADIA_ID, name: 'دكتورة نادية', createdAt: Date.now() });
@@ -6502,7 +7550,12 @@ function toggleCalc() { if (document.getElementById('calc-win')) closeCalc(); el
 document.addEventListener('keydown', e => {
   if (e.key !== '+' || e.ctrlKey || e.altKey || e.metaKey) return;
   const ae2 = e.target;
-  if (ae2 && (/^(INPUT|TEXTAREA|SELECT)$/.test(ae2.tagName) || ae2.isContentEditable)) return;   /* داخل حقل إدخال = يُكتب + عادياً */
+  if (ae2 && ae2.closest && ae2.closest('#calc-win')) return;   /* داخل الحاسبة: يُكتب + كعادته */
+  const tag2 = ae2 && ae2.tagName ? ae2.tagName : '';
+  const typ2 = ae2 && ae2.type ? String(ae2.type) : '';
+  const freeText = tag2 === 'TEXTAREA' || (tag2 === 'INPUT' && ['text', 'email', 'tel', 'url', 'password', ''].indexOf(typ2) >= 0) || (ae2 && ae2.isContentEditable);
+  const inSearch = !!(ae2 && ae2.closest && ae2.closest('.search-engine'));
+  if (freeText && !inSearch) return;   /* الحقول النصية الحرة (اسم صنف، ملاحظة…) تحتفظ بالبلس للمستخدم */
   e.preventDefault();
   if (!state.session && !document.getElementById('calc-win')) return;   /* لا تفتح قبل تسجيل الدخول */
   toggleCalc();
