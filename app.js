@@ -526,13 +526,13 @@ function promptBox(title, { placeholder = '', value = '', type = 'text', okLabel
     const settle = v => { if (!settled) { settled = true; res(v); } };
     const inp = h('input', { type, value, placeholder, style: { width: '100%', border: '1.5px solid var(--line)', borderRadius: '12px', padding: '11px 14px', fontWeight: 800, fontSize: '15px', outline: 'none' } });
     const done = (c) => { const v = inp.value.trim(); settle(v || null); c(); };
-    openModal({
+    const modal = openModal({
       title, icon: 'edit', body: inp,
       actions: [{ label: 'إلغاء', cls: 'n', onClick: c => { settle(null); c(); } }, { label: okLabel, cls: 'g', onClick: done }],
       onClose: () => settle(null),
     });
     inp.focus(); inp.select();
-    inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); done(() => $('#modal-root').innerHTML = ''); } });
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); done(modal.close); } });
   });
 }
 
@@ -897,33 +897,80 @@ function _scoreProduct(p, qt, fuzzy) {
   return total;
 }
 const _rawQ = q => String(q || '').trim().toLowerCase().replace(/[\u0660-\u0669]/g, d => d.charCodeAt(0) - 0x0660);
+/* ═══ انعكاس لوحة المفاتيح: عربي ↔ إنكليزي على نفس الأزرار (تخطيط Arabic 101) ═══ */
+const LAY_AR2EN = {
+  'ض':'q','ص':'w','ث':'e','ق':'r','ف':'t','غ':'y','ع':'u','ه':'i','خ':'o','ح':'p','ج':'[','د':']',
+  'ش':'a','س':'s','ي':'d','ب':'f','ل':'g','ا':'h','ت':'j','ن':'k','م':'l','ك':';','ط':"'",
+  'ئ':'z','ء':'x','ؤ':'c','ر':'v','ى':'n','ة':'m','و':',','ز':'.','ظ':'/','ذ':'`',
+  'أ':'h','إ':'h','آ':'h','ٱ':'h','ی':'d','ک':';'
+};
+const LAY_EN2AR = {};
+for (const ar in LAY_AR2EN) if (!LAY_EN2AR[LAY_AR2EN[ar]]) LAY_EN2AR[LAY_AR2EN[ar]] = ar;
+function layFlip(s) {                    // يبدّل كل حرف بحرف الزر نفسه في اللوحة الأخرى
+  let out = '', hits = 0;
+  for (const ch of String(s == null ? '' : s)) {
+    const l = ch.toLowerCase();
+    if (LAY_AR2EN[l] !== undefined) { out += LAY_AR2EN[l]; hits++; }
+    else if (LAY_EN2AR[l] !== undefined) { out += LAY_EN2AR[l]; hits++; }
+    else out += ch;
+  }
+  return hits ? out : '';
+}
+function _queryVariants(q) {             // النسخة الأصلية أولاً، ثم نسخة انعكاس اللوحة
+  const list = [], base = arTokens(q);
+  if (base.length) list.push({ t: base, lay: 0 });
+  const flip = layFlip(q);
+  if (flip) {
+    const ft = arTokens(flip);
+    if (ft.length && ft.join('').length >= 2 && ft.join(' ') !== base.join(' ')) list.push({ t: ft, lay: 1 });
+  }
+  return list;
+}
+const _layHits = new Set();              // أصناف جاءت عبر الانعكاس وحده (لشارة المقترحات)
+const _bcEq  = (p, raw) => (p.barcodes || []).some(b => String(b).toLowerCase() === raw);
+const _bcHit = (p, raw) => (p.barcodes || []).some(b => String(b).toLowerCase().includes(raw));
 function prodMatches(p, q) {   // للفلاتر (المخزن…)
-  const qt = arTokens(q); if (!qt.length) return true;
-  const raw = _rawQ(q);
-  return _scoreProduct(p, qt, true) > 0 || (p.barcodes || []).some(b => String(b).toLowerCase().includes(raw));
+  const raw = _rawQ(q); if (!raw) return true;
+  const vars = _queryVariants(q);
+  if (!vars.length) return true;
+  for (const v of vars) if (_scoreProduct(p, v.t, true) > 0) return true;
+  return _bcHit(p, raw);
 }
 function searchProducts(q) {
   const raw = _rawQ(q);
+  _layHits.clear();
   if (!raw) return [];
   const live = state.products.filter(p => !p.deleted);
-  const exact = live.find(p => (p.barcodes || []).some(b => String(b).toLowerCase() === raw));
+  const exact = live.find(p => _bcEq(p, raw));
   if (exact) return [exact];
-  const qt = arTokens(q);
+  const vars = _queryVariants(q);
   const rank = (a, b) => b.s - a.s || a.p.brandName.length - b.p.brandName.length;
-  const strict = [];
-  for (const p of live) {
-    let s = qt.length ? _scoreProduct(p, qt, false) : 0;
-    if (!s && (p.barcodes || []).some(b => String(b).toLowerCase().includes(raw))) s = 50;
-    if (s) strict.push({ p, s });
+  if (!vars.length) return live.filter(p => _bcHit(p, raw)).slice(0, 12);
+  const best = new Map(), direct = new Set();
+  const feed = (arr, w, lay) => arr.forEach(x => {
+    if (!lay) direct.add(x.p.id);
+    const s = Math.round(x.s * w), cur = best.get(x.p.id);
+    if (!cur || s > cur.s) best.set(x.p.id, { p: x.p, s, lay });
+  });
+  for (const v of vars) {
+    const strict = [];
+    for (const p of live) {
+      const s = _scoreProduct(p, v.t, false);
+      if (s) strict.push({ p, s });
+      else if (_bcHit(p, raw)) strict.push({ p, s: 50 });
+    }
+    strict.sort(rank);
+    feed(strict, v.lay ? 0.88 : 1, v.lay);            // نتيجة الانعكاس أدنى بمرتبة من المطابق المباشر
+    if (strict.length < 4 && v.t.some(t => t.length >= 3)) {      // تنبؤ/تصحيح عند قلة النتائج
+      const ids = new Set(strict.map(x => x.p.id)), fz = [];
+      for (const p of live) { if (ids.has(p.id)) continue; const s = _scoreProduct(p, v.t, true); if (s) fz.push({ p, s }); }
+      fz.sort(rank);
+      feed(fz, v.lay ? 0.78 : 0.9, v.lay);
+    }
   }
-  strict.sort(rank);
-  let res = strict;
-  if (strict.length < 4 && qt.some(t => t.length >= 3)) {      // تنبؤ/تصحيح عند قلة النتائج
-    const ids = new Set(strict.map(x => x.p.id)), fz = [];
-    for (const p of live) { if (ids.has(p.id)) continue; const s = _scoreProduct(p, qt, true); if (s) fz.push({ p, s }); }
-    fz.sort(rank); res = strict.concat(fz);
-  }
-  return res.slice(0, 12).map(x => x.p);
+  const out = [...best.values()].sort(rank).slice(0, 12);
+  out.forEach(x => { if (x.lay && !direct.has(x.p.id)) _layHits.add(x.p.id); });
+  return out.map(x => x.p);
 }
 
 /* ───────────────────────── 12) نقطة البيع ───────────────────────── */
@@ -988,6 +1035,7 @@ function renderPOS(tab) {
         sugBox.append(h('div', { class: 'sug-item', onclick: () => { pickProduct(p); } },
           h('span', { class: 'sug-ic', html: icon('pill') }),
           h('div', { class: 'sug-name' }, p.brandName, coTag(p),
+            _layHits.has(p.id) ? h('span', { class: 'sug-lay', title: 'كتابتها على لوحة غير لغة الكتابة' }, '⌨ انعكاس اللوحة') : null,
             h('small', {}, `${p.scientificName || ''}${p.scientificName ? ' • ' : ''}${p.form || ''} ${p.dose || ''}`)),
           h('span', { class: 'sug-stock' + ((p.stockBase || 0) <= (state.settings.lowStock ?? 10) ? ' low' : '') },
             `المخزون: ${fmt(p.stockBase || 0)} ${smallUnitName(p)}`),
@@ -1031,6 +1079,7 @@ function renderPOS(tab) {
   /* جدول السلة */
   const cartWrap = h('div', { class: 'cart-wrap' });
   st.renderCart = () => {
+    dsKeepView(cartWrap);
     cartWrap.innerHTML = '';
     if (!st.cart.length) {
       cartWrap.append(h('div', { class: 'cart-empty', inert: true, 'aria-hidden': 'true' },
@@ -1319,7 +1368,7 @@ function renderPOSSide(tab) {
   const tabsBar = h('div', { class: 'side-tabs' });
 
   /* ★ تبويب دكتورة نادية دائم الظهور للإضافة السريعة — الزبون نفسه يُختار لحظة الحفظ */
-  const TABS = [['dr', 'دكتورة نادية'], ['featured', 'المميز'], ['invoices', 'الفواتير السابقة'], ['shortage', 'النواقص'], ['shift', 'تقرير الشفت']];
+  const TABS = [['dr', 'د. نادية'], ['featured', 'المميز'], ['invoices', 'الفواتير'], ['shortage', 'النواقص'], ['shift', 'الشفت']];
   if (!TABS.some(([k]) => k === st.sideTab)) st.sideTab = 'dr';
 
   function draw() {
@@ -1365,7 +1414,7 @@ function drawDrNadia(tab, body) {
     return;
   }
   const tbody = h('tbody');
-  rows.forEach((r, i) => tbody.append(h('tr', { class: 'dr-row', title: 'اضغط للإضافة للسلة', onclick: () => addToCart(tab, r.p) },
+  rows.forEach((r, i) => tbody.append(h('tr', { class: 'dr-row', title: r.p.brandName + ' — اضغط للإضافة للسلة', onclick: () => addToCart(tab, r.p) },
     h('td', { class: 'td-seq' }, i + 1),
     h('td', { class: 'td-name' }, r.p.brandName, coTag(r.p)),
     h('td', {}, h('span', { class: 'badge b' }, `${r.count}×`)),
@@ -1382,7 +1431,10 @@ function drawDrNadia(tab, body) {
       } })))));
   body.append(h('div', { class: 'tbl-scroll dr-table' },
     h('table', { class: 'tbl' },
-      h('thead', {}, h('tr', {}, h('th', {}, 'ت'), h('th', {}, 'الصنف'), h('th', {}, 'مرات البيع'), h('th', {}, 'السعر'), h('th', {}, ''))),
+      h('thead', {}, h('tr', {},
+        h('th', { style: { width: '20px' } }, 'ت'), h('th', {}, 'الصنف'),
+        h('th', { style: { width: '34px' } }, 'مرات'), h('th', { style: { width: '44px' } }, 'السعر'),
+        h('th', { style: { width: '30px' } }, ''))),
       tbody)));
 }
 
@@ -1591,39 +1643,164 @@ function dsScroll(dir) {
   if (cand) { cand.scrollTop += dir * 110; return; }
   window.scrollBy(0, dir * 110);
 }
+/* يحفظ موضع التمرير والموضع المُركّز قبل إعادة رسم الجدول ويرجعهما بعده */
+function dsKeepView(wrap) {
+  const box = wrap ? wrap.querySelector('.tbl-scroll') : null;
+  const af = document.activeElement;
+  let spot = null;
+  if (box && af && af !== document.body && box.contains(af)) {
+    const tr = af.closest('tr'), td = af.closest('td');
+    if (tr && td) spot = {
+      i: [...tr.parentElement.children].indexOf(tr),
+      j: [...td.parentElement.children].indexOf(td),
+      k: [...td.querySelectorAll('input,select,textarea,button')].indexOf(af),
+      s: (af.tagName === 'INPUT' && af.type !== 'number') ? af.selectionStart : null,
+      e: (af.tagName === 'INPUT' && af.type !== 'number') ? af.selectionEnd : null
+    };
+  }
+  const top = box ? box.scrollTop : 0, left = box ? box.scrollLeft : 0;
+  requestAnimationFrame(() => {
+    const nb = (wrap && wrap.isConnected) ? wrap.querySelector('.tbl-scroll') : null;
+    if (!nb) return;
+    nb.scrollTop = top; nb.scrollLeft = left;
+    if (!spot || spot.i < 0 || spot.j < 0) return;
+    const tr = nb.querySelector('tbody tr:nth-child(' + (spot.i + 1) + ')');
+    const td = tr && tr.children[spot.j];
+    const list = td ? [...td.querySelectorAll('input,select,textarea,button')] : [];
+    const el = list[spot.k];
+    if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'SELECT')) return;   // الأزرار لا تُستعاد كي لا يتكرر الضغط
+    el.focus({ preventScroll: true });
+    if (el.setSelectionRange && spot.s != null) { try { el.setSelectionRange(spot.s, spot.e); } catch (_) {} }
+  });
+}
+/* ★ مؤشر الخلية: الجدول الذي تمشي فيه الأسهم + العمود المحفوظ بعد كل إعادة رسم */
+let dsCell = null, dsCol = 0;
+function dsTds(tr) { return [...tr.children].filter(x => x.tagName === 'TD'); }
+function dsTables(scope) {
+  return [...scope.querySelectorAll('table.tbl')].filter(t => t.tBodies.length && t.tBodies[0].rows.length);
+}
+/* الجدول المقصود: جدول الخلية المركّز عليها ← الخلية المحددة ← جدول فيه تحديد ← أول جدول في الشاشة */
+function dsPickTable(scope) {
+  const ae = document.activeElement;
+  const own = ae && ae.closest ? ae.closest('table.tbl') : null;
+  if (own && scope.contains(own) && own.tBodies.length && own.tBodies[0].rows.length) return own;
+  if (dsCell && (!dsCell.isConnected || !scope.contains(dsCell))) dsCell = null;
+  if (dsCell) { const t = dsCell.closest('table.tbl'); if (t) return t; }
+  const ts = dsTables(scope);
+  return ts.find(t => t.querySelector('td.ds-cell, tr.ds-cur')) || ts[0] || null;
+}
 function dsTableRows(scope) {
-  const boxes = [...scope.querySelectorAll('.tbl-scroll')];
-  const pick = boxes.find(b => b.scrollHeight > b.clientHeight + 2 && b.querySelectorAll('tbody tr').length)
-    || boxes.find(b => b.querySelectorAll('tbody tr').length);
-  return pick ? [...pick.querySelectorAll('tbody tr')] : [];
+  const t = dsPickTable(scope);
+  return t ? [...t.tBodies[0].rows] : [];
+}
+/* الموضع الحالي: من التركيز ← من الخلية المحددة ← من صف التحديد ← أول صف */
+function dsPos(t) {
+  const rows = [...t.tBodies[0].rows];
+  if (!rows.length) return null;
+  const ae = document.activeElement;
+  const c = ae && ae.closest ? ae.closest('td') : null;
+  let ri = -1, ci = -1;
+  if (c && t.contains(c)) { ri = rows.indexOf(c.parentElement); ci = dsTds(c.parentElement).indexOf(c); }
+  else if (dsCell && dsCell.isConnected && t.contains(dsCell)) { ri = rows.indexOf(dsCell.parentElement); ci = dsTds(dsCell.parentElement).indexOf(dsCell); }
+  else { ri = rows.findIndex(r => r.classList.contains('ds-cur')); ci = dsCol; }
+  if (ri < 0) ri = 0;
+  const tds = dsTds(rows[ri]);
+  if (!tds.length) return null;
+  if (ci < 0) ci = 0; else if (ci >= tds.length) ci = tds.length - 1;
+  return { rows, ri, ci, cell: tds[ci] };
+}
+/* يكشف الصّف/الخلية كاملة أسفل الترويسة اللزجة (thead sticky) */
+function dsReveal(el, horiz) {
+  if (!el || !el.getBoundingClientRect) return;
+  const host = (el.closest && el.closest('.tbl-scroll')) || dsScrollHost(el) || dsScrollHost(dsScope());
+  if (!host) { el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); return; }
+  const box = host.getBoundingClientRect(), th = host.querySelector('thead');
+  const r = el.getBoundingClientRect();
+  const topEdge = box.top + (th ? th.getBoundingClientRect().height : 0) + 4;
+  const botEdge = box.bottom - 4;
+  if (r.top < topEdge) host.scrollTop -= (topEdge - r.top);
+  else if (r.bottom > botEdge) host.scrollTop += (r.bottom - botEdge);
+  if (horiz) {
+    const rtl = getComputedStyle(host).direction === 'rtl', c = el.getBoundingClientRect();
+    if (c.left < box.left + 2) host.scrollLeft += rtl ? (box.left + 2 - c.left) : (c.left - box.left - 2);
+    else if (c.right > box.right - 2) host.scrollLeft += rtl ? (box.right - c.right - 2) : (c.right - box.right + 2);
+  }
+}
+function dsColStep(K, el) {                     // يمين/يسار حسب اتجاه الجدول
+  return (K === 'ArrowRight') === (getComputedStyle(el || document.body).direction !== 'rtl') ? 1 : -1;
+}
+function dsCaretAtEdge(inp, K) {                // النص داخل الخلية يأخذ السهم أولاً
+  const t = inp.type || 'text';
+  if (t === 'number' || !/^(text|search|tel|url|password|email)$/.test(t)) return true;
+  const s = inp.selectionStart, e = inp.selectionEnd;
+  if (s == null || e == null) return true;
+  const rtl = getComputedStyle(inp).direction === 'rtl';
+  const atStart = (s === 0 && e === 0), atEnd = (s >= inp.value.length && e >= inp.value.length);
+  return (K === 'ArrowLeft') === rtl ? atEnd : atStart;
+}
+function dsMarkCell(td) {
+  const row = td.closest('tr');
+  if (!row) return;
+  document.querySelectorAll('table.tbl td.ds-cell').forEach(x => x.classList.remove('ds-cell'));
+  document.querySelectorAll('table.tbl tr.ds-cur').forEach(x => x.classList.remove('ds-cur'));
+  td.classList.add('ds-cell');
+  row.classList.add('ds-cur');
+  dsCell = td;
+  dsCol = Math.max(0, dsTds(row).indexOf(td));
+}
+function dsFocusCell(tc) {
+  if (!tc) return false;
+  dsMarkCell(tc);
+  const f = tc.matches('input,select,textarea,button') ? tc : tc.querySelector('input:not([disabled]),select:not([disabled]),textarea,button');
+  if (f) { f.focus({ preventScroll: true }); if (f.tagName === 'INPUT' && f.select) f.select(); }
+  else { tc.tabIndex = -1; tc.focus({ preventScroll: true }); }   // الخلية النصية تُحدد: التركيز على الخلية نفسها
+  dsReveal(tc, true);
+  return true;
+}
+function dsHScroll(K, el) {                     // يمين/يسار عند حافة الجدول = تمرير الجدول نفسه فقط
+  const host = (el && el.closest ? el.closest('.tbl-scroll') : null)
+    || [...dsScope().querySelectorAll('.tbl-scroll')].find(x => x.scrollWidth > x.clientWidth + 2);
+  if (!host || host.scrollWidth <= host.clientWidth + 2) return;
+  host.scrollLeft += ((K === 'ArrowLeft') === (getComputedStyle(host).direction === 'rtl')) ? 110 : -110;
 }
 function dsArrowNav(e) {
   if (!state.session || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
-  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+  const K = e.key;
+  const isRow = (K === 'ArrowDown' || K === 'ArrowUp');
+  const isCol = (K === 'ArrowRight' || K === 'ArrowLeft');
+  if (!isRow && !isCol) return;
   const ae = document.activeElement;
   if (ae && ae.closest && (ae.closest('#calc-win') || ae.closest('.ds-stage'))) return;
   if (ae && (ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
   if (ae && ae.tagName === 'INPUT' && /month|date|time|week/.test(ae.type || '')) return;   // الإكسباير: يبقى يدوّر الأشهر
   const scope = dsScope();
   if ([...document.querySelectorAll('.suggestions.show')].some(s => s.contains(ae) || scope.contains(s))) return;   // المقترحات مفتوحة: الأسهم لها
-  const dir = e.key === 'ArrowDown' ? 1 : -1;
+  const dir = K === 'ArrowDown' ? 1 : (K === 'ArrowUp' ? -1 : 0);
   const cell = ae && ae.closest ? ae.closest('td') : null;
-  if (cell) {
-    const tr = cell.closest('tr');
-    const body = tr && tr.closest('table') && tr.closest('table').tBodies.length ? tr.closest('table').tBodies[0] : null;
-    if (body) {
-      e.preventDefault();
-      const rows = [...body.rows], col = [...tr.children].indexOf(cell);
-      const nxt = rows[rows.indexOf(tr) + dir];
-      const tc = nxt ? nxt.children[col] : null;
-      if (tc) {
-        const f = tc.matches('input,select,textarea,button') ? tc : tc.querySelector('input,select,textarea,button');
-        if (f) { f.focus(); if (f.tagName === 'INPUT' && f.select) f.select(); }
-        else tc.scrollIntoView({ block: 'nearest' });
-      } else dsScroll(dir);
+  if (isCol && ae && (ae.tagName === 'SELECT' || (cell && ae.tagName === 'INPUT' && !dsCaretAtEdge(ae, K)))) return;   // Dropdown والنص: أسهمهما محفوظة
+  if (isCol && !cell && ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName || '')) return;   // حقل كتابة خارج الجدول: السهم لمؤشر النص
+  const t = dsPickTable(scope);
+  const p = t ? dsPos(t) : null;
+  if (p && p.cell) {
+    e.preventDefault();
+    const tds = dsTds(p.rows[p.ri]);
+    if (isRow) {
+      const nxt = p.rows[p.ri + dir];
+      if (!nxt) { dsScroll(dir); return; }
+      dsFocusCell(dsTds(nxt)[Math.min(p.ci, dsTds(nxt).length - 1)]);
       return;
     }
+    const step = dsColStep(K, t);
+    let tc = tds[p.ci + step];
+    if (!tc) {                                  // آخر العمود ← أول عمود في صف مجاور مثل الإكسل
+      const row = p.rows[p.ri + (step > 0 ? 1 : -1)];
+      const r2 = row ? dsTds(row) : null;
+      tc = r2 && r2.length ? r2[step > 0 ? 0 : r2.length - 1] : null;
+    }
+    if (tc) dsFocusCell(tc); else dsHScroll(K, p.cell);
+    return;
   }
+  if (isCol) { e.preventDefault(); dsHScroll(K, ae); return; }
   const rows = dsTableRows(scope);
   if (rows.length) {
     e.preventDefault();
@@ -1632,7 +1809,7 @@ function dsArrowNav(e) {
     const j = i < 0 ? (dir === 1 ? 0 : rows.length - 1) : Math.max(0, Math.min(rows.length - 1, i + dir));
     rows.forEach(r => r.classList.remove('ds-cur'));
     rows[j].classList.add('ds-cur');
-    rows[j].scrollIntoView({ block: 'nearest' });
+    dsReveal(rows[j]);
     return;
   }
   e.preventDefault();
@@ -2218,6 +2395,7 @@ function renderPurchase(tab) {
   /* جدول الأصناف */
   const cartWrap = h('div', { class: 'cart-wrap' });
   st.renderItems = () => {
+    dsKeepView(cartWrap);
     cartWrap.innerHTML = '';
     if (!st.items.length) {
       cartWrap.append(h('div', { class: 'cart-empty' }, h('span', { html: icon('purchase') }), h('p', {}, 'أدخل باركود الأصناف لبناء قائمة الشراء')));
@@ -5183,29 +5361,532 @@ const DoseCalc = (() => {
   const inflight = new Map();
   let cssDone = false;
 
-  /* الأشكال المستهدفة: شراب / معلق / نقط / حقن وأمبولات */
-  const LIQ = /syrup|susp|drop|amp|vial|infusion|sachet|emuls|solution|mixture|linctus|شراب|معلق|نقط|قطرة|حقن|امبول|أمبول|فيال/i;
-  const applicable = p => !!(p && (LIQ.test(S(p.form)) || LIQ.test(S(p.dose))));
+  /* الأشكال التي تُفتح لها الحاسبة: الشراب والمعلّق والنقط فقط — لا فيال ولا أمبول ولا أقراص ولا حقن */
+  const SYRUP = /syrup|sirup|susp|linctus|elixir|gutt|drops?\b|قطرة|قطرات|نقط|شراب|معلق|معلّق/i;
+  const EXCL = /vial|amp|inje|infusion|nebul|\btab|\bcap|supp|\bgum|granul|sachet|cream|oint|\bgel|patch|spray|pessary|فيال|امبول|أمبول|حقن|قرص|أقراص|اقراص|كبسول|لبوس|مرهم|كريم|بخاخ/i;
+  const applicable = p => { const f = S(p && p.form); return !!f && SYRUP.test(f) && !EXCL.test(f); };
 
-  /* نفس فلسفة الموسوعة: مفتاح من الاسم العلمي مرتّباً أبجدياً — كل المنتجات بنفس المادة تشترك بقاعدة جرعة واحدة */
+  /* تحليل الاسم العلمي: يفهم المركّبات من مادتين أو ثلاث ( + أو , أو & أو / أو and ) */
   const splitParts = sci => S(sci)
     .replace(/\(.*?\)/g, ' ')
     .split(/\s*(?:\+|\/|&|,|;|\band\b)\s*/i)
     .map(x => x.replace(/\d+(?:[.,]\d+)?\s*(?:mg|mcg|µg|ug|gm|g|ml|iu|%|units?)(?![a-z])/ig, ' ').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
-  const keyOf = ps => ps.map(x => x.toLowerCase().replace(/[^a-z0-9\u0600-\u06FF]+/g, '_').replace(/^_+|_+$/g, '')).filter(Boolean).sort().join('__').slice(0, 200);
+  /* أملاح الاسم واستراته لا تغيّر المادة: «Amoxicillin trihydrate» ← amoxicillin */
+  const SALT = /^(tri.?hydrate|tetra.?hydrate|di.?hydrate|anhydrous|hydrochloride|hydrochlorid|dihydrochloride|hydrobromide|chloride|bromide|sulfate|sulphate|sulfuric|sodium|potassium|calcium|magnesium|ammonium|meglumine|maleate|mesylate|besylate|tartrate|citrate|acetate|propionate|valerate|pivalate|valinate|ascorbate|benzoate|pamoate|embonate|tannate|estolate|stearate|ethylsuccinate|succinate|gluconate|glucinate|naphthionate|tosilate|resinate|hydroxide|carbonate|phosphate|complex|oral|dry|powder|reconstitution)$/i;
+  const ALIAS = {
+    acetaminophen: 'paracetamol', clavulanate: 'clavulanic_acid', cephalexin: 'cefalexin', cefalexine: 'cefalexin',
+    cefuroxime: 'cefuroxime_axetil', cefixim: 'cefixime', azithromycine: 'azithromycin', metronidazol: 'metronidazole',
+    guaiphenesin: 'guaifenesin', glyceryl_guaiacolate: 'guaifenesin', phenoxymethylpenicillin: 'penicillin_v',
+    penicillin_v_potassium: 'penicillin_v', n_acetylcysteine: 'acetylcysteine', acetylcystein: 'acetylcysteine',
+    cotrimoxazole: 'co_trimoxazole', sulphamethoxazole: 'sulfamethoxazole', cholecalciferol: 'vitamin_d',
+    colecalciferol: 'vitamin_d', ergocalciferol: 'vitamin_d', ascorbic_acid: 'vitamin_c', folicacid: 'folic_acid',
+    ferrous: 'iron', ferric: 'iron', polymaltose: 'iron', iron_polymaltose: 'iron', pyrantel_pamoate: 'pyrantel',
+    salbutamol_sulfate: 'salbutamol', ambroxol_hcl: 'ambroxol', bromhexine_hcl: 'bromhexine', cetirizine_hcl: 'cetirizine',
+    l_lysine: 'lysine', aciclovir: 'acyclovir', sulphate_of_iron: 'iron'
+  };
+  /* الأسماء العربية في خانة الاسم العلمي أو اسم المنتج */
+  const ARB = [
+    [/باراسيتامول|اسيتامينوفين|أسيتامينوفين|بنادول|كالبول/, 'paracetamol'],
+    [/بروفين|ايبوبروفين|إيبوبروفين/, 'ibuprofen'],
+    [/اموكسيسيلين|أموكسيسيلين/, 'amoxicillin'],
+    [/كلافولان|كلافولانيك|حمض الكلاف/, 'clavulanic_acid'],
+    [/ازيترومايسين|أزيثرومايسين/, 'azithromycin'],
+    [/كلاريثروميسين|كلاريثروميسن/, 'clarithromycin'],
+    [/ايريتروميسين|اريثروميسين/, 'erythromycin'],
+    [/سيفالكسين|سيفالوسين/, 'cefalexin'],
+    [/سيفوروكسيم/, 'cefuroxime_axetil'],
+    [/سيفيكيم|سيفيكسين/, 'cefixime'],
+    [/ميترونيدازول|مترونيدازول/, 'metronidazole'],
+    [/امبيسيلين|أمبيسيلين/, 'ampicillin'],
+    [/سيبروفلوكساسين|سبروفلوكساسين/, 'ciprofloxacin'],
+    [/سالبوتامول|فنتولين/, 'salbutamol'],
+    [/بروم.كسين|بروهيكسين|بروهكسين|بيسولفون/, 'bromhexine'],
+    [/امبروكسول|أمبروكسول/, 'ambroxol'],
+    [/استيل سيستين|أسيتيل سيستين|ناك/, 'acetylcysteine'],
+    [/سيتريزين|سيتيريزين/, 'cetirizine'],
+    [/لوراتيدين|لوريتادين/, 'loratadine'],
+    [/ديكلامير?|كلورفينامين|كلورفينيرامين/, 'chlorpheniramine'],
+    [/بريدنيزولون|بردنيزولون/, 'prednisolone'],
+    [/ديكساميثازون|ديساميثازون/, 'dexamethasone'],
+    [/حديد|الكربونيل|بوليمالتوز/, 'iron'],
+    [/زنك|خارصين/, 'zinc'],
+    [/فوليك/, 'folic_acid'],
+    [/نستاتين|نيستاتين/, 'nystatin'],
+    [/فلوكونازول|ديفلوكان/, 'fluconazole'],
+    [/اوميبرازول|أوميبرازول/, 'omeprazole'],
+    [/اوندانسيترون|أوندانسيترون|زدفران/, 'ondansetron'],
+    [/لكتولوز|دوفالاك/, 'lactulose'],
+    [/سيميثيكون|مايكليكون/, 'simethicone'],
+    [/مونتيلوكاست|سينغولير/, 'montelukast']
+  ];
+  /* علامات تجارية معروفة تُفهم حتى لو غاب الاسم العلمي */
+  const BRAND = [
+    [/augmentin|clamox|calamox|amorx|augmentes|أوغمنتين|اوجمنتين|كلاموكس/, 'amoxicillin__clavulanic_acid'],
+    [/amoxil|amoxla|hapimox|simplicef|amoxitra/, 'amoxicillin'],
+    [/keflex|cephalexin|cefapor|cefalexine|kefex|سيفالكسين|كيفلكس/, 'cefalexin'],
+    [/zinnat|cefamox|xinat|zinnat/, 'cefuroxime_axetil'],
+    [/cefodox|vantin|podox|suprax|cefix|cefixim/, 'cefixime'],
+    [/klacid|biaxin|clarit|calyr|clarithro/, 'clarithromycin'],
+    [/zithromax|zitromax|macrolen|sittomax|azithro/, 'azithromycin'],
+    [/flagyl|metrogyl|amigyl|clindamet|metronidazol/, 'metronidazole'],
+    [/fasigyn|tinidazol/, 'tinidazole'],
+    [/septrin|bactrim|sultron|tymothol|cotrim|co.?trimox/, 'co_trimoxazole'],
+    [/zovirax|viralex|aciclovir|acyclovir/, 'acyclovir'],
+    [/tamiflu|oseltami|nomitres/, 'oseltamivir'],
+    [/calpol|panadol|tempra|adol|fevadol|celcosi|abemol|paracin|arumol/, 'paracetamol'],
+    [/brufen|nurofen|pediabur|burana|ibuprofen|brupron/, 'ibuprofen'],
+    [/novalgin|metamil|analgin|dipiro|نوفالجين|ديبون/, 'metamizole'],
+    [/ventolin|volmax|salbut|ventohex|سالبوتامول|فنتولين/, 'salbutamol'],
+    [/bricanyl|terbutalin/, 'terbutaline'],
+    [/singulair|montel|moneluk|singular/, 'montelukast'],
+    [/zyrtec|setride|cetrizan|allertec|cetirizin/, 'cetirizine'],
+    [/claridone|alarin|loramax|loratadin|clarityn/, 'loratadine'],
+    [/xalaton|xyzal|levocetiriz|lcetirizin/, 'levocetirizine'],
+    [/telfast|fexofenad|fesmit|fexo/, 'fexofenadine'],
+    [/piriton|chlorphenir|pheniramine|aleron/, 'chlorpheniramine'],
+    [/zaditen|ketotif|ketolen/, 'ketotifen'],
+    [/atarax|hydroxyz|atara/, 'hydroxyzine'],
+    [/periactin|peritol|cyhept|aptin|بيرياكتين|بيريتول/, 'cyproheptadine'],
+    [/motilium|domperid|domeril|motinorm|موتيليوم|دومريل/, 'domperidone'],
+    [/zofran|ondanset|odanon|emset|setron|زدفران/, 'ondansetron'],
+    [/reglan|maxolon|metoclop|ريغلان/, 'metoclopramide'],
+    [/losec|omepr|prilosec|omez|أوميبرازول|لوسك/, 'omeprazole'],
+    [/purinol|famotidine|famox|quamatil/, 'famotidine'],
+    [/mylicon|infacol|lebidim|air.?x|مايكليكون/, 'simethicone'],
+    [/duphalac|normolac|portalac|lactulose|دوفالاك/, 'lactulose'],
+    [/zincat|zolium|zinctron|زينك|زنكات/, 'zinc'],
+    [/ferose|ferifor|sytron|hemafer|ferplex|tot.?hema|ferrograd|ferro/, 'iron'],
+    [/abivit|devarol|sterogold|solliben|vitaminal|أبيفيت|ديفارول/, 'vitamin_d'],
+    [/bisolvon|bromhex|solvin|flegicol|بروموكسين|بيسولفون/, 'bromhexine'],
+    [/mucosolvan|ambrox|lazolvan|bronchovax|mucosol|أمبروكسل|موكوسول/, 'ambroxol'],
+    [/fluimucil|mucomyst|acetem|n.?acetylcystein|فلويموسيل/, 'acetylcysteine'],
+    [/sinecod|omnitus|butamir|سنيكود/, 'butamirate'],
+    [/tussion|dextromethor|dexmeth|romilar|توسين/, 'dextromethorphan'],
+    [/vermox|penvelope|minzol|mebendazol|فيموكس/, 'mebendazole'],
+    [/zentel|albendazol|albendazole|اربيموكس|alidaz/, 'albendazole'],
+    [/pyrantel|antamide|بيرانفوس/, 'pyrantel'],
+    [/mycostatin|fungilin|nystatin|نيستاتين/, 'nystatin'],
+    [/diflucan|flucol|fluconazol|ديفلوكان/, 'fluconazole'],
+    [/xylometa|otrivin|nosol|nasal.?spray|زايلوتامول|أوتريفين/, 'xylometazoline'],
+    [/benadryl|diphenhydram|ديفينهيدرامين/, 'diphenhydramine'],
+    [/vigranon|surbedex?|kidxi|appetile|بيكوتان|سوربيكس/, 'multivitamin']
+  ];
+  /* المركّبات التي تحتاج معاملة خاصة: المكوّن المرجعي وكيف يُقرأ الرقم المطبوع على العبوة */
+  const COMBO = {
+    amoxicillin__clavulanic_acid: {
+      drv: 'amoxicillin',
+      merge: { 156: 125, 200: 200, 228: 200, 250: 250, 312: 250, 400: 400, 457: 400, 600: 600, 643: 600 },
+      es: [228, 400, 457, 600, 643], gES: 40, tES: 2, gLo: 25, tLo: 3, clavCap: 10,
+      src: 'DailyMed Augmentin (GSK): 228 = 200+28.5 ، 457 = 400+57 ، 643 = 600+42.9 لكل 5 مل',
+      note: 'الأرقام 228/400/457/600/643 هي الصيغة المركّزة (7:1 و14:1) وتُقسّم مرتين على 40 ملغ/كغم يومياً؛ وأرقام 125/156/200/250/312 هي الصيغة المعتادة وتُقسّم ثلاث مرات على 25 ملغ/كغم يومياً — والكلافولانات لا تتجاوز 10 ملغ/كغم يومياً'
+    },
+    sulfamethoxazole__trimethoprim: {
+      drv: 'trimethoprim', share: 1 / 6, merge: { 240: 40, 480: 80 }, g: 8, t: 2, minM: 2,
+      src: 'DailyMed: الشراب 200 ملغ سلفاميثوكسازول + 40 ملغ تريميثوبريم لكل 5 مل (نسبة 5:1 ثابتة)',
+      note: 'الحساب على التريميثوبريم 8 ملغ/كغم يومياً مقسّمة مرتين — ممنوع تحت شهرين من العمر'
+    },
+    co_trimoxazole: {
+      drv: 'trimethoprim', share: 1 / 6, merge: { 240: 40, 480: 80 }, g: 8, t: 2, minM: 2,
+      src: 'DailyMed: 200 + 40 ملغ لكل 5 مل', note: 'الحساب على التريميثوبريم 8 ملغ/كغم يومياً مقسّمة مرتين — ممنوع تحت شهرين من العمر'
+    },
+    amoxicillin__clavulanate: { drv: 'amoxicillin', merge: { 156: 125, 200: 200, 228: 200, 250: 250, 312: 250, 400: 400, 457: 400, 600: 600, 643: 600 }, es: [228, 400, 457, 600, 643], gES: 40, tES: 2, gLo: 25, tLo: 3, clavCap: 10, src: 'DailyMed Augmentin', note: 'الحساب على الأموكسيسيلين' },
+    bromhexine__guaifenesin__salbutamol: { drv: 'salbutamol', note: 'المركّب: السالبوتامول هو المحدّد للجرعة، ويتبعه الغوايفينيزين والبرومهكسين بالحجم نفسه' },
+    ambroxol__guaifenesin: { drv: 'ambroxol', note: 'المركّب: الأمبروكسول هو المحدّد — ولا يتجاوز الغوايفينيزين 200 ملغ للجرعة بين 6 و12 سنة' },
+    bromhexine__dextromethorphan: { drv: 'dextromethorphan', note: 'المركّب: الديكستروميتورفان هو المحدّد — ولا يُعطى تحت 6 سنوات' },
+    chlorpheniramine__paracetamol: { drv: 'paracetamol', note: 'المركّب: الجرعة تُحسب على الباراسيتامول — لا تُعطِ معها أي دواء آخر يحتوي باراسيتامول' },
+    bromhexine__guaifenesin: { drv: 'bromhexine', note: 'المركّب: الجرعة تُحسب على البرومهكسين بحسب العمر، والغوايفينيزين مرفق بجرعة أمانه المعتادة' }
+  };
+  /* توحيد اسم المكوّن: إزالة الملح/الاستر ثم الترجمة إلى مفتاح القاعدة */
+  function canon(t) {
+    let x = S(t).toLowerCase().replace(/[^a-z0-9\u0600-\u06FF]+/g, '_').replace(/^_+|_+$/g, '');
+    if (!x) return '';
+    if (ALIAS[x]) return ALIAS[x];
+    const keep = x.split('_').filter(w => w && !SALT.test(w) && !/^\d+$/.test(w));
+    const y = keep.join('_') || x;
+    if (ALIAS[y]) return ALIAS[y];
+    for (const a of ARB) if (a[0].test(t)) return typeof a[1] === 'string' ? a[1] : y;
+    return y;
+  }
+  /* المواد بترتيب ظهورها (مهم للمركّبات: أي رقم ينتمي لأي مكوّن) */
+  const partsOf = sci => { const o = []; splitParts(sci).forEach(x => { const c = canon(x); if (c && o.indexOf(c) < 0) o.push(c); }); return o; };
+  const brandOf = name => { const n = S(name).toLowerCase(); for (const b of BRAND) if (b[0].test(n)) return b[1]; return ''; };
+  /* نفس فلسفة الموسوعة: مفتاح مرتّب أبجدياً — كل المنتجات بنفس المادة تشترك بقاعدة جرعة واحدة */
+  const keyOf = ps => ps.slice().sort().join('__').slice(0, 200);
 
-  /* تركيز المنتج من خانة الجرعة: «250mg/5ml» ← 50 ملغ لكل مل */
-  function concOf(p) {
-    const m = /(\d+(?:\.\d+)?)\s*(mg|g|mcg)\s*\/\s*(\d+(?:\.\d+)?)\s*ml/i.exec(S(p && p.dose));
-    if (!m) return 0;
-    let mg = parseFloat(m[1]);
-    if (/^g$/i.test(m[2])) mg *= 1000;
-    if (/^mcg$/i.test(m[2])) mg /= 1000;
-    const ml = parseFloat(m[3]);
-    return ml > 0 ? Math.round((mg / ml) * 100) / 100 : 0;
+  /* قراءة التركيز التحليلية: تفهم «250mg/5ml» و«15mg/ml» و«125/31.25» والرقم المدمج «457» والنسبة المئوية والوحدات الدولية */
+  const U2 = { mg: 1, mcg: 0.001, 'µg': 0.001, ug: 0.001, g: 1000, gm: 1000, gram: 1000, iu: 1, unit: 1, units: 1 };
+  const VOLU = { ml: 1, cc: 1, 'سم3': 1, 'سم': 1, 'مل': 1, dl: 0.1, l: 1000, 'لتر': 1000 };
+  const VOLWORD = /\b(ml|cc|سم3|سم|مل|l|لتر)\b/i;
+  function concInfo(p, parts, drv) {
+    const raw = S(p && p.dose).replace(/(\d),(\d)/g, '$1.$2').replace(/\s+/g, ' ');
+    const r = { perMl: 0, unit: 'mg', list: [], base: 0, assumed: false, how: '', kind: '' };
+    if (!raw) return r;
+    const numRe = /(\d+(?:\.\d+)?)\s*(mcg|µg|ug|mg|g|gm|iu|units?)/gi;
+    const volAt = t => { const m = /(\d+(?:\.\d+)?)\s*(ml|cc|سم3|سم|مل|dl|l|لتر)\b/i.exec(t || ''); return m ? parseFloat(m[1]) * (VOLU[m[2].toLowerCase()] || 1) : 0; };
+    const pick = list => {
+      if (!list.length) return null;
+      let i = -1;
+      if (drv) { if (parts.length === list.length) i = parts.indexOf(drv); if (i < 0) i = list.findIndex(x => x.tag === drv); }
+      return list[i < 0 ? 0 : i];
+    };
+    const slash = raw.indexOf('/');
+    const left = slash < 0 ? raw : raw.slice(0, slash), right = slash < 0 ? '' : raw.slice(slash + 1);
+    let m, list = [];
+    while ((m = numRe.exec(left))) {
+      const u = m[2].toLowerCase(), f = U2[u] == null ? 1 : U2[u], v = parseFloat(m[1]);
+      list.push({ v, u, mg: Math.round(v * f * 100000) / 100000, iu: /^iu|^unit/.test(u), tag: parts[list.length] || '' });
+    }
+    if (list.length) {
+      let denom = volAt(right);
+      if (!denom && VOLWORD.test(right)) denom = 1; else if (!denom) { denom = 5; r.assumed = true; }
+      const c = pick(list);
+      r.kind = 'unit'; r.list = list; r.base = denom; r.unit = c.iu ? 'iu' : 'mg';
+      r.perMl = Math.round((c.mg / denom) * 10000) / 10000;
+      r.how = `${c.v} ${c.u} لكل ${denom} مل ⇒ ${r.perMl} ${r.unit}/مل` + (r.assumed ? ' — فُهم الرقم على أنه لكل 5 مل' : '');
+      return r;
+    }
+    const pm = /(\d+(?:\.\d+)?)\s*%/.exec(raw);
+    if (pm) {
+      const pct = parseFloat(pm[1]);
+      r.kind = 'pct'; r.base = 1; r.list = [{ v: pct, u: '%', mg: Math.round(pct * 10 * 10000) / 10000, iu: false }];
+      r.perMl = Math.round(pct * 10 * 10000) / 10000;
+      r.how = `${pct}٪ (غ/100 مل) ⇒ ${r.perMl} ملغ/مل`;
+      return r;
+    }
+    const digits = (raw.match(/\d+(?:\.\d+)?/g) || []).map(Number).filter(n => n > 0);
+    if (digits.length >= 2) {
+      r.kind = 'slash'; r.base = 5; r.assumed = true;
+      r.list = digits.map((v, i) => ({ v, u: 'mg', mg: v, iu: false, tag: parts[i] || '' }));
+      const c = pick(r.list);
+      r.perMl = Math.round((c.mg / 5) * 10000) / 10000;
+      r.how = `${digits.join(' / ')} ملغ لكل 5 مل (التقسيم بترتيب الاسم العلمي) ⇒ ${r.perMl} ملغ/مل`;
+      return r;
+    }
+    if (digits.length === 1) {
+      r.kind = 'one'; r.base = 5; r.assumed = true;
+      r.list = [{ v: digits[0], u: 'mg', mg: digits[0], iu: false, tag: parts[0] || '' }];
+      r.perMl = Math.round((digits[0] / 5) * 10000) / 10000;
+      r.how = `${digits[0]} ملغ لكل 5 مل ⇒ ${r.perMl} ملغ/مل`;
+      return r;
+    }
+    return r;
+  }
+  /* رقم العبوة المدمج (مثل 457 في أوجمنتين و 240 في سبتومين): يفكّه جدول المركّب إلى مكوّناته */
+  const printedNum = p => Math.round(parseFloat((S(p && p.dose).replace(/(\d),(\d)/g, '$1.$2').match(/\d+(?:\.\d+)?/) || [0])[0]) || 0);
+  function applyMerge(p, parts, combo, ci) {
+    if (!combo || parts.length < 2) return ci;
+    const n = printedNum(p), di = Math.max(0, parts.indexOf(combo.drv));
+    let drv = combo.merge ? combo.merge[n] : undefined;
+    if (drv == null && combo.share && ci.kind === 'one') drv = Math.round(n * combo.share * 100) / 100;
+    if (drv == null) {
+      if (ci.kind === 'one' && !ci.perMl) ci.unknown = true;
+      if (ci.kind === 'one' && parts.length > 1 && combo.merge) { ci.unknown = true; ci.perMl = 0; ci.how = `الرقم ${n} لا يطابق تركيبة «${Object.keys(combo.merge).join(' / ')}» المعروفة للمركّب — لا يمكن اعتماد رقم واحد للسم³: اكتب التركيز يدوياً بالأسفل (جرعة الملغ نفسها لا تتأثر)`; }
+      return ci;
+    }
+    ci.kind = 'merge'; ci.base = 5; ci.assumed = false; ci.unknown = false; ci.unit = 'mg';
+    ci.perMl = Math.round((drv / 5) * 10000) / 10000;
+    const co = Math.round((n - drv) * 100) / 100;
+    ci.list = [{ v: drv, u: 'mg', mg: drv, iu: false, tag: parts[di] || combo.drv }];
+    if (co > 0) ci.list.push({ v: co, u: 'mg', mg: co, iu: false, tag: parts[(di + 1) % parts.length] || '' });
+    ci.how = `الرقم ${n} لكل 5 مل = ${drv} ملغ من ${S(parts[di] || combo.drv).replace(/_/g, ' ')}` +
+      (co > 0 ? ` + ${co} ملغ من المكوّن الآخر` : ' — لم يُذكر المكوّن الثاني على العبوة فلم يُفصّل') +
+      ` ⇒ ${ci.perMl} ملغ/مل`;
+    return ci;
   }
 
+  /* ── موسوعة الجرعات المحلية: كل رقم منقول عن مرجع مسمّى (BNFC / DailyMed / FDA / EMA / MHRA / TGA / WHO / MSF / NHS / HPRA / نشرة منتج) ── */
+  /* k: wt = ملغ/كغم للجرعة | day = ملغ/كغم يومياً مقسّمة | band = ملغ ثابت للجرعة بفئة العمر | wb = بفئة الوزن | fx = جرعة ثابتة | no = ممنوع */
+  /* cap = سقف الجرعة الواحدة (ملغ) | day = السقف اليومي (ملغ) | minM = أقل عمر بالأشهر | minKg = أقل وزن مسموح */
+  const LIB = {
+    paracetamol: { k: 'wt', g: 15, t: 4, cap: 1000, day: 4000, minM: 1,
+      n: '15 ملغ/كغم لكل جرعة، كل 4–6 ساعات عند اللزوم، وبحد أقصى 4 جرعات في 24 ساعة.',
+      w: ['لا يتجاوز 75 ملغ/كغم يومياً ولا 4000 ملغ في اليوم (BNFC)', 'تحت 3 أشهر: 10 ملغ/كغم للجرعة بسقف 30 ملغ/كغم يومياً وبوصفة طبيب', 'لا يجمع مع أي دواء آخر يحتوي باراسيتامول (كتمهيدات البرد)', 'لا يزيد على 3 أيام للحمى و5 أيام للألم دون مراجعة'],
+      r: ['BNF for Children', 'MHRA', 'DailyMed'], s: 'BNFC: 20–30 mg/kg للجرعة الأولى ثم 15–20 mg/kg كل 4–6 ساعات بسقف 75 mg/kg/يوم؛ MHRA: لا أكثر من 4 جرعات في 24 ساعة' },
+    ibuprofen: { k: 'wt', g: 10, t: 3, cap: 400, day: 1200, minM: 3, minKg: 5,
+      n: '5–10 ملغ/كغم لكل جرعة حتى 3 مرات يومياً بفاصل 6–8 ساعات، مع الحليب.',
+      w: ['لا يتجاوز 30 ملغ/كغم يومياً ولا 1200 ملغ في اليوم', 'يتجنب في الجفاف أو ضعف الكلى أو جدري الماء أو الربو الحساس للأسبرين', 'خطر خلط التركيزين: القطرات 40 ملغ/مل والشراب 100 ملغ/5 مل'],
+      r: ['BNF for Children', 'MSF', 'Medscape', 'NHS'], s: 'MSF: فوق 3 أشهر 5–10 mg/kg ثلاثاً إلى أربع مرات يومياً بسقف 30 mg/kg/يوم؛ Medscape: أقصى جرعة واحدة 400 mg' },
+    diclofenac: { k: 'day', g: 2, t: 3, cap: 50, day: 150, minM: 144,
+      n: 'مضاد التهاب (التهاب المفاصل الأحداث) لا دواء حمى معتاد: 0.5–2 ملغ/كغم يومياً مقسّمة على 2–3 مرات.',
+      w: ['السقف 150 ملغ يومياً ولمدة قصيرة', 'خطر تقرح المعدة والكلى'],
+      r: ['BNF for Children', 'Egypt EDA SmPC', 'MIMS'], s: 'SmPC: 0.5–2 mg/kg يومياً مقسّمة على 2–3 جرعات بسقف 150 mg/يوم؛ UK JIA: 1–3 mg/kg/يوم مقسّمة' },
+    mefenamic_acid: { k: 'wt', g: 6.5, t: 3, cap: 500, day: 1500, minM: 6,
+      n: '4–6.5 ملغ/كغم لكل جرعة كل 8 ساعات، ولا تزيد على 3 جرعات يومياً.',
+      w: ['المدة لا تتجاوز 7 أيام', 'الإسهال أكثر آثاره شيوعاً، وليس خطاً أول في BNFC'],
+      r: ['MIMS', 'MAPP consensus', 'BNF'], s: 'MAPP: 4–6.5 mg/kg كل 8 ساعات بحد أقصى 3 مرات يومياً' },
+    metamizole: { k: 'wt', g: 10, t: 3, cap: 1000, day: 4000, minM: 3, minKg: 5,
+      n: '8–16 ملغ/كغم للجرعة الواحدة (خط ثانٍ للألم والحمى الشديدين)، وحتى 3–4 مرات يومياً.',
+      w: ['ممنوع تحت 3 أشهر أو تحت 5 كغم (EMA)', 'خطر نقص المحبّات: يمنع مع من لديه سابق إصابة بنقص محبّات أو خلل في النقي، ولمدة لا تتجاوز 3–5 أيام', 'لا يُصرف إلا بوصفة واضحة'],
+      r: ['EMA Annex III', 'MIMS'], s: 'EMA: 8–16 mg/kg كجرعة واحدة للأطفال حتى 14 سنة؛ السقف اليومي للبالغ 4000 mg' },
+    aspirin: { k: 'no', n: 'لا يُستخدم للحمى أو الألم في الأطفال — لا تُحسب له جرعة في الحاسبة.',
+      w: ['BNFC: الشركة الصانعة تنصح بعدم إعطاء المستحضرات المحتوية أسبرين للأطفال تحت 16 سنة لخطر متلازمة راي', 'يمنع تماماً مع الجدري أو الأعراض الإنفلونزية', 'الاستخدام القلبي/الصفيحاتي (1–5 ملغ/كغم يومياً) يحدده أخصائي فقط'],
+      r: ['BNF for Children', 'Medsafe NZ'], s: 'BNFC: owing to an association with Reye\'s syndrome, aspirin-containing preparations should not be given to children under 16 years' },
+    omeprazole: { k: 'wt', g: 0.7, t: 1, cap: 20, minM: 1,
+      n: '700 ميكروغرام/كغم مرة يومياً قبل الفطور (من شهر إلى سنة)، وقد ترفعه الوصفة إلى 1.4–2.8 ملغ/كغم.',
+      w: ['لا يوجد شراب جاهز مرخّص غالباً: المعلق المُعدّ أو MUPS يتطلب وصفة وطريقة تحضير محددة', 'المدة 4–8 أسابيع بمراجعة'],
+      r: ['BNF for Children', 'DailyMed PriLOSEC'], s: 'BNFC: Child 1 month–1 year 700 micrograms/kg once daily' },
+    famotidine: { k: 'wt', g: 0.5, t: 1, cap: 20, day: 40, minM: 12,
+      n: '0.5 ملغ/كغم مرة يومياً قبل النوم (أو 0.25 ملغ/كغم مرتين يومياً)، بسقف 20 ملغ للجرعة.',
+      w: ['تُخفض الجرعة في ضعف الكلى'],
+      r: ['FDA label', 'NSHD paediatric guideline'], s: 'FDA: من سنة إلى أقل من 17 سنة — starting dosage 0.5 mg/kg once daily' },
+    ranitidine: { k: 'no', n: 'مسحوب من الأسواق — لا تُحسب له جرعة.',
+      w: ['FDA طلبت سحب كل منتجات رانيتيدين من السوق في 1 أبريل 2020 بسبب شوائب NDMA المسرطنة', 'إن وُجد في المخزون: لا يُصرف للأطفال وتُبلّغ الجهة الرقابية'],
+      r: ['FDA press announcement 2020'], s: 'FDA: Requests Removal of All Ranitidine Products (Zantac) from the Market' },
+    domperidone: { k: 'day', g: 0.75, t: 3, cap: 10, day: 30, minM: 0,
+      n: '0.25 ملغ/كغم لكل جرعة حتى 3 مرات يومياً، بسقف 0.75 ملغ/كغم يومياً — قبل الأكل.',
+      w: ['EMA/MHRA: لم يعد مشّراً للغثيان والقيء فيمن يقل عمره عن 12 سنة أو وزنه عن 35 كغم — الاستعمال تحت ذلك بوصفة اختصاصي', 'خطر تطاول QT واضطراب النظم: يمنع مع الأدوية المطاولَة QT ومثبطات CYP3A4', 'المدة أقل من أسبوع'],
+      r: ['EMA Art.31', 'MHRA', 'BNF'], s: 'EMA: 0.25 mg/kg حتى 3 مرات يومياً، وأقصى 0.75 mg/kg/يوم' },
+    metoclopramide: { k: 'wt', g: 0.15, t: 3, cap: 10, day: 30, minM: 12,
+      n: '100–150 ميكروغرام/كغم لكل جرعة حتى 3 مرات يومياً، بسقف 10 ملغ للجرعة.',
+      w: ['ممنوع تحت عمر سنة واحدة', 'المدة 48 ساعة (وحتى 5 أيام في بعض النشرات) — خطر عسر الحركة والاختلاج المبكر أعلى في الأطفال'],
+      r: ['BNF for Children', 'Medsafe 2023'], s: 'BNFC: 1–17 سنة 100–150 micrograms/kg حتى 3 مرات يومياً (أقصى 10 mg لكل جرعة) لمدة 48 ساعة' },
+    ondansetron: { k: 'wt', g: 0.15, t: 2, cap: 4, day: 8, minM: 6,
+      n: '0.1–0.15 ملغ/كغم لكل جرعة (بسقف 4 ملغ) حتى مرتين يومياً في القيء الحاد.',
+      w: ['انتبه للتركيز: 4 ملغ/مل يختلف عن 4 ملغ/5 مل (خمسة أضعاف)', 'تطاول QT مع الجرعات العالية', 'قد تكفي جرعة واحدة في نوبة واحدة'],
+      r: ['MSF', 'CPS position statement', 'BNF for Children'], s: 'MSF: من 6 شهور إلى 12 سنة 0.1–0.15 mg/kg (أقصى 4 mg) حتى مرتين يومياً' },
+    simethicone: { k: 'band', minM: 0, bands: [[2, 20, 4], [14, 40, 4]],
+      n: '20 ملغ تحت السنتين و40 ملغ فوقهما، بعد كل وجبة وقبل النوم.',
+      w: ['لا تُتجاوز 12 جرعة في اليوم (النشرة)', 'آمن لأنه لا يُمتص — لكن القطّارة حصراً لا الملعقة المنزلية'],
+      r: ['DailyMed Mylicon'], s: 'DailyMed: تحت السنتين 0.3 ml (20 mg)؛ فوق السنتين 0.6 ml (40 mg)؛ لا أكثر من 12 جرعة/يوم' },
+    lactulose: { k: 'band', minM: 0, bands: [[1, 1667, 2], [4, 3333, 2], [10, 6667, 2], [14, 10000, 2]],
+      n: 'المرجع يذكرها بالحجم: 2.5 مل مرتين تحت السنة، و5 مل مرتين 1–4 سنوات، و10 مل مرتين 5–10 سنوات (محسوبة على محلول 10 غ/15 مل).',
+      w: ['يلزم شرب ماء كافٍ', 'يمنع في انسداد الأمعاء وعدم تحمل الغالاكتوز', 'تعدّل الجرعة حتى تبرز مرة أو مرتين يومياً'],
+      r: ['BNF for Children', 'BNF'], s: 'BNFC: 1–11 months 2.5 mL twice daily؛ 1–4 years 5 mL twice daily؛ 5–10 years 10 mL twice daily' },
+    zinc: { k: 'band', minM: 0, bands: [[6, 10, 1], [14, 20, 1]],
+      n: 'الإسهال: 10 ملغ يومياً تحت 6 أشهر، و20 ملغ يومياً فوقها، لمدة 10–14 يوماً كاملة.',
+      w: ['يفصل عن الحديد والكالسيوم بساعتين', 'يُكمل الكورس حتى بعد توقف الإسهال'],
+      r: ['WHO/UNICEF', 'WHO ELENA', 'TMDA SmPC'], s: 'WHO: 20 mg/day لمدة 10–14 يوماً (10 mg/day للرضع تحت 6 أشهر)' },
+    iron: { k: 'day', g: 3, t: 1, cap: 100, day: 200, minM: 1,
+      n: 'العلاج: 3–6 ملغ حديد عنصري/كغم يومياً (3 ملغ/كغم تكفي غالباً)، مرة واحدة أو مقسّمة على 1–3 مرات. الوقاية: 1 ملغ/كغم يومياً.',
+      w: ['كل الأرقام هنا بالحديد العصري لا بملح الحديد — اقرأ العبوة', 'التسمم يبدأ من 20 ملغ/كغم عنصري (BNFC): أبده عن متناول الأطفال', 'يفصل عن الشاي والكالسيوم والزنك'],
+      r: ['RCH', 'AMH/Royal Children', 'BNF for Children', 'MSF'], s: 'RCH/AMH: 3–6 mg/kg/day elemental iron in 1–3 divided doses (max 100–200 mg daily)؛ BNFC: سمية الحديد من 20 mg/kg' },
+    vitamin_d: { k: 'band', minM: 0, unit: 'iu', bands: [[1, 400, 1], [11, 400, 1], [14, 600, 1]],
+      n: 'الوقاية: 400 وحدة دولية يومياً من أول أيام العمر، و600 وحدة من 11 إلى 14 سنة — مرة يومياً مع وجبة فيها دسم.',
+      w: ['سقف المكملات 4000 وحدة يومياً للأطفال (BNF) — لا تتجاوزه', 'لا تُستعمل كبسولة 50,000 وحدة كجرعة يومية للأطفال', 'عدد القطرات يختلف بين الشركات: لا بد من معرفة تركيز هذا المنتج بالتحديد', 'جرعات العلاج (نقص/لين العظام) غير هذا الرقم وتكون بوصفة'],
+      r: ['BNF for Children', 'NHS', 'AAP'], s: 'BNFC: 1 month–11 years 400–600 units daily؛ NHS: من الولادة 300–400 وحدة' },
+    vitamin_c: { k: 'band', minM: 1, bands: [[4, 125, 2], [12, 250, 2], [14, 500, 2]],
+      n: 'العلاج: 125–250 ملغ يومياً مقسّمة على مرة إلى مرتين تحت 4 سنوات، و250–500 ملغ يومياً من 4 إلى 11 سنة.',
+      w: ['لا تتجاوز 1 غرام يومياً — خطر بول الأوكسالات'],
+      r: ['BNF for Children', 'MSF'], s: 'BNFC: 1 month–3 years 125–250 mg daily in 1–2 divided doses؛ 4–11 years 250–500 mg daily' },
+    folic_acid: { k: 'wt', g: 0.5, t: 1, cap: 5, minM: 1,
+      n: 'فقر الدم الضخم الأرومي: 500 ميكروغرام/كغم مرة يومياً (بسقف 5 ملغ) لمدة حتى 4 أشهر.',
+      w: ['يستبعد نقص B12 قبل الجرعات العالية', 'شراب 2.5 ملغ/5 مل لا يعطي جرعات الرضّع بدقة'],
+      r: ['BNF for Children', 'BNF'], s: 'BNFC: 1–11 months initially 500 micrograms/kg once daily (max. per dose 5 mg)' },
+    cyproheptadine: { k: 'band', minM: 24, bands: [[6, 2, 3], [14, 4, 3]], day: 16,
+      n: '2 ملغ للجرعة من 2 إلى 6 سنوات، و4 ملغ من 7 إلى 14 سنة، مرتين إلى ثلاث مرات يومياً.',
+      w: ['ممنوع تحت السنتين (FDA): لم يثبت الأمان تحت هذا العمر', 'السقف 12 ملغ يومياً 2–6 سنوات و16 ملغ يومياً 7–14 سنة', 'تحفيز الشهية استعمال غير مرخّص — والنعاس والتأثر المضاد للكولين شائع'],
+      r: ['DailyMed cyproheptadine', 'MIMS'], s: 'FDA: 2–6 years 2 mg مرتين إلى ثلاث مرات يومياً ولا تتجاوز 12 mg/يوم؛ 7–14 years 4 mg ولا تتجاوز 16 mg/يوم' },
+    bilastine: { k: 'fx', f: 10, t: 1, minM: 72, minKg: 20,
+      n: '10 ملغ مرة يومياً من 6 إلى 11 سنوات (بوزن 20 كغم فأكثر)، و20 ملغ من 12 سنة.',
+      w: ['SmPC: لا يُستعمل تحت 6 سنوات وتحت 20 كغم', 'يؤخذ قبل الأكل بساعة أو بعده بساعتين (الأكل والعصير ينقصان الامتصاص 30٪)'],
+      r: ['eMC bilastine SmPC'], s: 'SmPC: children 6–11 years with body weight of at least 20 kg — bilastine 10 mg orodispersible / 2.5 mg/mL oral solution' },
+    ebastine: { k: 'band', minM: 24, bands: [[5, 2.5, 1], [12, 5, 1], [14, 10, 1]],
+      n: 'المحلول 5 ملغ/5 مل: 2.5 ملغ مرة يومياً من 2 إلى 5 سنوات، و5 ملغ من 6 إلى 12 سنة.',
+      w: ['النشرة تسمح بمضاعفة الجرعة في الحالات الشديدة (5 مل / 10 مل)'],
+      r: ['Kenya PPB SmPC'], s: 'SmPC: children 2–5 years 2.5 mL once daily؛ 6–12 years 5 mL once daily' },
+    cetirizine: { k: 'band', minM: 24, bands: [[5, 2.5, 2], [11, 5, 2], [14, 10, 1]],
+      n: '2.5 ملغ مرتين يومياً من 2 إلى 5 سنوات، و5 ملغ مرتين من 6 إلى 11 سنة، و10 ملغ مرة واحدة من 12 سنة.',
+      w: ['تحت السنتين بوصفة طبيب فقط', 'نعاس خفيف عند بعض الأطفال'],
+      r: ['BNF for Children'], s: 'BNFC: 2–5 years 2.5 mg twice daily؛ 6–11 years 5 mg twice daily؛ 12+ 10 mg daily' },
+    levocetirizine: { k: 'band', minM: 6, bands: [[5, 1.25, 1], [11, 2.5, 1], [14, 5, 1]],
+      n: '1.25 ملغ (1.25 مل من محلول 5 ملغ/5 مل) مساءً من 6 أشهر إلى 5 سنوات، و2.5 ملغ 6–11 سنة، و5 ملغ من 12 سنة.',
+      w: ['بعض النشرات الأمريكية تعطي 2–5 سنوات مرتين يومياً — تحقق من نشرة عبوتك قبل الصرف', 'نعاس'],
+      r: ['Mayo Clinic/DailyMed label', 'TMDA SmPC'], s: 'Label: children 6 months–5 years 1.25 mg or 2.5 mL once daily in the evening؛ 6–11 years 2.5 mg once daily' },
+    loratadine: { k: 'band', minM: 24, bands: [[5, 5, 1], [14, 10, 1]],
+      n: 'الشراب 5 ملغ/5 مل: 5 ملغ (5 مل) مرة يومياً من 2 إلى 5 سنوات، و10 ملغ (10 مل) من 6 سنوات.',
+      w: ['NVS/CDC: لا يُستعمل للحساسية تحت السنتين', 'يفضّل على الريق؛ الطعام يزيد امتصاصه قليلاً'],
+      r: ['Children\'s Colorado dose table', 'Kaiser pediatric OTC guide'], s: '2–5 years 5 mg once daily؛ ≥6 years 10 mg once daily' },
+    desloratadine: { k: 'band', minM: 12, bands: [[5, 1.25, 1], [11, 2.5, 1], [14, 5, 1]],
+      n: 'الشراب 2.5 ملغ/5 مل: 1.25 ملغ (2.5 مل) من سنة إلى 5 سنوات، و2.5 ملغ (5 مل) 6–11 سنة، و5 ملغ (10 مل) من 12 سنة.',
+      w: ['الاتحاد الأوروبي: مرخّص فوق سنة واحدة فقط', 'بعض المنتجات الأمريكية تغطي 6 أشهر — لا تقارن بينهما'],
+      r: ['HPRA SmPC', 'Mayo Clinic'], s: 'SmPC: 1–5 years 1.25 mg once daily؛ 6–11 years 2.5 mg once daily' },
+    fexofenadine: { k: 'band', minM: 6, bands: [[2, 15, 2], [11, 30, 2], [14, 60, 2]],
+      n: 'العلق 30 ملغ/5 مل: 15 ملغ مرتين يومياً من 6 أشهر إلى سنتين، و30 ملغ مرتين 2–11 سنة، و60 ملغ مرتين من 12 سنة.',
+      w: ['العصير (تفاح/برتقال/غريب فروت) ينقص الامتصاص — لا تعطه معه', 'يفصله عن مضاد الحموضة المحتوي ألومنيوم/ماغنسيوم بساعتين'],
+      r: ['Texas HHS DUR (FDA label)', 'PMC review'], s: '6 months–2 years 15 mg twice daily؛ 2–11 years 30 mg twice daily؛ 12–17 years 60 mg twice daily' },
+    chlorpheniramine: { k: 'band', minM: 12, bands: [[6, 1, 4], [12, 2, 4], [14, 4, 4]],
+      n: '1 ملغ كل 4–6 ساعات (بحد أقصى 4 جرعات يومياً) من سنة إلى 6 سنوات، ثم 2 ملغ للجرعة.',
+      w: ['جيل أول: نعاس وجفاف فم، وخطر تثبيط التنفس في الجرعة الزائدة', 'لا يُستعمل للسعال في الصغار دون وصفة'],
+      r: ['NHS Piriton PIL', 'BNF'], s: 'Piriton: 1–6 years 1 mg كل 4–6 ساعات وأقصى 4 جرعات؛ 6–12 years 2 mg' },
+    diphenhydramine: { k: 'band', minM: 72, bands: [[12, 25, 4], [14, 25, 4]], day: 150,
+      n: 'الشراب 12.5 ملغ/5 مل: 25 ملغ (10 مل) كل 4–6 ساعات من 6 إلى 12 سنة، بسقف 150 ملغ يومياً.',
+      w: ['OTC: تحت 6 سنوات لا يُستعمل للسعال/البرد، وفئات 2–6 سنوات غير موثقة من نشرة سائلة معتمدة', 'مضاد كولين قوي: جفاف، احتباس بول، تشوش، وتثبيط تنفسي في الجرعة الزائدة'],
+      r: ['DailyMed', 'Malaysian formulary', 'EFDA SmPC'], s: 'Children 6–12 years 25–50 mg كل 6–8 ساعات (أقصى 150 mg/يوم)؛ لا أكثر من 6 جرعات في 24 ساعة' },
+    hydroxyzine: { k: 'day', g: 2, t: 4, cap: 25, day: 100, minM: 12,
+      n: 'الحكة والشرى: حتى 2 ملغ/كغم يومياً مقسّمة على 3–4 مرات.',
+      w: ['نعاس شديد — لا يجمع مع مهدئات أخرى', 'تطاول QT في الجرعات العالية'],
+      r: ['BNF for Children', 'Medscape'], s: 'Medscape: لا تزيد على 2 mg/kg/day مقسّمة' },
+    promethazine: { k: 'no', n: 'ممنوع تحت 6 سنوات — لا تُحسب له جرعة.',
+      w: ['EMA/MHRA: البروميثازين ممنوع تحت 6 سنوات لخطر تثبيط التنفس القاتل في الصغار', 'لا يجمع مع مهدئات أو موسّعات الشعب دون وصفة'],
+      r: ['EMA', 'BNF for Children'], s: 'Promethazine is contraindicated in children under 6 years' },
+    ketotifen: { k: 'band', minM: 6, bands: [[3, 1, 2], [14, 2, 2]],
+      n: 'الوقاية من الربو التحسسي: 1 ملغ مرتين يومياً من 6 أشهر إلى 3 سنوات، و2 ملغ مرتين فوق 3 سنوات.',
+      w: ['نعاس وزيادة وزن', 'لا يُستعمل لإسبات نوبة حادة'],
+      r: ['BNF for Children', 'Zaditen SmPC'], s: 'BNFC: 6 months–3 years 1 mg twice daily؛ over 3 years 2 mg twice daily' },
+    bromhexine: { k: 'band', minM: 24, bands: [[5, 4, 2], [12, 8, 3], [14, 8, 3]], day: 24,
+      n: 'الشراب 4 ملغ/5 مل: 4 ملغ مرتين يومياً من 2 إلى 5 سنوات (5 مل مرتين)، و8 ملغ ثلاث مرات فوق 6 سنوات.',
+      w: ['EMA PRAC: لا يُستعمل مقشعاً تحت سنتين', 'MedSafe/MHRA/TGA: مستحضرات السعال والبرد المحتوية برومهكسين تُعطى فقط من 6 سنوات فأكثر — تحت 6 سنوات بوصفة طبيب', 'السقف اليومي 24 ملغ في 6–11 سنة (MIMS)؛ فئات أعمار القطرات 4 ملغ/مل غير موثقة — لا تصرف قطرات برومهكسين لطفل دون التأكد من النشرة'],
+      r: ['HPRA SPC', 'EMA PRAC Art.31', 'MedSafe NZ', 'MIMS'], s: 'HPRA SPC: Children 2 to ≤5 years recommended total daily dose 5 ml (4 mg) twice daily؛ MedSafe: only in children six years and over for cough/cold' },
+    ambroxol: { k: 'band', minM: 24, bands: [[11, 15, 3], [14, 30, 3]], day: 90,
+      n: 'الشراب 15 ملغ/5 مل: 15 ملغ (5 مل) مرتين إلى ثلاث مرات يومياً فوق السنتين؛ وصيغة 30 ملغ/5 مل لمن هم 12 سنة فأكثر.',
+      w: ['EMA PRAC: أُزيل استعماله مقشعاً تحت السنتين — وتحت السنتين يكون بقرار طبي متخصص فقط', 'قطرات 7.5 ملغ/مل: فئات الأعمار غير موثقة عن مصدر نظامي — لا تُصرف دون نشرة العبوة', 'لا يجمع مع أدوية السعال المثبطة'],
+      r: ['MT Medicines Authority SmPC', 'EMA PRAC Art.31', 'Dafrapharma SmPC'], s: 'SmPC: children over two years 5 ml of 15 mg/5 ml syrup 2 or 3 times a day؛ under 2 years only on specialised medical advice' },
+    acetylcysteine: { k: 'band', minM: 0, bands: [[2, 100, 2], [4, 100, 2], [7, 100, 3], [14, 200, 3]], day: 600,
+      n: 'محلّل المخاط حسب العمر: تحت سنتين 200 ملغ يومياً مقسّمة على مرتين، ومن 2 إلى 4 سنوات 200 ملغ يومياً، وفوق 4 سنوات 300 ملغ يومياً، ومن 6–7 سنوات 200 ملغ ثلاث مرات.',
+      w: ['تحت السنتين: بوصفة طبيب فقط', 'لا يُطبع للمادة رقم ملغ/كغم — المراجع النظامية تعطيه بالفئات العمرية فقط', 'لا يجمع مع أدوية السعال المثبطة في نفس الوصفة', 'يفصله عن المضاد الحيوي بساعتين'],
+      r: ['EFDA SmPC', 'PMC review', 'Vinmec'], s: 'SmPC: under 2 years 200 mg/day divided into two؛ 2–4 years 200 mg/day؛ over 4 years 300 mg/day؛ maximum 600 mg/day' },
+    carbocisteine: { k: 'band', minM: 24, bands: [[5, 125, 3], [12, 250, 3], [14, 250, 3]], day: 750,
+      n: 'الشراب 250 ملغ/5 مل: 125 ملغ (2.5 مل) ثلاث مرات من 2 إلى 5 سنوات، و250 ملغ (5 مل) ثلاث مرات من 6 إلى 12 سنة.',
+      w: ['ممنوع تحت السنتين (SmPC: contraindicated in children aged less than 2)', 'يتجنب في القرحة الهضمية', 'لا يجمع مع أدوية السعال المثبطة، والمدة لا تتجاوز 8–10 أيام دون مراجعة'],
+      r: ['HPRA SPC', 'FDA Ghana SmPC'], s: 'SmPC: 2–5 years 2.5 ml (125 mg) three times daily؛ 6–12 years 5 ml (250 mg) two to three times daily' },
+    guaifenesin: { k: 'band', minM: 24, bands: [[6, 100, 4], [12, 200, 4], [14, 400, 4]], day: 1200,
+      n: 'الشراب 100 ملغ/5 مل: 50–100 ملغ كل 4 ساعات من 2 إلى 6 سنوات، و100–200 ملغ 6–12 سنة، و200–400 ملغ من 12 سنة.',
+      w: ['لا تزيد على 6 جرعات في 24 ساعة (DailyMed)', 'يلزم شرب ماء كافٍ', 'تحت السنتين: لا يُستعمل دون وصفة'],
+      r: ['DailyMed'], s: 'Label: children 2 to under 6 years 50–100 mg كل 4 ساعات؛ 6 to under 12 years 100–200 mg؛ do not take more than 6 doses in 24 hours' },
+    butamirate: { k: 'band', minM: 36, bands: [[6, 7.5, 3], [12, 15, 3], [14, 22.5, 3]], day: 45,
+      n: 'شراب 7.5 ملغ/5 مل: 7.5 ملغ (5 مل) ثلاث مرات يومياً من 3 إلى 6 سنوات، و15 ملغ من 6 إلى 12 سنة، و22.5 ملغ فوق 12 سنة.',
+      w: ['السقف 22.5 ملغ يومياً (3–6 سنوات) ثم 45 ملغ (6–12 سنة)', 'قطرات سينيكود: أقل عمر شهران، وفئات الأعمار للقطرات غير موثقة — وبعض الأسواق تركيزها 5 ملغ/مل بدل 7.5: اقرأ العبوة', 'لا يجمع مع أدوية سعال محتوية كودايين أو ديكستروميتورفان'],
+      r: ['Novartis Sinecod PI (MIMS)', 'UAE Novartis leaflet'], s: 'PI: Children 3–6 years one teaspoonful (5 ml) three times daily, maximum daily dose 15 ml (22.5 mg)؛ 6–12 years 10 ml three times daily' },
+    dextromethorphan: { k: 'band', minM: 72, bands: [[11, 15, 4], [14, 15, 4]], day: 60, cap: 15,
+      n: 'الشراب 15 ملغ/5 مل: 15 ملغ (5 مل) كل 6–8 ساعات عند اللزوم من 6 إلى 11 سنة، وبحد أقصى 4 جرعات (60 ملغ) يومياً.',
+      w: ['MHRA: مستحضرات السعال والبرد المحتوية ديكستروميتورفان لا تُستخدم تحت 6 سنوات', 'المدة لا تتجاوز 7 أيام دون مراجعة', 'يمنع مع مثبطات MAO، وخطر متلازمة السيروتونين مع أدوية نفسية'],
+      r: ['MHRA drug safety update', 'TGA OTC monograph', 'DailyMed'], s: 'TGA: children 6–11 years 5 mL (15 mg) every 6–8 hours, max 4 doses (60 mg) per day؛ MHRA: no longer used in children under 6 years' },
+    salbutamol: { k: 'wt', g: 0.1, t: 3, cap: 2, day: 24, minM: 24,
+      n: 'الشراب 2 ملغ/5 مل: 0.1 ملغ/كغم للجرعة من 2 إلى 5 سنوات (بسقف 2 ملغ للجرعة)، و2 ملغ ثلاث إلى أربع مرات يومياً فوق 6 سنوات.',
+      w: ['رعشة وتسارع نبض هي أكثر الأعراض شيوعاً — لا ترفع الجرعة بسببها', 'السقف 24 ملغ يومياً 6–14 سنة و32 ملغ فوق 14 سنة', 'لا يُستعمل بديلاً عن البخاخ في النوبة الحادة'],
+      r: ['DailyMed albuterol oral solution'], s: 'Label: 2–5 years 0.1 mg/kg لا تتجاوز 2 mg (5 ml) ثلاث مرات يومياً؛ 6–14 years 2 mg ثلاث إلى أربع مرات ولا تتجاوز 24 mg/day؛ safety below 2 years not established' },
+    prednisolone: { k: 'wt', g: 2, t: 1, cap: 40, minM: 0,
+      n: 'الستيرويد الفموي: 1–2 ملغ/كغم مرة واحدة يومياً صباحاً (بسقف 40 ملغ) ولمدة قصيرة.',
+      w: ['لا يوقف فجأة بعد أكثر من 5 أيام — يُخفَّض بالتدريج', 'يُعطى بعد الأكل', 'تكرار الكورسات يضر النمو والعظام — بوصفة فقط'],
+      r: ['BNF for Children', 'NICE'], s: 'BNFC: 1–2 mg/kg once daily (max 40 mg)' },
+    dexamethasone: { k: 'wt', g: 0.6, t: 1, cap: 16, minM: 1,
+      n: 'الخناق (كرون): جرعة واحدة 0.6 ملغ/كغم (بسقف 16 ملغ)؛ وباقي الاستعمالات 0.15–0.6 ملغ/كغم بوصفة.',
+      w: ['جرعة واحدة لا تعاد إلا بأمر الطبيب', 'يُعطى صباحاً لأنه يسبب الأرق'],
+      r: ['BNF for Children', 'NICE'], s: '0.15–0.6 mg/kg، وأقصى 16 mg' },
+    montelukast: { k: 'band', minM: 6, bands: [[5, 4, 1], [14, 5, 1]],
+      n: '4 ملغ مساءً يومياً من 6 أشهر إلى 5 سنوات (كيس أو معيار 4 ملغ)، و5 ملغ من 6 إلى 14 سنة.',
+      w: ['FDA (2020): تحذير في العنوان — أعراض عصبية-نفسية (تغيّر المزاج، كوابيس، أفكار انتحارية)؛ أوقفه وراجع الطبيب فور ظهورها', 'ليس علاجاً للنوبة الحادة'],
+      r: ['NHS', 'HPRA SmPC', 'DailyMed', 'FDA boxed warning'], s: 'NHS: children 6 months–5 years 4 mg once a day؛ 6–14 years 5 mg؛ ≥15 years 10 mg' },
+    amoxicillin: { k: 'day', g: 25, t: 3, cap: 875, minM: 1,
+      n: '25 ملغ/كغم يومياً مقسّمة على 3 جرعات للالتهابات المعتادة.',
+      w: ['التهاب الأذن الوسطى والجيوب: 40–45 ملغ/كغم يومياً مقسّمة على مرتين بصيغة مركّزة', 'يمنع مع حساسية البنسلين — أوقفه عند أي طفح أو تورم', 'الإسهال شائع؛ لا يُستعمل لالتهاب الحلق دون تأكيد عقدي'],
+      r: ['Medscape', 'BNF for Children', 'DailyMed'], s: 'Medscape: 20–45 mg/kg/day مقسّمة؛ الالتهاب الحاد للأذن 40–45 mg/kg/day على مرتين' },
+    cefalexin: { k: 'day', g: 50, t: 4, cap: 1000, day: 4000, minM: 12,
+      n: '25–50 ملغ/كغم يومياً مقسّمة على جرعات متساوية كل 6 ساعات (نستخدم 50 كحد الأعلى)، وقد ترفع الوصفة إلى 100 ملغ/كغم في العدوى الشديدة.',
+      w: ['تحت السنة: BNFC يسمح به لكن النشرة المقتبسة ذكرت سنة — راجع نشرة العبوة', 'حساسية السيفالوسبورين قد تتقاطع مع البنسلين', 'لا تُعطِ مع مضاد حيوي آخر دون وصفة'],
+      r: ['DailyMed cefalexin label', 'BNF for Children'], s: 'Label: 25 to 50 mg/kg given in equally divided doses؛ in severe infections 50 to 100 mg/kg may be administered' },
+    cefadroxil: { k: 'day', g: 30, t: 2, cap: 1000, day: 2000, minM: 1,
+      n: '30 ملغ/كغم يومياً مقسّمة على مرتين.',
+      w: ['حساسية السيفالوسبورين قد تتقاطع مع البنسلين'],
+      r: ['Medscape', 'BNF for Children'], s: '30 mg/kg/day divided q12h' },
+    cefuroxime_axetil: { k: 'day', g: 30, t: 2, cap: 500, day: 1000, minM: 3,
+      n: '30 ملغ/كغم يومياً مقسّمة على مرتين، بعد الأكل لتحسين الامتصاص.',
+      w: ['لا يمضغ ولا يسحق — الأغلفة حساسة والطعم مرير؛ اطلب المعلّق المحضر', 'السقف 1000 ملغ يومياً'],
+      r: ['Medscape', 'Zinnat SmPC'], s: '30 mg/kg/day divided مرتين يومياً، وأقصى 1000 mg/day' },
+    cefixime: { k: 'day', g: 8, t: 1, cap: 400, day: 400, minM: 6,
+      n: '8 ملغ/كغم يومياً مرة واحدة (أو مقسّمة على مرتين)، ولمدة 5–10 أيام حسب العدوى.',
+      w: ['الإسهال أكثر آثاره شيوعاً', 'لا يعالج التهاب الحلق العقدي بديلاً عن البنسلين'],
+      r: ['Medscape', 'DailyMed'], s: '8 mg/kg/day مرة واحدة أو مقسّمة' },
+    cefpodoxime: { k: 'day', g: 10, t: 2, cap: 200, day: 400, minM: 2,
+      n: '10 ملغ/كغم يومياً مقسّمة على مرتين، مع الطعام.',
+      w: ['المعلّق يفسد بعد 14 يوماً في الثلاجة'],
+      r: ['Medscape', 'DailyMed'], s: '10 mg/kg/day divided q12h' },
+    azithromycin: { k: 'wt', g: 10, t: 1, cap: 500, minM: 6,
+      n: '10 ملغ/كغم مرة يومياً لمدة 3 أيام.',
+      w: ['بروتوكول آخر: 10 mg/kg في اليوم الأول ثم 5 mg/kg أيام 2–5', 'التهاب الأذن الوسطى: جرعة واحدة 30 ملغ/كغم في بعض المراجع', 'تطاول QT — يحذر مع الأدوية المطاولَة QT', 'يفصله عن مضاد الحموضة بساعتين'],
+      r: ['Medscape', 'DailyMed Zithromax'], s: '10 mg/kg يومياً لثلاثة أيام؛ أو 10 ثم 5 mg/kg؛ AOM: 30 mg/kg جرعة واحدة' },
+    clarithromycin: { k: 'wt', g: 7.5, t: 2, cap: 250, day: 500, minM: 6,
+      n: '7.5 ملغ/كغم كل 12 ساعة (أي 15 ملغ/كغم يومياً)، بسقف 500 ملغ يومياً.',
+      w: ['تداخلات كثيرة عبر CYP3A4 — يمنع مع الإرجوتامين', 'طعم مرار وألم بطن'],
+      r: ['Medscape', 'BNF for Children', 'DailyMed'], s: '7.5 mg/kg كل 12 ساعة، وأقصى 500 mg/day' },
+    trimethoprim: { k: 'day', g: 8, t: 2, cap: 200, day: 400, minM: 2,
+      n: 'التهاب البول: 8 ملغ/كغم يومياً مقسّمة على مرتين.',
+      w: ['ممنوع تحت شهرين', 'يلزم شرب سوائل كافية، ويحذر في ضعف الكلى وقلة البول'],
+      r: ['Medscape', 'BNF for Children', 'DailyMed'], s: 'Medscape trimethoprim (UTI): 8 mg/kg/day مقسّمة على مرتين' },
+    nitrofurantoin: { k: 'day', g: 6, t: 4, cap: 100, day: 400, minM: 1,
+      n: 'التهاب البول السفلي: 5–7 ملغ/كغم يومياً مقسّمة على 4 مرات.',
+      w: ['ممنوع تحت شهر واحد وفي ضعف الكلى', 'لا يُستعمل لالتهاب الكلى (اختراق نسيجي ضعيف)', 'المعلّق يُحفظ مبرداً ويهزز قبل الصرف'],
+      r: ['Medscape', 'BNF for Children'], s: '5–7 mg/kg/day in 4 divided doses' },
+    ciprofloxacin: { k: 'wt', g: 10, t: 2, cap: 750, minM: 12,
+      n: '10–20 ملغ/كغم لكل جرعة كل 12 ساعة (سقف 750 ملغ للجرعة) — لأخصائي فقط.',
+      w: ['ليس خطاً أولاً: خطر غضاريف المفصل', 'يمنع مع الحليب والكالسيوم والحديد والزنك في نفس الوقت (ينقص الامتصاص)', 'يحذر مع الستيرويدات بسبب وتر أخيل'],
+      r: ['Medscape', 'BNF for Children'], s: '10–20 mg/kg كل 12 ساعة، وأقصى 750 mg لكل جرعة' },
+    doxycycline: { k: 'wt', g: 2.2, t: 2, cap: 100, day: 200, minM: 72,
+      n: '2.2 ملغ/كغم كل 12 ساعة (سقف 100 ملغ للجرعة) ولمدة قصيرة.',
+      w: ['يُستعمل بحذر تحت 8 سنوات (تصبغ الأسنان) — الكورات القصيرة حتى 21 يوماً مقبولة في المراجع الحديثة', 'يبتلع واقفاً مع ماء كافٍ — خطر تقرح المريء', 'يمنع مع الحليب/الكالسيوم/الحديد/مضاد الحموضة، ويسبب تحسساً ضوئياً'],
+      r: ['Medscape', 'AAP', 'DailyMed'], s: '2.2 mg/kg كل 12 ساعة، وأقصى 100 mg لكل جرعة' },
+    metronidazole: { k: 'day', g: 30, t: 3, cap: 500, day: 1500, minM: 1,
+      n: 'الأميبا واللاهوائيات: 30–35 ملغ/كغم يومياً مقسّمة على 3 جرعات (البروتوكول المعتاد 7.5 ملغ/كغم كل 8 ساعات).',
+      w: ['الجرعة العالية 35–50 ملغ/كغم يومياً تكون للعدوى الشديدة وبوصفة اختصاصي فقط', 'طعم معدني وغثيان — يُعطى بعد الأكل', 'يمنع مع الكحول (تفاعل ديسفيرام)'],
+      r: ['MSF', 'BNF for Children', 'Medscape'], s: 'MSF: 7.5 mg/kg كل 8 ساعات؛ Medscape: 30–35 mg/kg/day in 3 divided doses' },
+    oseltamivir: { k: 'wb', minM: 12, wbands: [[15, 30, 2], [23, 45, 2], [40, 60, 2], [200, 75, 2]],
+      n: 'العلاج مرتين يومياً لمدة 5 أيام حسب فئة الوزن: حتى 15 كغم 30 ملغ (2.5 مل)، ثم 45 (3.75 مل)، ثم 60 (5 مل)، ثم 75 ملغ (6.25 مل).',
+      w: ['تحت سنة واحدة: 3 ملغ/كغم لكل جرعة مرتين يومياً بوصفة طبيب (النشرة الأمريكية ترخّص العلاج من عمر سنة)', 'الوقاية: نفس الفئات مرة واحدة يومياً لمدة 7–10 أيام', 'يبدأ خلال 48 ساعة من ظهور الأعراض', 'المعلّق المحضر يفسد بعد 17 يوماً مبرداً و5 أيام بحرارة الغرفة'],
+      r: ['CDC antiviral table', 'FDA Tamiflu label', 'RCH'], s: 'CDC/label: if younger than 1 year 3 mg/kg/dose twice daily؛ 15 kg or less 30 mg twice daily؛ 15.1–23 kg 45 mg؛ 23.1–40 kg 60 mg؛ over 40 kg 75 mg' },
+    acyclovir: { k: 'wt', g: 20, t: 4, cap: 800, day: 3200, minM: 0,
+      n: 'القوبل الفموي: 20 ملغ/كغم أربع مرات يومياً (كل 4 ساعات في اليقظة) لمدة 5 أيام.',
+      w: ['يلزم إدرار بول جيد — خطر ترسب الأنبوبي الكلوي', 'التهاب الدماغ الهربسي يعالج وريدياً في المستشفى وليس بهذه الجرعة'],
+      r: ['Medscape', 'BNF for Children', 'Zovirax label'], s: '20 mg/kg أربع مرات يومياً لمدة 5 أيام' },
+    fluconazole: { k: 'day', g: 3, t: 1, cap: 200, day: 200, minM: 1,
+      n: 'فطار الفم (القلاع): 3 ملغ/كغم يومياً مرة واحدة (3–6 ملغ/كغم في MSF، بسقف 200 ملغ).',
+      w: ['الالتهابات الجهازية والمريئية: 6–12 ملغ/كغم يومياً بأخصائي (سقف 400–600 ملغ)', 'تطاول QT وتداخلات CYP — يحذر مع الوارفارين والفينيتين', 'تحقق من تركيز المحلول على العبوة (10 ملغ/مل أو 50 ملغ/5 مل)'],
+      r: ['MSF', 'BNF for Children', 'Pfizer label', 'PCH monograph'], s: 'MSF: child 1 month and over 3 to 6 mg/kg (max. 200 mg) once daily؛ label: systemic candidiasis 6–12 mg/kg once daily' },
+    albendazole: { k: 'band', minM: 12, bands: [[2, 200, 1], [14, 400, 1]],
+      n: 'جرعة واحدة: 200 ملغ تحت سنتين و400 ملغ فوقها — وتعاد بعد أسبوعين في الديدان الدبوسية.',
+      w: ['وزن أقل من 10 كغم: 200 ملغ مهما كان العمر', 'مع طعام دسم لتحسين الامتصاص في الديدان النسيجية'],
+      r: ['WHO', 'BNF for Children', 'Medscape'], s: '400 mg جرعة واحدة؛ 200 mg تحت السنتين أو تحت 10 كغم' },
+    mebendazole: { k: 'fx', f: 100, t: 2, cap: 500, day: 500, minM: 12,
+      n: '100 ملغ مرتين يومياً لمدة 3 أيام (أو 500 ملغ جرعة واحدة حسب النشرة).',
+      w: ['تحت السنتين بوصفة طبيب', 'الديدان الدبوسية: تعالج العائلة كلها وتعاد الجرعة بعد أسبوعين'],
+      r: ['BNF for Children', 'Vermox label', 'Medscape'], s: '100 mg مرتين يومياً لثلاثة أيام (أو 500 mg جرعة واحدة)' },
+    pyrantel: { k: 'wt', g: 10, t: 1, cap: 1000, minM: 6,
+      n: '10 ملغ/كغم (بسقف 1 غرام) جرعة واحدة — وتعاد بعد أسبوعين في الديدان الدبوسية.',
+      w: ['الجرعة تُحسب على الباز: تحقق من العبوة أيهما مكتوب (باز أم باموات) فالأرقام تختلف', 'لا يحتاج مليناً'],
+      r: ['BNF for Children', 'Medscape'], s: '10–11 mg/kg (base) جرعة واحدة، وأقصى 1 g' },
+    nystatin: { k: 'band', minM: 0, unit: 'iu', bands: [[2, 200000, 4], [14, 400000, 4]],
+      n: 'فطار الفم (القلاع): المعلّق 100,000 وحدة/مل — الرضّع 200,000 وحدة (2 مل) أربع مرات يومياً، والأطفال 400,000 وحدة أربع مرات يومياً.',
+      w: ['النسخة البريطانية (NHS/HPRA) تبدأ بـ 1 مل (100,000 وحدة) أربع مرات يومياً، وتصل إلى 6 مل فوق السنتين — صحّح حسب بلد المنتج', 'يُمسح الفم به ويُبتلع نصف الكمية يميناً ونصفها يساراً', 'لا يُمتص فلا يعالج عدوى جهازية'],
+      r: ['DailyMed Mycostatin', 'NHS', 'HPRA PIL'], s: 'Label: for infants 2 mL (200,000 units) four times daily؛ NHS: 1 mL four times a day؛ children over 2 years 1–6 mL four times daily' },
+    vitamin_b: { k: 'band', minM: 1, bands: [[1, 25, 1], [11, 25, 2], [14, 25, 2]],
+      n: 'مكمل فيتامين B (نشرة Vigranon B وموسوعة BNFC مرتبطة بهذا المنتج): 5 مل مرة يومياً تحت السنة، و5 مل مرتين من سنة إلى 11 سنة.',
+      w: ['الأرقام خاصة بعلامة Vigranon B — لا تُطبّق على أي شراب B مركّب آخر', 'انتبه لمجموع فيتامين A/D إذا كان معه متعدد الفيتامينات'],
+      r: ['BNF for Children', 'eMC Vigranon-B PIL'], s: 'BNFC: 1–11 months 5 mL once daily (Vigranon B syrup)؛ 1–11 years 5 mL twice daily' },
+    multivitamin: { k: 'no', minM: 0,
+      n: 'متعدد الفيتامينات لا يُحسب بالملغ: تركيبة كل علامة مختلفة والجرعة حجمية بالعمر — BNFC: 0.3 مل يومياً للمولود والرضيع حتى 11 شهراً، و0.6 مل من سنة إلى 17 سنة. طبّق نشرة هذا المنتج بالذات.',
+      w: ['لا يجمع مع قطرة فيتامين A أو D منفصلة دون إشراف طبي', 'استعمل القطّارة المرفقة لا الملعقة المنزلية', 'الأرقام أعلاه لعلامة Dalivit/متعدد الفيتامينات القياسي — غيّرها حسب المنتج'],
+      r: ['BNF for Children (Dalivit)', 'EFDA multivitamin leaflet'], s: 'BNFC: preterm 0.6 mL daily؛ neonate 0.3 mL؛ 1–11 months 0.3 mL؛ 1–17 years 0.6 mL' }
+  };
+  /* تحويل الموسوعة إلى نفس شكل السجل المخزّن — متوافق مع القواعد القديمة في IndexedDB وفايربيس */
+  function libToData(e) {
+    const d = { unit: e.unit || 'mg', minMonths: +e.minM || 0, minKg: +e.minKg || 0, note: e.n || '', safety: A(e.w), refs: A(e.r), src: e.s || '' };
+    if (e.k === 'no') return Object.assign(d, { mode: 'no', noText: e.n || '', note: '' });
+    if (e.k === 'wt') return Object.assign(d, { mode: 'wt', mgPerKg: e.g, timesPerDay: e.t, maxDoseMg: e.cap || 0, maxDailyMg: e.day || 0 });
+    if (e.k === 'day') return Object.assign(d, { mode: 'day', mgPerKg: e.g, timesPerDay: e.t, maxDoseMg: e.cap || 0, maxDailyMg: e.day || 0 });
+    if (e.k === 'fx') return Object.assign(d, { mode: 'fx', f: e.f, timesPerDay: e.t, maxDoseMg: e.cap || 0, maxDailyMg: e.day || 0 });
+    if (e.k === 'wb') return Object.assign(d, { mode: 'wb', wbands: A(e.wbands).map(b => ({ toKg: b[0], doseMg: b[1], timesPerDay: b[2] })), timesPerDay: 2, maxDoseMg: e.cap || 0, maxDailyMg: e.day || 0 });
+    return Object.assign(d, { mode: 'band', bands: A(e.bands).map(b => ({ toYears: b[0], doseMg: b[1], timesPerDay: b[2] })), timesPerDay: 1, maxDoseMg: e.cap || 0, maxDailyMg: e.day || 0 });
+  }
+  /* قاعدة محلية للمادة المفردة أو للمركّب: المركّب يتبع المكوّن المحدّد للجرعة */
+  function localRule(key, combo, printed) {
+    const e = LIB[key];
+    if (e) return { key, data: libToData(e), prov: 'local', createdAt: 0, v: 1 };
+    if (!combo || !LIB[combo.drv]) return null;
+    const d = libToData(LIB[combo.drv]);
+    if (combo.es && combo.gES) {
+      const isES = combo.es.indexOf(printed) >= 0;
+      d.mode = 'day'; d.mgPerKg = isES ? combo.gES : combo.gLo; d.timesPerDay = isES ? combo.tES : combo.tLo;
+      const esL = A(combo.es).join('/');
+      const regL = Object.keys(combo.merge || {}).map(Number).filter(x => combo.es.indexOf(x) < 0).sort((a, b) => a - b).join('/');
+      d.note = (isES ? 'الصيغة المركّزة (أرقام ' + esL + '): ' : 'الصيغة المعتادة (أرقام ' + regL + '): ')
+        + d.mgPerKg + ' ملغ/كغم يومياً مقسّمة على ' + d.timesPerDay + ' — الحساب على الأموكسيسيلين';
+      if (!printed) d.safety = ['لم يُقرأ رقم التركيبة من العبوة: إن كانت 228/400/457/600/643 فهي الصيغة المركّزة وتُقسّم مرتين، وإن كانت 125/250 فهي المعتادة وتُقسّم ثلاث مرات — صحّح رقم العبوة أو التركيز قبل الصرف'].concat(A(d.safety));
+    } else if (combo.g != null) { d.mode = 'day'; d.mgPerKg = combo.g; d.timesPerDay = combo.t; }
+    if (combo.clavCap) d.clavCap = combo.clavCap;
+    if (combo.note) d.note = d.note ? combo.note + ' — ' + d.note : combo.note;
+    if (combo.src) d.src = combo.src;
+    return { key, data: d, prov: 'local', createdAt: 0, v: 1 };
+  }
   /* أوزان وسيطة للأطفال حسب العمر والجنس (المرجعية المتبعة في الممارسة العراقية) — تُستعمل فقط عندما لا يُدخل الصيدلي وزناً فعلياً */
   const AGE_M = [0, 3, 6, 9, 12, 18, 24, 36, 48, 60, 72, 84, 96, 108, 120, 132, 144, 156, 168];
   const WT_B = [3.3, 6.4, 7.9, 8.9, 9.6, 10.9, 12.2, 14.3, 16.3, 18.3, 20.5, 22.9, 25.6, 28.6, 31.9, 35.7, 40, 45, 50];
@@ -5230,21 +5911,31 @@ const DoseCalc = (() => {
 
   function buildPrompt(p, ps) {
     const clean = v => S(v).replace(/["\r\n]+/g, ' ');
-    return `You are a pediatric clinical pharmacist. Verify EVERY number against BNF for Children, Medscape pediatric dosing and the official FDA/DailyMed label only. Never guess — if verified pediatric dosing is not established for this drug, return {"mode":"none"}.
+    const combo = ps.length > 1
+      ? `This is a FIXED-DOSE COMBINATION of ${ps.length} active ingredients, in label order: ${ps.join(' + ')}.
+Return the regimen of the DOSE-DRIVING ingredient (the one whose mg/kg or age-band dose controls the volume given), and state in "note" which ingredient drives it and the ceiling of the others.
+If the product is a known co-formulation (e.g. amoxicillin/clavulanate, co-trimoxazole, bromhexine+salbutamol+guaifenesin) use the licensed co-formulation regimen for that exact ratio, not the single-ingredient one.`
+      : `Single active ingredient: ${ps.join(' + ')}.`;
+    return `You are a pediatric clinical pharmacist. Verify EVERY number against BNF for Children, Medscape pediatric dosing and the official FDA/DailyMed label only. Never guess and never round a mg/kg figure from memory.
+${combo}
 
-Drug (generic name): "${clean(p.scientificName)}"${ps.length > 1 ? ' — fixed-dose combination of: ' + ps.join(' + ') + '. Give the dosing of the combination as commonly prescribed.' : ''}
-Product context (for concentration only): form "${clean(p.form)}", strength "${clean(p.dose)}".
+Drug (generic name): "${clean(p.scientificName)}"
+Product context (concentration only, do not re-derive it): form "${clean(p.form)}", strength as printed "${clean(p.dose)}".
 
 Return ONLY one JSON object in exactly this shape:
-{"mode":"wt","mgPerKg":0,"timesPerDay":0,"maxDoseMg":0,"minMonths":0,"bands":[{"toYears":0,"doseMg":0,"timesPerDay":0}],"note":"","refs":[""]}
+{"mode":"wt","mgPerKg":0,"timesPerDay":1,"maxDoseMg":0,"maxDailyMg":0,"minMonths":0,"minKg":0,"unit":"mg","bands":[{"toYears":0,"doseMg":0,"timesPerDay":1}],"wbands":[{"toKg":0,"doseMg":0,"timesPerDay":1}],"f":0,"note":"","safety":[""],"refs":[""]}
 
 Rules:
-- mode "wt" = verified pediatric dosing is weight-based: mgPerKg = milligrams per kilogram per SINGLE dose; timesPerDay = doses given per day; maxDoseMg = absolute single-dose ceiling (usually the adult single dose); minMonths = minimum allowed age in months (0 if usable from birth per the source).
-- mode "band" = verified dosing is fixed by age band: fill bands ascending by toYears, doseMg = fixed mg per single dose, timesPerDay per band.
-- mode "none" = no verified pediatric dosing — nothing else required.
-- Use the standard common-indication regimen (e.g. usual infection course); put clarifications in note.
-- note: one short Arabic safety note, max 120 characters (food relation, dilution, key caution).
-- refs: names of sources actually verified from (e.g. "BNF for Children", "Medscape", "FDA label").
+- mode "wt": weight-based per SINGLE dose. mgPerKg = mg/kg per dose, timesPerDay = doses per day, maxDoseMg = absolute single-dose ceiling (usually the adult single dose).
+- mode "day": weight-based per TOTAL DAY. mgPerKg = mg/kg/day, timesPerDay = number of divided doses, maxDailyMg = absolute daily ceiling.
+- mode "band": fixed mg per single dose by age band — fill "bands" ascending by toYears (last band must cover up to 12–14 years), timesPerDay per band.
+- mode "wb": fixed mg per single dose by WEIGHT band — fill "wbands" ascending by toKg (use this for products licensed by weight bands, e.g. oseltamivir).
+- mode "fx": one fixed dose for every child above minMonths — put it in "f" (mg per dose) and "timesPerDay".
+- mode "none": ONLY when the drug has no pediatric oral dosing at all (withdrawn, contraindicated in children, or parenteral-only). Then also set "noText" to one short Arabic sentence naming the reason and the source.
+- minMonths: lowest age allowed by the source (0 = from birth). minKg: lowest weight allowed (0 = none).
+- unit: "mg" normally, "iu" for vitamin D / nystatin style products.
+- note: one short Arabic sentence naming the dose-driving rule (max 140 characters). safety: up to 3 short Arabic warnings (max 90 characters each).
+- refs: names of the sources you actually read for these numbers (e.g. "BNF for Children", "DailyMed label", "Medscape", "WHO/MSF").
 - No markdown, no text outside the JSON.`;
   }
 
@@ -5318,66 +6009,154 @@ Rules:
     try { await DB.put('meta', { ...rec, id: 'dose:' + rec.key }); } catch (_) {}
   }
 
-  /* الحساب المحلي الدقيق: ملغ للجرعة الواحدة مع سقف الجرعة، ثم التحويل إلى سم³ حسب تركيز المنتج */
+  /* الحساب المحلي الدقيق: ملغ (أو وحدة) للجرعة الواحدة مع السقوف، ثم التحويل إلى سم³ حسب تركيز المنتج */
   function calcDose(rule, months, kg) {
-    const d = rule.data || {};
+    const d = (rule && rule.data) || {};
+    if (d.mode === 'no') return { no: d.noText || 'هذه المادة لا تُصرف للأطفال في هذا العمر حسب المرجع المعتمد', unit: d.unit || 'mg' };
     if (d.mode === 'none') return { none: true };
-    let doseMg = 0, perDay = 0, capped = false;
-    const minM = +d.minMonths || 0;
+    let doseMg = 0, perDay = 0, capped = false, daily = 0, dailyCapped = false, bandLabel = '';
+    const minM = +d.minMonths || 0, minKg = +d.minKg || 0;
+    const A2 = arr => A(arr).filter(x => x && (+x.doseMg > 0)).slice().sort((a, b) => (+a.toYears || 0) - (+b.toYears || 0) || (+a.toKg || 0) - (+b.toKg || 0));
     if (d.mode === 'wt') {
-      doseMg = (+d.mgPerKg || 0) * kg;
-      perDay = +d.timesPerDay || 0;
+      doseMg = (+d.mgPerKg || 0) * kg; perDay = +d.timesPerDay || 0;
+      if (+d.maxDoseMg > 0 && doseMg > +d.maxDoseMg) { doseMg = +d.maxDoseMg; capped = true; }
+    } else if (d.mode === 'day') {
+      perDay = +d.timesPerDay || 1;
+      daily = (+d.mgPerKg || 0) * kg;
+      if (+d.maxDailyMg > 0 && daily > +d.maxDailyMg) { daily = +d.maxDailyMg; dailyCapped = true; }
+      doseMg = daily / Math.max(1, perDay);
+      if (+d.maxDoseMg > 0 && doseMg > +d.maxDoseMg) { doseMg = +d.maxDoseMg; capped = true; daily = doseMg * perDay; }
+    } else if (d.mode === 'fx') {
+      doseMg = +d.f || 0; perDay = +d.timesPerDay || 1;
+      if (+d.maxDoseMg > 0 && doseMg > +d.maxDoseMg) { doseMg = +d.maxDoseMg; capped = true; }
+    } else if (d.mode === 'wb') {
+      const bs = A2(d.wbands);
+      if (!bs.length) return { none: true };
+      let b = bs.find(x => kg <= (+x.toKg || 0)) || bs[bs.length - 1];
+      doseMg = +b.doseMg; perDay = +b.timesPerDay || +d.timesPerDay || 1;
+      bandLabel = `فئة الوزن: حتى ${+b.toKg} كغم`;
       if (+d.maxDoseMg > 0 && doseMg > +d.maxDoseMg) { doseMg = +d.maxDoseMg; capped = true; }
     } else {
       const yrs = months / 12;
-      const band = A(d.bands).filter(b => +b.toYears > 0 && +b.doseMg > 0).sort((a, b) => +a.toYears - +b.toYears).find(b => yrs <= +b.toYears);
-      if (!band) return { none: true };
-      doseMg = +band.doseMg; perDay = +band.timesPerDay || 0;
+      const bs = A2(d.bands);
+      if (!bs.length) return { none: true };
+      let b = bs.find(x => yrs <= (+x.toYears || 0)) || bs[bs.length - 1];
+      doseMg = +b.doseMg; perDay = +b.timesPerDay || +d.timesPerDay || 1;
+      bandLabel = yrs > (+b.toYears || 0) ? `لا توجد فئة عمرية مطابقة — طُبّقت أكبر فئة متوفرة (حتى ${+b.toYears} سنة)` : `فئة العمر: حتى ${+b.toYears} سنة`;
+      if (+d.maxDoseMg > 0 && doseMg > +d.maxDoseMg) { doseMg = +d.maxDoseMg; capped = true; }
     }
     doseMg = Math.round(doseMg * 10) / 10;
-    return { doseMg, perDay, capped, minM };
+    daily = Math.round((daily || doseMg * (perDay || 1)) * 10) / 10;
+    return { doseMg, perDay, capped, daily, dailyCapped, bandLabel, minM, minKg, unit: d.unit || 'mg' };
   }
 
   const dayTimes = n => n === 1 ? 'مرة واحدة يومياً' : n === 2 ? 'مرتين يومياً' : n > 0 ? n + ' مرات يومياً' : '';
 
-  /* أيقونة الطفل */
-  function baby() {
-    return `<svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="dzg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffd9e8"/><stop offset="1" stop-color="#9fd8ff"/></linearGradient></defs><circle cx="32" cy="34" r="22" fill="url(#dzg)" stroke="#0b2f2c" stroke-opacity=".15"/><path d="M32 12c3.5 0 5.5 2.5 5.5 5 0 1.8-1 3.2-2.5 3.9" fill="none" stroke="#8a5a00" stroke-width="2.6" stroke-linecap="round"/><circle cx="24" cy="33" r="2.6" fill="#14302d"/><circle cx="40" cy="33" r="2.6" fill="#14302d"/><path d="M24 43c2.8 3 5.5 4.2 8 4.2s5.2-1.2 8-4.2" fill="none" stroke="#14302d" stroke-width="2.6" stroke-linecap="round"/><circle cx="18" cy="40" r="3" fill="#ffb3c7" opacity=".8"/><circle cx="46" cy="40" r="3" fill="#ffb3c7" opacity=".8"/></svg>`;
+  /* الشعار الهندسي: قطرة بمدرّج قياس — مسطّح بلا ظل ولا بُعد ثالث */
+  function glyph() {
+    return `<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+<path d="M12 3.6c3.3 3.7 5.2 6.3 5.2 8.6a5.2 5.2 0 1 1-10.4 0c0-2.3 1.9-4.9 5.2-8.6z"/>
+<path d="M9.4 12.1h1.5M11.2 15.2h1.9M13.6 11.2h1.3"/>
+<circle cx="18.4" cy="5.2" r="1.5" class="dzq-dot"/></svg>`;
+  }
+  /* واجهة النافذة: ستة أضلاع + قطرة + نواة نابضة */
+  function hero() {
+    return `<svg viewBox="0 0 72 72" aria-hidden="true" fill="none">
+<path d="M36 5l24 14v24L36 67 12 43V19z" stroke="rgba(255,255,255,.55)" stroke-width="2" stroke-linejoin="round"/>
+<path d="M36 20c7 8.2 11 13.6 11 18.6a11 11 0 1 1-22 0C25 33.6 29 28.2 36 20z" fill="rgba(255,255,255,.92)"/>
+<circle cx="36" cy="40" r="4" fill="#2563eb" opacity=".75"/>
+<circle class="dzh-o" cx="36" cy="40" r="16" stroke="rgba(255,255,255,.5)" stroke-width="1.4" stroke-dasharray="5 7"/>
+<circle class="dzh-p" cx="36" cy="24" r="2.6" fill="#fff"/></svg>`;
   }
 
   function css() {
     if (cssDone) return; cssDone = true;
     const st = document.createElement('style'); st.id = 'dz-css';
     st.textContent = `
-.dz-fab{width:40px;height:40px;border:0;border-radius:50%;padding:5px;cursor:pointer;display:grid;place-items:center;background:linear-gradient(145deg,#fff,#ffe3ee);box-shadow:0 4px 0 #e6b8cc,0 9px 14px rgba(11,47,44,.22),inset 0 2px 0 #fff;transition:transform .18s ease,box-shadow .18s ease;animation:dzFloat 3.2s ease-in-out infinite;flex:none}
-.dz-fab svg{width:100%;height:100%;filter:drop-shadow(0 2px 2px rgba(0,0,0,.2))}
-.dz-fab:hover{transform:translateY(-3px) scale(1.06);box-shadow:0 7px 0 #e6b8cc,0 14px 18px rgba(11,47,44,.26),inset 0 2px 0 #fff;animation:none}
-.dz-fab:active{transform:translateY(3px);box-shadow:0 1px 0 #e6b8cc,0 3px 6px rgba(11,47,44,.2),inset 0 2px 0 #fff}
-@keyframes dzFloat{0%,100%{translate:0 0}50%{translate:0 -3px}}
-@keyframes dzSpin{to{transform:rotate(360deg)}}
-@media (prefers-reduced-motion:reduce){.dz-fab{animation:none}.dz-spin{animation:none}}
-.dz-wrap{display:flex;flex-direction:column;gap:12px}
-.dz-prod{display:flex;align-items:center;gap:12px;background:#f4faf9;border:1px solid #d3e5e2;border-radius:14px;padding:10px 14px}
-.dz-prod .dz-ic{width:42px;height:42px;flex:none}
-.dz-form{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+/* ── الحاسبة: موضع ثابت في صف الإجراءات حتى لا تنزاح أزرار عرض/تعديل/حذف ── */
+.dz-slot{width:32px;height:32px;flex:none;border-radius:11px;background:transparent}
+.dz-q{position:relative;isolation:isolate;width:32px;height:32px;flex:none;border:1px solid var(--line);border-radius:11px;background:var(--white);color:var(--ink-2);display:grid;place-items:center;cursor:pointer;overflow:hidden;padding:0;transition:color .25s ease,border-color .25s ease,transform .25s var(--tr-b),box-shadow .25s ease}
+.dz-q::before{content:"";position:absolute;inset:0;z-index:-1;background:linear-gradient(115deg,#2563eb,#0ea5a0 28%,#16a34a 52%,#7c3aed 76%,#2563eb);background-size:320% 100%;background-position:0% 0;opacity:.14;transition:opacity .3s ease}
+.dz-q svg{width:19px;height:19px;position:relative;z-index:1}
+.dz-q .dzq-dot{opacity:0;transition:opacity .3s}
+.dz-q:hover{color:#fff;border-color:transparent;transform:translateY(-2px);box-shadow:0 8px 18px -6px rgba(37,99,235,.55),0 0 0 3px rgba(124,58,237,.13)}
+.dz-q:hover::before{opacity:1;animation:dzFlow 4.6s linear infinite}
+.dz-q:hover .dzq-dot{opacity:1;animation:dzBlink 1.15s ease-in-out infinite}
+.dz-q:active{transform:translateY(0) scale(.95)}
+.dz-q:focus-visible{outline:2px solid #7c3aed;outline-offset:2px}
+@keyframes dzFlow{from{background-position:0% 0}to{background-position:320% 0}}
+@keyframes dzBlink{0%,100%{opacity:.25}50%{opacity:1}}
+/* ── النافذة ── */
+.dzx{border-radius:24px;overflow:hidden;box-shadow:var(--shadow-lg),0 0 0 1px rgba(124,58,237,.16);border:0}
+.dzx .modal-head{position:relative;border:0;padding:15px 20px;color:#fff;background:linear-gradient(115deg,#1d4ed8,#0f9488 34%,#16a34a 62%,#7c3aed);background-size:230% 100%;animation:dzFlow 14s linear infinite}
+.dzx .modal-head h3{color:#fff;font-size:16.5px;letter-spacing:.2px;gap:12px}
+.dzx .modal-head h3 svg{width:24px;height:24px;color:rgba(255,255,255,.9)}
+.dzx .modal-close{background:rgba(255,255,255,.18);color:#fff}
+.dzx .modal-close:hover{background:rgba(255,255,255,.34);color:#fff;transform:rotate(90deg)}
+.dzx .modal-body{padding:18px 20px 20px;background:radial-gradient(120% 60% at 100% 0%,rgba(124,58,237,.08),transparent 60%),linear-gradient(180deg,#f6f9ff,var(--bg))}
+html[data-theme="dark"] .dzx .modal-body{background:radial-gradient(120% 60% at 100% 0%,rgba(124,58,237,.18),transparent 60%),linear-gradient(180deg,#0f1826,var(--canvas))}
+.dzx-head{display:flex;align-items:center;gap:14px;margin:-4px 0 14px}
+.dzx-head>span{width:60px;height:60px;flex:none;display:grid;place-items:center;border-radius:19px;background:linear-gradient(115deg,#1d4ed8,#0f9488 38%,#16a34a 68%,#7c3aed);background-size:250% 100%;animation:dzFlow 9s linear infinite;box-shadow:0 12px 24px -12px rgba(37,99,235,.8)}
+.dzx-head svg{width:40px;height:40px}
+.dzx-head .dzh-o{animation:dzSpin 9s linear infinite;transform-origin:36px 40px}
+.dzx-head .dzh-p{animation:dzOrb 3.4s linear infinite;transform-origin:36px 40px}
+@keyframes dzOrb{to{transform:rotate(360deg)}}
+.dz-id{min-width:0;display:flex;flex-direction:column;gap:3px}
+.dz-id b{font-size:16px;line-height:1.35}
+.dz-id .dz-chip{display:inline-flex;gap:6px;align-items:center;font-size:11.5px;font-weight:900;color:var(--muted);background:#fff;border:1px solid var(--line);border-radius:99px;padding:2px 9px;width:max-content}
+html[data-theme="dark"] .dz-id .dz-chip{background:#131e2e}
+/* ── المدخلات ── */
+.dz-wrap{display:flex;flex-direction:column;gap:13px}
+.dz-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}
 .dz-field{display:flex;flex-direction:column;gap:5px}
-.dz-field label{font-weight:900;font-size:12.5px;color:var(--muted)}
-.dz-field input{border:1.5px solid var(--line);border-radius:11px;padding:9px 12px;font:inherit;font-weight:800;outline:none}
-.dz-field input:focus{border-color:#14b8a6}
-.dz-seg{display:flex;gap:8px}
-.dz-sex{flex:1;border:1.5px solid var(--line);background:transparent;color:inherit;font:inherit;font-weight:900;border-radius:11px;padding:9px 0;cursor:pointer}
-.dz-sex.on{background:#14b8a6;border-color:#14b8a6;color:#fff}
-.dz-res{display:flex;flex-direction:column;gap:10px}
-.dz-big{background:linear-gradient(120deg,#0f766e,#14b8a6);color:#fff;border-radius:16px;padding:16px;text-align:center}
-.dz-big b{font-size:30px;font-weight:900;direction:ltr;display:block}
-.dz-big small{font-weight:800;opacity:.92}
-.dz-line{background:#fff;border:1px solid #dcebe8;border-radius:12px;padding:9px 13px;font-weight:800;line-height:1.9}
-.dz-warn{background:#fff0c9;color:#7a4b00;border:1px solid #f0d48a;border-radius:12px;padding:9px 13px;font-weight:800;line-height:1.9}
-.dz-stop{background:#ffdcdc;color:#b91c1c;border:1px solid #f3b4b4;border-radius:12px;padding:9px 13px;font-weight:900;line-height:1.9}
-.dz-note{font-size:11.8px;font-weight:700;color:var(--muted);line-height:1.9}
-.dz-src{direction:ltr;display:inline-block;background:#e3f1ee;border-radius:8px;padding:0 8px;font-size:11.5px;font-weight:800;margin:0 2px}
-.dz-load{display:flex;flex-direction:column;align-items:center;gap:10px;padding:18px;text-align:center}
-.dz-spin{width:40px;height:40px;border-radius:50%;border:4px solid #cfe5e1;border-top-color:#14b8a6;animation:dzSpin 1s linear infinite}
+.dz-field label{font-weight:900;font-size:11.5px;color:var(--muted)}
+.dz-field input{border:1.5px solid var(--line);border-radius:12px;padding:9px 11px;font:inherit;font-weight:900;outline:none;background:var(--white);color:var(--ink);transition:border-color .2s,box-shadow .2s;direction:ltr;text-align:center}
+.dz-field input:focus{border-color:#7c3aed;box-shadow:0 0 0 3px rgba(124,58,237,.15)}
+.dz-seg{display:flex;gap:7px}
+.dz-sex{flex:1;border:1.5px solid var(--line);background:var(--white);color:var(--muted);font:inherit;font-weight:900;font-size:13px;border-radius:12px;padding:8px 0;cursor:pointer;transition:all .2s}
+.dz-sex.on{background:linear-gradient(120deg,#2563eb,#7c3aed);border-color:transparent;color:#fff;box-shadow:0 6px 14px -6px rgba(37,99,235,.6)}
+.dz-go{position:relative;border:0;border-radius:14px;padding:12px 16px;font:inherit;font-weight:900;font-size:14.5px;color:#fff;cursor:pointer;overflow:hidden;background:linear-gradient(115deg,#1d4ed8,#0f9488 40%,#16a34a 68%,#7c3aed);background-size:250% 100%;animation:dzFlow 7s linear infinite;box-shadow:0 12px 24px -12px rgba(22,163,74,.75);transition:transform .2s var(--tr-b),box-shadow .2s}
+.dz-go:hover{transform:translateY(-2px);box-shadow:0 16px 30px -12px rgba(37,99,235,.8)}
+.dz-go:active{transform:translateY(0) scale(.98)}
+/* ── النتائج ─ */
+.dz-res{display:flex;flex-direction:column;gap:11px}
+.dz-big{position:relative;overflow:hidden;color:#fff;border-radius:20px;padding:18px 18px 16px;text-align:center;background:linear-gradient(115deg,#1e40af,#0e9488 38%,#16a34a 66%,#7c3aed);background-size:240% 100%;animation:dzFlow 10s linear infinite;box-shadow:0 18px 34px -18px rgba(124,58,237,.8)}
+.dz-big::after{content:"";position:absolute;inset:auto -20% -60% -20%;height:110%;background:radial-gradient(50% 50% at 50% 50%,rgba(255,255,255,.22),transparent 70%);pointer-events:none}
+.dz-big b{font-size:40px;font-weight:900;direction:ltr;display:block;line-height:1.05;letter-spacing:-1px;text-shadow:0 2px 10px rgba(0,0,0,.22)}
+.dz-big small{font-weight:800;opacity:.95;font-size:12.5px}
+.dz-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.dz-card{background:var(--white);border:1px solid var(--line);border-radius:14px;padding:9px 8px;text-align:center;display:flex;flex-direction:column;gap:3px;box-shadow:var(--shadow-sm)}
+html[data-theme="dark"] .dz-card{background:#131e2e}
+.dz-card i{font-style:normal;font-size:10.5px;font-weight:900;color:var(--muted);letter-spacing:.2px}
+.dz-card b{font-size:15.5px;font-weight:900;direction:ltr;color:var(--ink)}
+.dz-card span{font-size:10.5px;font-weight:800;color:var(--faint)}
+.dz-line{background:var(--white);border:1px solid var(--line);border-radius:14px;padding:10px 13px;font-weight:800;line-height:1.85;box-shadow:var(--shadow-sm)}
+html[data-theme="dark"] .dz-line{background:#131e2e}
+.dz-warn{background:#fff8e6;color:#7a4b00;border:1px solid #f0d48a;border-radius:14px;padding:9px 13px;font-weight:800;line-height:1.8}
+html[data-theme="dark"] .dz-warn{background:#2a2110;color:#fcd34d;border-color:#5c4a1c}
+.dz-stop{background:#fff1f1;color:#b91c1c;border:1px solid #f3b4b4;border-radius:14px;padding:10px 13px;font-weight:900;line-height:1.8}
+html[data-theme="dark"] .dz-stop{background:#2a1414;color:#fca5a5;border-color:#5c2222}
+.dz-parts{display:flex;flex-direction:column;gap:6px;background:var(--white);border:1px dashed var(--line-2);border-radius:14px;padding:10px 12px}
+.dz-part{display:flex;align-items:center;justify-content:space-between;gap:10px;font-weight:900;font-size:12.5px}
+.dz-part em{font-style:normal;color:var(--muted);font-weight:800}
+.dz-part b{direction:ltr;color:#1d4ed8}
+html[data-theme="dark"] .dz-part b{color:#93c5fd}
+.dz-src{direction:ltr;display:inline-block;background:#eef2ff;border:1px solid #dbe3ff;border-radius:8px;padding:1px 8px;font-size:11px;font-weight:800;margin:2px 2px 0 0;color:#3730a3}
+html[data-theme="dark"] .dz-src{background:#1c2440;border-color:#2c3a63;color:#c7d2fe}
+.dz-prov{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:900;border-radius:99px;padding:3px 10px;background:#ecfdf5;color:#047857;border:1px solid #a7f3d0}
+html[data-theme="dark"] .dz-prov{background:#0f2a20;color:#6ee7b7;border-color:#1c4a39}
+.dz-prov.ai{background:#eef2ff;color:#4338ca;border-color:#dbe3ff}
+.dz-prov.man{background:#fff7ed;color:#9a3412;border-color:#fed7aa}
+html[data-theme="dark"] .dz-prov.man{background:#2a1b10;color:#fdba74;border-color:#5c3a1c}
+.dz-note{font-size:11.5px;font-weight:700;color:var(--muted);line-height:1.9}
+.dz-load{display:flex;flex-direction:column;align-items:center;gap:10px;padding:16px;text-align:center}
+.dz-spin{width:38px;height:38px;border-radius:50%;border:4px solid #dfe7f5;border-top-color:#7c3aed;border-right-color:#16a34a;animation:dzSpin 1s linear infinite}
+@keyframes dzSpin{to{transform:rotate(360deg)}}
+.dz-adv{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.dz-mini{border:1px solid var(--line);background:var(--white);color:var(--ink-2);font:inherit;font-size:11.5px;font-weight:900;border-radius:99px;padding:5px 12px;cursor:pointer;transition:all .2s}
+.dz-mini:hover{border-color:#7c3aed;color:#7c3aed;transform:translateY(-1px)}
+html[data-theme="dark"] .dz-mini{background:#131e2e}
+@media (prefers-reduced-motion:reduce){.dz-q::before,.dz-go,.dz-big,.dzx .modal-head,.dz-spin,.dzx-head svg{animation:none}.dz-q:hover{transform:none}}
 `;
     document.head.append(st);
   }
@@ -5386,120 +6165,271 @@ Rules:
     if (!applicable(p)) return;
     css();
     const sci = S(p.scientificName);
-    const conc = concOf(p);
+    const bKey = brandOf(p.brandName);                       /* العلامة التجارية تُغني عن الاسم العلمي عند غيابه */
+    const psRaw = partsOf(sci);
+    const ps = psRaw.length ? psRaw : (bKey ? bKey.split('__') : []);
+    const key = keyOf(ps) || bKey;
+    const combo = COMBO[keyOf(ps)] || COMBO[bKey] || null;   /* المركّبات: المكوّن المحدّد للجرعة وكيف يُفكّ رقم العبوة */
+    const drv = (combo && combo.drv) || ps[0] || '';
+    const ci = applyMerge(p, ps, combo, concInfo(p, ps, drv));
+    const nameOf = t => S(t).replace(/_/g, ' ');
     let sex = 'm';
 
-    const yInp = h('input', { type: 'number', min: 0, max: 14, step: 'any', placeholder: '0' });
-    const mInp = h('input', { type: 'number', min: 0, max: 11, step: 'any', placeholder: '0' });
+    const yInp = h('input', { type: 'number', min: 0, max: 14, step: 'any', placeholder: '0', dir: 'ltr' });
+    const mInp = h('input', { type: 'number', min: 0, max: 11, step: 'any', placeholder: '0', dir: 'ltr' });
     const wInp = h('input', { type: 'number', min: 0, step: 'any', placeholder: 'اختياري', dir: 'ltr' });
+    const cInp = h('input', { type: 'number', min: 0, step: 'any', placeholder: ci.perMl ? String(Math.round(ci.perMl * 5 * 100) / 100) : 'مثال: 250', dir: 'ltr' });
+    const concLine = h('div', { class: 'dz-note', style: { paddingTop: '9px', lineHeight: '1.8' } },
+      ci.how || 'لم يُقرأ التركيز من خانة الجرعة — اكتبه بالملغ لكل 5 مل لعرض الحجم بالسم³ (الملغ يُحسب في كل الأحوال)');
     const res = h('div', { class: 'dz-res' });
     const bBtn = h('button', { class: 'dz-sex on' }, 'ذكر');
     const gBtn = h('button', { class: 'dz-sex' }, 'أنثى');
     bBtn.onclick = () => { sex = 'm'; bBtn.classList.add('on'); gBtn.classList.remove('on'); };
     gBtn.onclick = () => { sex = 'f'; gBtn.classList.add('on'); bBtn.classList.remove('on'); };
+    const monthsNow = () => Math.max(0, (+yInp.value || 0) * 12 + (+mInp.value || 0));
 
-    openModal({ title: 'حاسبة جرعات الأطفال الذكية', icon: 'pill', body: h('div', { class: 'dz-wrap' },
-      h('div', { class: 'dz-prod' },
-        h('span', { class: 'dz-ic', html: baby() }),
-        h('div', { style: { minWidth: 0 } },
-          h('b', { style: { fontSize: '15px' } }, p.brandName),
-          h('div', { class: 'dz-note' }, `${S(p.form)} ${S(p.dose)}` + (conc ? ` — التركيز: ${conc} ملغ/مل` : ' — التركيز غير مقروء: سيُعرض الناتج بالملغ فقط (اكتب الجرعة بصيغة 250mg/5ml في صفحة الصنف لعرض السم³)')),
-          h('div', { class: 'dz-note' }, 'المادة: ' + (sci || 'لا يوجد اسم علمي — أدخله من «تعديل الصنف»')))),
-      h('div', { class: 'dz-form' },
+    const mo = openModal({ title: 'حاسبة جرعات الأطفال', icon: 'pill', wide: true, body: h('div', { class: 'dz-wrap' },
+      h('div', { class: 'dzx-head' },
+        h('span', { html: hero() }),
+        h('div', { class: 'dz-id' },
+          h('b', {}, S(p.brandName) || 'بدون اسم منتج'),
+          h('span', { class: 'dz-chip' }, (S(p.form) || 'شكل غير محدد') + (S(p.dose) ? ' • ' + S(p.dose) : '')),
+          h('div', { class: 'dz-note' }, ps.length
+            ? 'المكوّنات: ' + ps.map(nameOf).join(' + ') + (drv && ps.length > 1 ? ' — المحدّد للجرعة: ' + nameOf(drv) : '')
+            : 'لا يوجد اسم علمي — أدخله من «تعديل الصنف» لتحديد المادة'))),
+      h('div', { class: 'dz-grid' },
         h('div', { class: 'dz-field' }, h('label', {}, 'الجنس'), h('div', { class: 'dz-seg' }, bBtn, gBtn)),
-        h('div', { class: 'dz-field' }, h('label', {}, 'العمر (سنوات)'), yInp),
-        h('div', { class: 'dz-field' }, h('label', {}, 'العمر (أشهر)'), mInp)),
-      h('div', { class: 'dz-field' }, h('label', {}, 'الوزن بالكغم — اختياري: عند تركه فارغاً يُقدَّر من العمر والجنس'), wInp),
-      h('button', { class: 'btn g big', onclick: () => run() }, h('span', { html: icon('check') }), 'احسب الجرعة'),
+        h('div', { class: 'dz-field' }, h('label', {}, 'سنوات'), yInp),
+        h('div', { class: 'dz-field' }, h('label', {}, 'أشهر'), mInp),
+        h('div', { class: 'dz-field' }, h('label', {}, 'الوزن (كغم)'), wInp)),
+      h('div', { class: 'dz-grid', style: { gridTemplateColumns: '1fr 2fr' } },
+        h('div', { class: 'dz-field' }, h('label', {}, 'ملغ لكل 5 مل'), cInp),
+        h('div', { class: 'dz-field' }, h('label', {}, 'كيف قرأنا العبوة'), concLine)),
+      h('button', { class: 'dz-go', onclick: () => run() }, 'احسب الجرعة'),
       res) });
+    mo.box.classList.add('dzx');
     setTimeout(() => yInp.focus(), 60);
+    cInp.oninput = () => { if (lastRule) renderRes(lastRule); };
 
     const say = t => { const el = res.querySelector('.dz-lmsg'); if (el) el.textContent = t; };
+    /* وسائط آمنة: أي قيمة فارغة تُتجاهل ولا تُرسل إلى append فتُحوَّل نصاً */
+    const add = (...k) => k.flat(Infinity).forEach(x => { if (x != null && x !== false && x !== true) res.append(x); });
+    let lastRule = null;
 
     function validRule(t) {
       const o = parseJson(t);
       if (!o || typeof o !== 'object') return null;
-      if (o.mode === 'none') return o;
-      if (o.mode === 'wt' && +o.mgPerKg > 0 && +o.timesPerDay > 0) return o;
+      if (o.mode === 'none' || o.mode === 'no') return o;
+      if ((o.mode === 'wt' || o.mode === 'day') && +o.mgPerKg > 0 && +o.timesPerDay > 0) return o;
+      if (o.mode === 'fx' && +o.f > 0 && +o.timesPerDay > 0) return o;
       if (o.mode === 'band' && A(o.bands).some(b => +b.toYears > 0 && +b.doseMg > 0)) return o;
+      if (o.mode === 'wb' && A(o.wbands).some(b => +b.toKg > 0 && +b.doseMg > 0)) return o;
       return null;
     }
 
-    async function ensureRule(force) {
-      if (!sci) throw new Error('لا يمكن البحث بلا اسم علمي — أدخل الاسم العلمي من «تعديل الصنف» أولاً');
-      const ps = splitParts(sci), key = keyOf(ps);
-      if (!key) throw new Error('الاسم العلمي غير صالح للبحث');
-      let rec = force ? null : await lookup(key);
-      if (!rec) {
-        if (inflight.has(key)) rec = await inflight.get(key);
-        else {
-          const pr = (async () => {
-            const r = await askAI(buildPrompt(p, ps), validRule, say);
-            return { key, sci, parts: ps, data: r.obj, model: r.model, createdAt: Date.now(), v: 1 };
-          })();
-          inflight.set(key, pr);
-          try { rec = await pr; } finally { inflight.delete(key); }
-          await store(rec);
-        }
-      }
-      return rec;
+    /* سلّم الحل: قاعدة الصيدلي اليدوية ← موسوعة الجرعات الداخلية الموثّقة ← القاعدة المخزّنة ← الذكاء الاصطناعي ← إدخال يدوي */
+    async function ensureRule(forceAI) {
+      if (!key) throw new Error('لا توجد مادة للبحث — أدخل الاسم العلمي من «تعديل الصنف»');
+      let cached = null;
+      if (!forceAI) { try { cached = await lookup(key); } catch (_) { cached = null; } }
+      if (cached && cached.data && (cached.man === true || cached.override === true)) return cached;
+      if (!forceAI) { const loc = localRule(key, combo, printedNum(p)); if (loc) return loc; }
+      if (cached && cached.data) return cached;
+      if (!ps.length) throw new Error('الاسم العلمي مطلوب ليبحث الذكاء الاصطناعي عن المادة');
+      const k = key;
+      if (inflight.has(k)) return inflight.get(k);
+      const pr = (async () => {
+        const r = await askAI(buildPrompt(p, ps), validRule, say);
+        const rec = { key: k, sci: sci || k, parts: ps, data: r.obj, model: r.model, override: !!forceAI, createdAt: Date.now(), v: 2 };
+        await store(rec);
+        return rec;
+      })();
+      inflight.set(k, pr);
+      try { return await pr; } finally { inflight.delete(k); }
     }
 
     async function run(force) {
-      const months = Math.max(0, (+yInp.value || 0) * 12 + (+mInp.value || 0));
+      const months = monthsNow();
       if (!months && !+wInp.value) { toast('أدخل العمر (سنوات أو أشهر) أو الوزن', 'r'); return; }
       if (months > 168) { toast('الحاسبة مخصصة للأطفال حتى 14 سنة', 'r'); return; }
       res.innerHTML = '';
-      res.append(h('div', { class: 'dz-load' }, h('div', { class: 'dz-spin' }), h('div', { class: 'dz-lmsg', style: { fontWeight: 900 } }, 'جارٍ تجهيز قاعدة الجرعة…')));
-      try {
-        const rule = await ensureRule(!!force);
-        renderRes(rule, months);
-      } catch (e) {
-        res.innerHTML = '';
-        res.append(h('div', { class: 'dz-load' },
-          h('div', { class: 'dz-stop' }, (e && e.message) || 'تعذّر جلب قاعدة الجرعة'),
-          h('button', { class: 'btn b', onclick: () => run() }, 'إعادة المحاولة')));
-      }
+      lastRule = null;
+      res.append(h('div', { class: 'dz-load' }, h('div', { class: 'dz-spin' }),
+        h('div', { class: 'dz-lmsg', style: { fontWeight: '900' } }, 'جارٍ تجهيز قاعدة الجرعة…')));
+      try { renderRes(await ensureRule(!!force)); } catch (e) { renderFail(e); }
     }
 
-    function renderRes(rule, months) {
+    function renderFail(e) {
+      lastRule = null;
+      res.innerHTML = '';
+      add(
+        h('div', { class: 'dz-stop' }, 'تعذّر إكمال البحث الآلي: ' + ((e && e.message) || 'خطأ غير معروف')),
+        h('div', { class: 'dz-note' }, 'لا تُترك الجرعة بلا نتيجة: أدخلها يدوياً فتُحفظ على الجهاز وفي السحابة وتُطبّق فوراً.'),
+        h('div', { class: 'dz-adv' },
+          h('button', { class: 'dz-mini', onclick: () => run(true) }, 'إعادة البحث الآلي'),
+          h('button', { class: 'dz-mini', onclick: () => manualCard() }, 'إدخال جرعة يدوية')));
+    }
+
+    function provRow(rule) {
+      return h('div', { class: 'dz-adv' },
+        h('span', { class: 'dz-prov' + (rule.man ? ' man' : rule.prov === 'local' ? '' : ' ai') },
+          rule.man ? 'قاعدة أدخلها الصيدلي'
+            : rule.prov === 'local' ? 'موسوعة الجرعات الداخلية — منقولة عن المصادر المعتمدة'
+              : 'قاعدة ذكاء اصطناعي' + (rule.model ? ' • ' + S(rule.model) : '')
+                + (rule.createdAt ? ' • ' + fmtDate(rule.createdAt) + ' ' + fmtTime(rule.createdAt) : '')),
+        h('button', { class: 'dz-mini', onclick: () => manualCard() }, rule.man ? 'تعديل القاعدة' : 'قاعدة يدوية'),
+        (rule.man || rule.override) ? h('button', { class: 'dz-mini', onclick: async () => {
+          if (!(await confirmBox('إلغاء اعتماد هذه القاعدة والرجوع إلى موسوعة الجرعات الداخلية؟', { okLabel: 'إلغاء الاعتماد' }))) return;
+          const rec = { ...rule, man: false, override: false };
+          try { await store(rec); } catch (_) {}
+          const loc = localRule(key, combo, printedNum(p));
+          renderRes(loc || rec);
+        } }, 'الرجوع للموسوعة الداخلية') : null,
+        h('button', { class: 'dz-mini', onclick: async () => {
+          if (!(await confirmBox('إعادة جلب قاعدة الجرعة بالذكاء الاصطناعي؟ تُستهلك حصة وتُستبدل القاعدة لكل الأجهزة.', { okLabel: 'تحديث' }))) return;
+          run(true);
+        } }, 'تحديث بالذكاء الاصطناعي'));
+    }
+
+    const srcRow = d => h('div', { class: 'dz-note' },
+      'المصادر: ', A(d.refs).length ? A(d.refs).map(r => h('span', { class: 'dz-src' }, S(r))) : '—',
+      d.src ? h('div', { style: { marginTop: '4px' } }, S(d.src)) : null);
+
+    function renderRes(rule) {
+      lastRule = rule;
+      const months = monthsNow();
       const kgReal = +wInp.value || 0;
       const kg = kgReal || estWeight(months, sex);
       const out = calcDose(rule, months, kg);
+      const d = (rule && rule.data) || {};
+      const un = out.unit === 'iu' ? 'وحدة دولية' : 'ملغ';
       res.innerHTML = '';
-      const d = rule.data || {};
-      if (out.none) {
-        res.append(h('div', { class: 'dz-stop' }, 'لا توجد جرعة أطفال موثقة لهذه المادة في المصادر المعتمدة — راجع النشرة الرسمية أو الطبيب.'));
+
+      if (out.no) {
+        add(
+          h('div', { class: 'dz-stop' }, S(out.no)),
+          A(d.safety).slice(0, 3).map(w => h('div', { class: 'dz-warn' }, S(w))),
+          d.note ? h('div', { class: 'dz-line' }, S(d.note)) : null,
+          srcRow(d), provRow(rule));
         return;
       }
-      if (out.minM && months && months < out.minM) {
-        res.append(h('div', { class: 'dz-stop' }, `تنبيه: المصادر تشترط عمراً لا يقل عن ${out.minM} شهراً لهذا الدواء — الصرف تحت هذا العمر بأمر طبيب فقط.`));
+      if (out.none || !(out.doseMg > 0)) {
+        manualCard('لم تُسجَّل جرعة أطفال موثّقة لهذه المادة بعد — أدخلها الصيدلي أدناه فتُحفظ وتُطبّق فوراً.');
+        return;
       }
-      const ml = conc ? Math.round((out.doseMg / conc) * 2) / 2 : 0;
-      res.append(
+
+      const manPer5 = +cInp.value || 0;
+      const perMl = manPer5 > 0 ? manPer5 / 5 : (ci.perMl || 0);
+      const unitOk = (out.unit || 'mg') === (ci.unit || 'mg');
+      const canVol = perMl > 0 && unitOk && !ci.unknown;
+      const rawMl = canVol ? out.doseMg / perMl : 0;
+      const ml = rawMl ? (rawMl < 1 ? Math.round(rawMl * 20) / 20 : Math.round(rawMl * 10) / 10) : 0;
+      const interval = out.perDay >= 1 ? 'كل ' + (Math.round((24 / out.perDay) * 10) / 10) + ' ساعة' : '';
+      const base = ci.base || 5;
+
+      add(
         h('div', { class: 'dz-big' },
-          h('div', {},
-            h('b', {}, ml ? `${ml}` : `${out.doseMg}`),
-            h('div', {}, h('small', {}, ml ? `سم³ (cc) للجرعة الواحدة ≈ ${out.doseMg} ملغ` : 'ملغ للجرعة الواحدة')),
-            out.perDay ? h('div', { style: { marginTop: '4px', fontWeight: 900 } }, dayTimes(out.perDay)) : null)),
-        kgReal ? null : h('div', { class: 'dz-warn' }, `استُخدم وزن تقديري ${kg} كغم (حسب العمر والجنس) — إدخال الوزن الفعلي يعطي دقة أعلى.`),
-        out.capped ? h('div', { class: 'dz-warn' }, 'طُبّق سقف الجرعة القصوى (جرعة البالغ) — الحساب بالوزن أعطى أكثر من المسموح.') : null,
+          h('b', {}, ml ? String(ml) : String(out.doseMg)),
+          h('div', {}, h('small', {}, ml ? `مل (سم³) للجرعة الواحدة — يعادل ${out.doseMg} ${un}` : `${un} للجرعة الواحدة`)),
+          out.perDay ? h('div', { style: { marginTop: '5px', fontWeight: '900' } }, dayTimes(out.perDay) + (interval ? ' • ' + interval : '')) : null),
+
+        h('div', { class: 'dz-cards' },
+          h('div', { class: 'dz-card' }, h('i', {}, 'الحجم للجرعة'), h('b', {}, ml ? ml + ' مل' : '—'), h('span', {}, ml ? 'حسب تركيز العبوة' : 'أكمل التركيز')),
+          h('div', { class: 'dz-card' }, h('i', {}, 'مرات اليوم'), h('b', {}, out.perDay ? out.perDay + '×' : '—'), h('span', {}, interval || 'غير محدد')),
+          h('div', { class: 'dz-card' }, h('i', {}, 'المجموع اليومي'), h('b', {}, `${out.daily} ${un}`), h('span', {}, 'خلال 24 ساعة'))),
+
+        out.bandLabel && /لا توجد/.test(out.bandLabel) ? h('div', { class: 'dz-warn' }, S(out.bandLabel)) : null,
+        out.minM && months && months < out.minM
+          ? h('div', { class: 'dz-stop' }, `المصادر تشترط عمراً لا يقل عن ${out.minM} شهراً — الصرف تحت هذا العمر بأمر طبيب فقط.`) : null,
+        out.minKg && kg < out.minKg
+          ? h('div', { class: 'dz-stop' }, `المصادر تشترط وزناً لا يقل عن ${out.minKg} كغم — لا تُصرف تحت هذا الوزن.`) : null,
+        kgReal ? null : h('div', { class: 'dz-warn' }, `استُخدم وزن تقديري ${kg} كغم من العمر والجنس — الوزن الفعلي أدق.`),
+        out.capped ? h('div', { class: 'dz-warn' }, `بلغت جرعة الوزن سقف الجرعة الواحدة (${d.maxDoseMg} ملغ) فطُبّق السقف.`) : null,
+        out.dailyCapped ? h('div', { class: 'dz-warn' }, `بلغ مجموع اليوم سقف ${d.maxDailyMg} ملغ فطُبّق السقف وقُسّم على عدد الجرعات.`) : null,
+        ci.unknown ? h('div', { class: 'dz-warn' }, S(ci.how)) : null,
+        !ci.unknown && ci.assumed && !manPer5 ? h('div', { class: 'dz-warn' }, 'لم يحدَّد حجم المجرى في خانة الجرعة، فُهِم الرقم على أنه لكل 5 مل — صحّحه من حقل «ملغ لكل 5 مل» إن كان غير ذلك.') : null,
+        !canVol && !ci.unknown ? h('div', { class: 'dz-warn' }, ci.perMl && !unitOk
+          ? `وحدة التركيز (${ci.unit === 'iu' ? 'وحدة دولية' : 'ملغ'}) لا تطابق وحدة الجرعة (${un}) — يُعرض الملغ فقط حتى تصحّح التركيز.`
+          : 'لا يوجد تركيز مقروء — أكمل حقل «ملغ لكل 5 مل» لعرض الحجم بالسم³.') : null,
+        canVol && ml && ml < 0.2 ? h('div', { class: 'dz-warn' }, 'الحجم أقل من 0.2 مل — استخدم القطّارة المدرّجة ولا تستخدم الملعقة المنزلية.') : null,
+
+        ps.length > 1 && A(ci.list).length && !ci.unknown ? h('div', { class: 'dz-parts' },
+          A(ci.list).map((e, i) => h('div', { class: 'dz-part' },
+            h('em', {}, nameOf(e.tag || ps[i]) + (e.tag === drv ? ' — المحدّد للجرعة' : '')),
+            h('b', {}, `${Math.round((e.mg / base) * 5 * 100) / 100} ${e.iu ? 'وحدة' : 'ملغ'}/5 مل` +
+              (canVol ? ` • في الجرعة ${Math.round((e.mg / base) * ml * 100) / 100}` : ''))))
+        ) : null,
+
+        combo && combo.clavCap && canVol ? (() => {
+          const co = A(ci.list).find(e => e.tag && e.tag !== drv);
+          if (!co) return null;
+          const perDayCo = Math.round(((co.mg / base) * ml * (out.perDay || 1)) * 10) / 10;
+          const cap = combo.clavCap * kg;
+          return perDayCo > cap
+            ? h('div', { class: 'dz-stop' }, `مجموع ${nameOf(co.tag)} اليومي ${perDayCo} ملغ يتجاوز سقف ${combo.clavCap} ملغ/كغم (${cap} ملغ) — خفّف الجرعة أو بدّل الصيغة.`)
+            : h('div', { class: 'dz-line' }, `المكوّن الثاني ${nameOf(co.tag)}: ${perDayCo} ملغ يومياً — ضمن السقف المسموح ${cap} ملغ`);
+        })() : null,
+
+        A(d.safety).slice(0, 3).map(w => h('div', { class: 'dz-warn' }, S(w))),
+
         h('div', { class: 'dz-line' },
-          d.mode === 'wt'
-            ? `القاعدة المعتمدة: ${d.mgPerKg} ملغ/كغم للجرعة الواحدة${d.maxDoseMg ? ` — بسقف ${d.maxDoseMg} ملغ` : ''}`
-            : 'القاعدة المعتمدة: جرعة ثابتة حسب الفئة العمرية',
-          d.note ? h('div', { class: 'dz-note' }, d.note) : null),
-        h('div', { class: 'dz-note' },
-          'المصادر: ', A(d.refs).length ? A(d.refs).map(r => h('span', { class: 'dz-src' }, S(r))) : '—',
-          ' — هذه النتيجة استرشادية ولا تغني عن مراجعة الصيدلي/الطبيب والنشرة الرسمية. ',
-          h('button', { class: 'mini-btn blue', onclick: async () => { if (await confirmBox('إعادة جلب قاعدة الجرعة بالذكاء الاصطناعي؟ تُستهلك حصة وتُستبدل القاعدة المخزنة لكل الأجهزة.', { okLabel: 'تحديث' })) run(true); } }, 'تحديث القاعدة')));
+          d.mode === 'wt' ? `القاعدة: ${d.mgPerKg} ملغ/كغم للجرعة الواحدة ${dayTimes(d.timesPerDay)}` + (d.maxDoseMg ? ` — سقف ${d.maxDoseMg} ملغ` : '')
+            : d.mode === 'day' ? `القاعدة: ${d.mgPerKg} ملغ/كغم يومياً مقسّمة على ${d.timesPerDay}` + (d.maxDailyMg ? ` — سقف يومي ${d.maxDailyMg} ملغ` : '')
+              : d.mode === 'fx' ? `القاعدة: جرعة ثابتة ${d.f} ملغ ${dayTimes(d.timesPerDay)}`
+                : d.mode === 'wb' ? `القاعدة: فئات وزن بعدد ${A(d.wbands).length} فئة`
+                  : `القاعدة: فئات عمرية بعدد ${A(d.bands).length} فئة`,
+          out.bandLabel && !/لا توجد/.test(out.bandLabel) ? h('div', { class: 'dz-note' }, S(out.bandLabel)) : null,
+          d.note ? h('div', { class: 'dz-note' }, S(d.note)) : null),
+        srcRow(d),
+        h('div', { class: 'dz-note' }, 'نتيجة استرشادية محسوبة من العمر والوزن — لا تغني عن مراجعة النشرة الرسمية والصيدلي المسؤول.'),
+        provRow(rule));
+    }
+
+    function manualCard(reason) {
+      lastRule = null;
+      res.innerHTML = '';
+      let mm = 'wt';
+      const v1 = h('input', { type: 'number', min: 0, step: 'any', placeholder: 'ملغ/كغم للجرعة', dir: 'ltr' });
+      const v2 = h('input', { type: 'number', min: 0, step: 'any', placeholder: 'عدد المرات', dir: 'ltr' });
+      const v3 = h('input', { type: 'number', min: 0, step: 'any', placeholder: 'سقف الجرعة', dir: 'ltr' });
+      const v4 = h('input', { type: 'number', min: 0, step: 'any', placeholder: 'أقل عمر (شهر)', dir: 'ltr' });
+      const w1 = h('button', { class: 'dz-sex on' }, 'حسب الوزن');
+      const w2 = h('button', { class: 'dz-sex' }, 'جرعة ثابتة');
+      w1.onclick = () => { mm = 'wt'; w1.classList.add('on'); w2.classList.remove('on'); v1.placeholder = 'ملغ/كغم للجرعة'; };
+      w2.onclick = () => { mm = 'fx'; w2.classList.add('on'); w1.classList.remove('on'); v1.placeholder = 'ملغ لكل جرعة'; };
+      res.append(
+        h('div', { class: 'dz-line' }, h('b', {}, 'قاعدة يدوية للصيدلي'),
+          h('div', { class: 'dz-note' }, reason ? S(reason) + ' ' : '',
+            'تُحفظ باسم المادة وتُطبّق على كل منتجاتها في هذا الجهاز وفي كل الأجهزة المرتبطة.')),
+        h('div', { class: 'dz-field' }, h('label', {}, 'نوع القاعدة'), h('div', { class: 'dz-seg' }, w1, w2)),
+        h('div', { class: 'dz-grid' },
+          h('div', { class: 'dz-field' }, h('label', {}, 'الجرعة'), v1),
+          h('div', { class: 'dz-field' }, h('label', {}, 'مرات اليوم'), v2),
+          h('div', { class: 'dz-field' }, h('label', {}, 'سقف ملغ'), v3),
+          h('div', { class: 'dz-field' }, h('label', {}, 'أقل عمر'), v4)),
+        h('div', { class: 'dz-adv' },
+          h('button', { class: 'dz-go', style: { padding: '10px 16px', fontSize: '14px' }, onclick: async () => {
+            const a = +v1.value || 0, t = +v2.value || 0;
+            if (!(a > 0) || !(t > 0)) { toast('اكتب الجرعة وعدد المرات', 'r'); return; }
+            if (!key) { toast('أدخل الاسم العلمي أولاً من «تعديل الصنف»', 'r'); return; }
+            const data = mm === 'wt'
+              ? { mode: 'wt', mgPerKg: a, timesPerDay: t, maxDoseMg: +v3.value || 0, maxDailyMg: 0, minMonths: +v4.value || 0, minKg: 0, unit: 'mg', note: 'قاعدة حسب الوزن أدخلها الصيدلي يدوياً — راجع نشرة المنتج', safety: [], refs: ['إدخال صيدلاني يدوي'] }
+              : { mode: 'fx', f: a, timesPerDay: t, maxDoseMg: +v3.value || 0, maxDailyMg: 0, minMonths: +v4.value || 0, minKg: 0, unit: 'mg', note: 'جرعة ثابتة أدخلها الصيدلي يدوياً — راجع نشرة المنتج', safety: [], refs: ['إدخال صيدلاني يدوي'] };
+            const rec = { key, sci: sci || key, parts: ps, data, man: true, createdAt: Date.now(), v: 2 };
+            try { await store(rec); } catch (_) {}
+            toast('حُفظت القاعدة اليدوية وطُبّقت', 'g');
+            renderRes(rec);
+          } }, 'حفظ وتطبيق'),
+          h('button', { class: 'dz-mini', onclick: () => run(false) }, 'رجوع')));
+      setTimeout(() => v1.focus(), 50);
     }
   }
 
+  /* الزر يحجز موضعه دائماً (32×32) حتى لا تنزاح أزرار عرض/تعديل/حذف بين منتج له حاسبة وآخر ليس له */
   function button(p) {
-    if (!applicable(p)) return null;
     css();
-    return h('button', { class: 'dz-fab', title: 'حاسبة جرعات الأطفال', 'aria-label': 'حاسبة جرعات الأطفال', html: baby(), onclick: () => open(p) });
+    if (!applicable(p)) return h('span', { class: 'dz-slot', 'aria-hidden': 'true' });
+    return h('button', { class: 'dz-q', type: 'button', title: 'حاسبة جرعات الأطفال', 'aria-label': 'حاسبة جرعات الأطفال', html: glyph(), onclick: () => open(p) });
   }
 
   return { button, open, applicable };
@@ -6078,7 +7008,9 @@ function renderSettings(tab) {
             h('div', {}, '4) انسخ المفتاح (يبدأ بـ AIza…) والصقه في الخانة أعلاه ثم اضغط «حفظ المفتاح».'),
             h('div', {}, '5) اضغط «اختبار المفتاح» للتأكد — ثم افتح الماسح من الزر أسفل.'),
             h('div', { style: { marginTop: '8px', color: 'var(--muted)' } }, 'المفتاح مجاني وثابت بلا انتهاء صلاحية، والحد المجاني يكفي فواتير الصيدلية اليومية بمرات. لا تشاركه مع أحد.')))),
+      h('div', { class: 'f-field full' }, h('span', { style: { color: 'var(--muted)', fontWeight: '800', lineHeight: '2', fontSize: '13px' } }, 'الإدخال السريع: صورة واحدة لكل العلبات ← قارئ بـ Gemini ← قارئ ثانٍ بمزوّد مختلف ← قاضٍ يحسم الخلاف ويتحقق من التعبئة ← جدول كبير بكل الأعمدة ← حفظ دفعة واحدة بعد تأكيدك. يعمل بمفاتيح الموسوعة الدوائية، ولو لم تُضف يستخدم مفتاح Gemini أعلاه.')),
       h('div', { class: 'f-field full', style: { display: 'flex', gap: '10px', flexWrap: 'wrap' } },
+        h('button', { class: 'btn g big', onclick: () => { if (typeof QuickEntry === 'undefined') return toast('ملف quick-entry.js غير محمّل — أرجع سطر تحميله في index.html', 'r'); QuickEntry.open(); } }, h('span', { html: icon('pill') }), 'فتح الإدخال السريع'),
         h('button', { class: 'btn b', onclick: () => openTab('scanner') }, h('span', { html: icon('camera') }), 'فتح الماسح الذكي'),
         h('button', { class: 'btn g', onclick: () => KeyPool.openManager() }, h('span', { html: icon('lock') }), 'مفاتيح الموسوعة الدوائية'))));
   }
@@ -6868,6 +7800,7 @@ function renderReturnSale(tab) {
   /* سلة الإرجاع */
   const cartWrap = h('div', { class: 'cart-wrap' });
   st.renderCart = () => {
+    dsKeepView(cartWrap);
     cartWrap.innerHTML = '';
     if (!st.cart.length) {
       cartWrap.append(h('div', { class: 'cart-empty' }, h('span', { html: icon('refresh') }),
@@ -7045,6 +7978,7 @@ function renderReturnPurchase(tab) {
 
   const cartWrap = h('div', { class: 'cart-wrap' });
   st.renderItems = () => {
+    dsKeepView(cartWrap);
     cartWrap.innerHTML = '';
     if (!st.items.length) {
       cartWrap.append(h('div', { class: 'cart-empty' }, h('span', { html: icon('purchase') }), h('p', {}, 'أدخل الأصناف المُرجعة للمذخر')));

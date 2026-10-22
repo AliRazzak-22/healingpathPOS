@@ -714,5 +714,5 @@ Output must start with { and end with } and nothing else.`;
     }
   }
 
-    return { mount, usableModels: async k => orderModels(await listModels(k)), normExpiry, resolveCompany };
+    return { mount, usableModels: async k => orderModels(await listModels(k)), normExpiry, resolveCompany, prepImage, autoLink };
 })();

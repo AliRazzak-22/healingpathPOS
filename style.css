@@ -215,6 +215,9 @@ img{object-fit:cover}
 .sug-item .sug-price{font-weight:900;color:var(--green);font-size:14px;white-space:nowrap}
 .sug-item .sug-stock{font-size:11px;font-weight:800;color:var(--muted);white-space:nowrap}
 .sug-item .sug-stock.low{color:var(--red)}
+.sug-lay{display:inline-block;margin-inline-start:8px;padding:2px 8px;border-radius:999px;background:#eef4ff;border:1px solid #cfdffb;color:#2f5fd0;font-size:10.5px;font-weight:900;vertical-align:middle;white-space:nowrap}
+html[data-theme="dark"] .sug-lay{background:#182a48;border-color:#31507f;color:#9dc0ff}
+table.tbl tbody td.ds-cell{outline:2px solid var(--blue);outline-offset:-2px;background:var(--blue-soft)}
 .sug-empty{padding:22px;text-align:center;color:var(--muted);font-weight:800}
 /* جدول السلة */
 .cart-wrap{flex:1;min-height:0;background:var(--white);border:1px solid var(--line);border-radius:18px;overflow:hidden;display:flex;flex-direction:column;box-shadow:var(--shadow-sm)}
@@ -308,15 +311,16 @@ table.tbl tbody tr:last-child td{border-bottom:none}
 .pay-btn.credit{background:var(--white);color:var(--red);border-color:var(--red-soft)}
 .pay-btn.credit:hover{background:linear-gradient(135deg,var(--red),#b91c1c);color:#fff;border-color:transparent;box-shadow:var(--shadow-red);transform:translateY(-3px) scale(1.02)}
 .pay-btn:active{transform:translateY(0) scale(.98)}
-/* اللوح الجانبي لنقطة البيع */
-.side-tabs{display:flex;border-bottom:1px solid var(--line);flex:none}
+/* اللوح الجانبي: شريط التبويبات على مساحته فقط — يتقلّص ولا ينزح أفقياً أبداً */
+.side-tabs{display:flex;border-bottom:1px solid var(--line);flex:none;gap:0;overflow:hidden}
 .side-tab{
-  flex:1;padding:19px 4px;text-align:center;font-weight:800;font-size:13px;color:var(--muted);
+  flex:1 1 0;min-width:0;padding:17px 3px;text-align:center;font-weight:800;font-size:12px;color:var(--muted);
   cursor:pointer;border-bottom:2.5px solid transparent;transition:all var(--tr);user-select:none;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
 .side-tab:hover{color:var(--ink-2);background:var(--bg)}
 .side-tab.active{color:var(--green);border-bottom-color:var(--green);background:var(--green-ghost)}
-.side-body{flex:1;overflow-y:auto;padding:12px}
+.side-body{flex:1;overflow-y:auto;overflow-x:hidden;padding:12px}
 .feat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(108px,1fr));gap:9px}
 .feat-cell{
   background:linear-gradient(160deg,var(--white),var(--green-ghost));border:1.5px solid var(--green-soft);
@@ -624,9 +628,9 @@ table.tbl tbody tr:last-child td{border-bottom:none}
   .print-area .print-label:last-child{page-break-after:auto}
 }
 
-/* تبويب دكتورة نادية: شريط جانبي أوسع + بطاقة الصنف برتبة وزر إخفاء */
-.pos-side .side-tabs{overflow-x:auto;scrollbar-width:none}
-.pos-side .side-tabs::-webkit-scrollbar{display:none}
+/* تبويب دكتورة نادية: الشريط يستعرض بتساوٍ على عرضه، بلا نزوح أفقي */
+.pos-side .side-tabs{overflow:hidden;flex-wrap:nowrap}
+.pos-side .side-tab{font-size:11.5px;padding:15px 2px}
 .dr-cell{position:relative;flex-direction:row;align-items:center;gap:7px;text-align:start;padding:11px 10px}
 .dr-cell .feat-price{margin-inline-start:auto}
 .dr-rank{position:absolute;top:-7px;inset-inline-start:-7px;width:19px;height:19px;border-radius:50%;background:linear-gradient(135deg,var(--blue),var(--blue-2));color:#fff;font-size:10.5px;font-weight:900;display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow-blue)}
@@ -862,7 +866,12 @@ table.tbl tbody tr:hover{background:var(--green-ghost)}
 .side-body .tbl{font-size:12.5px}
 .side-body .tbl th,.side-body .tbl td{padding:7px 8px}
 .dr-row{cursor:pointer}
-.dr-row .td-name{font-size:12.5px;min-width:0}
+/* أعمدة ثابتة داخل عرض اللوح: الاسم يأخذ الباقي ويقتطع بدل أن يزيح الجدول يميناً ويساراً */
+.dr-table table.tbl{table-layout:fixed;width:100%}
+.side-body .dr-table th,.side-body .dr-table td{padding:6px 3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.side-body .dr-table thead th{font-size:11px;padding:8px 3px}
+.side-body .dr-table .td-name{min-width:0;font-size:12px}
+.side-body .dr-table .dr-del2{margin:0 auto}
 .dr-del2{width:24px;height:24px;border-radius:8px;background:var(--red-ghost);color:var(--red);display:flex;align-items:center;justify-content:center;flex:none}
 .dr-del2:hover{background:var(--red);color:#fff}
 .dr-del2 svg{width:12px;height:12px}
